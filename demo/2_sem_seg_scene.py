@@ -11,7 +11,11 @@
 # instead of the bundled sample1.npz, and visualizes prediction vs GT.
 
 import os
+import json
+import csv
+import time
 import argparse
+import traceback
 import numpy as np
 import utonia
 import torch
@@ -378,83 +382,88 @@ def render_views_to_png(
     raise ValueError(f"Unknown backend: {backend}")
 
 
-def compute_miou(pred: np.ndarray, gt: np.ndarray, num_classes: int = 20):
-    """Compute mean IoU and per-class IoU, ignoring gt == -1."""
-    valid = gt >= 0
-    pred = pred[valid]
-    gt = gt[valid]
-    ious = []
-    for c in range(num_classes):
-        p_mask = pred == c
-        g_mask = gt == c
-        inter = np.logical_and(p_mask, g_mask).sum()
-        union = np.logical_or(p_mask, g_mask).sum()
-        if union == 0:
-            ious.append(float("nan"))
-        else:
-            ious.append(float(inter) / float(union))
-    acc = (pred == gt).mean() if len(gt) > 0 else float("nan")
-    return ious, acc
+def confusion_matrix(
+    pred: np.ndarray, gt: np.ndarray, num_classes: int = 20
+) -> np.ndarray:
+    """Compute a (num_classes, num_classes) confusion matrix, ignoring gt == -1.
+
+    Rows = ground-truth class, Columns = predicted class.
+    Useful for aggregating across multiple scenes by summing the matrices.
+    """
+    valid = (gt >= 0) & (gt < num_classes)
+    pred = pred[valid].astype(np.int64)
+    gt = gt[valid].astype(np.int64)
+    # Clip pred into valid range (defensive; argmax output should already be valid).
+    pred = np.clip(pred, 0, num_classes - 1)
+    idx = gt * num_classes + pred
+    bincount = np.bincount(idx, minlength=num_classes * num_classes)
+    return bincount.reshape(num_classes, num_classes).astype(np.int64)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run Utonia semantic segmentation on a preprocessed scene folder"
-    )
-    parser.add_argument(
-        "scene_dir",
-        help="Path to scene folder containing coord.npy/color.npy/normal.npy/segment20.npy",
-    )
-    parser.add_argument(
-        "--gt-segment", choices=["segment20", "segment200"], default="segment20",
-        help="Which ground-truth segment file to compare against (default: segment20). "
-             "Utonia linear-prob head is trained on ScanNet20, so metrics only make "
-             "sense for segment20.",
-    )
-    parser.add_argument(
-        "--wo_color", action="store_true", help="disable the color."
-    )
-    parser.add_argument(
-        "--wo_normal", action="store_true", help="disable the normal."
-    )
-    parser.add_argument(
-        "--save-ply-dir", default=None,
-        help="If set, save pred/gt/input PLY files to this directory instead of "
-             "opening an interactive viewer.",
-    )
-    parser.add_argument(
-        "--save-png-dir", default=None,
-        help="If set, render PNG snapshots from multiple viewpoints "
-             "(top/front/back/left/right/iso) for input/pred/gt and a combined "
-             "side-by-side 'all' view. Can be combined with --save-ply-dir.",
-    )
-    parser.add_argument(
-        "--png-width", type=int, default=1280, help="PNG width (default 1280)"
-    )
-    parser.add_argument(
-        "--png-height", type=int, default=960, help="PNG height (default 960)"
-    )
-    parser.add_argument(
-        "--point-size", type=float, default=2.0,
-        help="Point size for PNG rendering (default 2.0)",
-    )
-    parser.add_argument(
-        "--backend", choices=["auto", "open3d", "matplotlib"], default="auto",
-        help="PNG rendering backend. 'matplotlib' works on headless servers "
-             "with no OpenGL/display; 'open3d' is higher quality but needs "
-             "OpenGL; 'auto' tries open3d first and falls back to matplotlib.",
-    )
-    parser.add_argument(
-        "--max-points", type=int, default=150_000,
-        help="Max points for matplotlib rendering (subsample above this). "
-             "Matplotlib 3D scatter is slow; lower this for faster PNG output. "
-             "Ignored for open3d backend. Default 150000.",
-    )
-    args = parser.parse_args()
+def metrics_from_confmat(confmat: np.ndarray) -> dict:
+    """Derive per-class IoU, mIoU, overall accuracy, and macro-averaged
+    precision/recall from a confusion matrix.
+    """
+    num_classes = confmat.shape[0]
+    tp = np.diag(confmat).astype(np.float64)
+    gt_count = confmat.sum(axis=1).astype(np.float64)  # sum over pred axis
+    pred_count = confmat.sum(axis=0).astype(np.float64)  # sum over gt axis
+    union = gt_count + pred_count - tp
 
-    utonia.utils.set_seed(46647087)
+    ious = np.full(num_classes, np.nan, dtype=np.float64)
+    mask = union > 0
+    ious[mask] = tp[mask] / union[mask]
 
-    # ---- Load model ----
+    precisions = np.full(num_classes, np.nan, dtype=np.float64)
+    p_mask = pred_count > 0
+    precisions[p_mask] = tp[p_mask] / pred_count[p_mask]
+
+    recalls = np.full(num_classes, np.nan, dtype=np.float64)
+    r_mask = gt_count > 0
+    recalls[r_mask] = tp[r_mask] / gt_count[r_mask]
+
+    total = confmat.sum()
+    acc = float(tp.sum() / total) if total > 0 else float("nan")
+    valid_ious = ious[~np.isnan(ious)]
+    miou = float(valid_ious.mean()) if valid_ious.size > 0 else float("nan")
+
+    return {
+        "num_points_evaluated": int(total),
+        "overall_accuracy": acc,
+        "mIoU": miou,
+        "per_class_iou": {
+            CLASS_LABELS_20[i]: (None if np.isnan(ious[i]) else float(ious[i]))
+            for i in range(num_classes)
+        },
+        "per_class_precision": {
+            CLASS_LABELS_20[i]: (None if np.isnan(precisions[i]) else float(precisions[i]))
+            for i in range(num_classes)
+        },
+        "per_class_recall": {
+            CLASS_LABELS_20[i]: (None if np.isnan(recalls[i]) else float(recalls[i]))
+            for i in range(num_classes)
+        },
+    }
+
+
+def print_metrics(metrics: dict, title: str = ""):
+    if title:
+        print(f"\n=== {title} ===")
+    print(f"Points evaluated: {metrics['num_points_evaluated']}")
+    print(f"Overall accuracy: {metrics['overall_accuracy']:.4f}")
+    print(f"mIoU:             {metrics['mIoU']:.4f}")
+    print("Per-class IoU:")
+    for label, iou in metrics["per_class_iou"].items():
+        iou_str = f"{iou:.4f}" if iou is not None else "  n/a "
+        print(f"  {label:20s}: {iou_str}")
+
+
+# ---------------------------------------------------------------------------
+# Model loading and per-scene processing
+# ---------------------------------------------------------------------------
+
+def load_utonia_model():
+    """Load Utonia backbone + ScanNet20 linear-probing head once, reusable."""
     if flash_attn is not None:
         model = utonia.load("utonia", repo_id="Pointcept/Utonia").to(device)
     else:
@@ -473,24 +482,36 @@ if __name__ == "__main__":
     )
     seg_head = SegHead(**ckpt["config"]).to(device)
     seg_head.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    seg_head.eval()
+    return model, seg_head
 
-    # ---- Load data ----
-    point = load_scene_folder(args.scene_dir)
+
+def process_scene(
+    model,
+    seg_head,
+    scene_dir: str,
+    out_dir: str,
+    args,
+) -> dict:
+    """Run inference on one scene, save PLY/PNG outputs, return a metrics dict.
+
+    The metrics dict is also written to `<out_dir>/metrics.json`.
+    """
+    scene_id = os.path.basename(os.path.normpath(scene_dir))
+    os.makedirs(out_dir, exist_ok=True)
+
+    point = load_scene_folder(scene_dir)
 
     if args.wo_color:
         point["color"] = np.zeros_like(point["coord"])
     if args.wo_normal:
         point["normal"] = np.zeros_like(point["coord"])
 
-    # Keep a copy of originals for visualization against GT
     original_coord = point["coord"].copy()
     original_color = point["color"].copy()
     gt_segment_full = point.get(args.gt_segment, None)
-    if gt_segment_full is None:
-        print(f"Warning: {args.gt_segment}.npy not found; skipping GT comparison.")
 
-    # Utonia transform expects a 'segment' key.  Use segment20 since the
-    # linear-probing head is trained on ScanNet20 labels.
     seg20_for_transform = point.pop("segment20", None)
     point.pop("segment200", None)
     if seg20_for_transform is not None:
@@ -499,14 +520,11 @@ if __name__ == "__main__":
     transform = utonia.transform.default(0.5)
     point = transform(point)
 
-    # ---- Inference ----
-    model.eval()
-    seg_head.eval()
+    t0 = time.time()
     with torch.inference_mode():
         for key in point.keys():
             if isinstance(point[key], torch.Tensor) and device == "cuda":
                 point[key] = point[key].cuda(non_blocking=True)
-
         point = model(point)
         while "pooling_parent" in point.keys():
             assert "pooling_inverse" in point.keys()
@@ -514,111 +532,369 @@ if __name__ == "__main__":
             inverse = point.pop("pooling_inverse")
             parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
             point = parent
-
         seg_logits = seg_head(point.feat)
-        pred = seg_logits.argmax(dim=-1).data.cpu().numpy()  # (M,)
+        pred = seg_logits.argmax(dim=-1).data.cpu().numpy()
+    infer_time = time.time() - t0
 
-    # point.coord is the grid-sampled coord (M, 3); the transform also stores
-    # `inverse` so we can map predictions back to the original N points.
     coord_sampled = point.coord.detach().cpu().numpy()
     pred_color_sampled = CLASS_COLOR_20[pred]
 
     if "inverse" in point.keys():
-        inverse = point.inverse.detach().cpu().numpy()  # (N,) maps orig -> sampled
-        pred_full = pred[inverse]                       # (N,)
+        inv = point.inverse.detach().cpu().numpy()
+        pred_full = pred[inv]
         pred_color_full = CLASS_COLOR_20[pred_full]
     else:
-        inverse = None
         pred_full = None
         pred_color_full = None
 
-    # ---- Compare against GT (at original resolution if possible) ----
+    # ---- Metrics ----
+    metrics = {
+        "scene_id": scene_id,
+        "num_points_input": int(original_coord.shape[0]),
+        "num_points_sampled": int(coord_sampled.shape[0]),
+        "inference_seconds": float(infer_time),
+        "gt_segment": args.gt_segment,
+        "wo_color": bool(args.wo_color),
+        "wo_normal": bool(args.wo_normal),
+    }
+
+    confmat = None
     if gt_segment_full is not None and pred_full is not None:
-        ious, acc = compute_miou(pred_full, gt_segment_full, num_classes=20)
-        valid_ious = [v for v in ious if not np.isnan(v)]
-        miou = float(np.mean(valid_ious)) if valid_ious else float("nan")
-        print(f"\n=== Evaluation against {args.gt_segment} (ScanNet20) ===")
-        print(f"Overall point accuracy: {acc:.4f}")
-        print(f"mIoU:                   {miou:.4f}")
-        print("Per-class IoU:")
-        for label, iou in zip(CLASS_LABELS_20, ious):
-            iou_str = f"{iou:.4f}" if not np.isnan(iou) else "  n/a "
-            print(f"  {label:20s}: {iou_str}")
+        confmat = confusion_matrix(pred_full, gt_segment_full, num_classes=20)
+        scene_metrics = metrics_from_confmat(confmat)
+        metrics.update(scene_metrics)
+        # Save confusion matrix as .npy (useful for re-aggregation)
+        np.save(os.path.join(out_dir, "confmat.npy"), confmat)
+
+    # Save metrics.json
+    with open(os.path.join(out_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
 
     # ---- Build visualization geometries ----
     geometries = []
-
-    # 1. Input RGB (original resolution)
     pcd_input = make_pcd(original_coord, original_color, offset=(0.0, 0.0, 0.0))
     geometries.append(pcd_input)
 
-    # Shift along +x by the scene width so the three views sit side by side
     extent_x = float(original_coord[:, 0].max() - original_coord[:, 0].min())
     shift = extent_x * 1.2
 
-    # 2. Prediction (use full-resolution if available, otherwise sampled)
     if pred_color_full is not None:
         pcd_pred = make_pcd(original_coord, pred_color_full, offset=(shift, 0.0, 0.0))
     else:
         pcd_pred = make_pcd(coord_sampled, pred_color_sampled, offset=(shift, 0.0, 0.0))
     geometries.append(pcd_pred)
 
-    # 3. Ground truth (if available)
     if gt_segment_full is not None and args.gt_segment == "segment20":
         gt_rgb = labels_to_rgb(gt_segment_full, CLASS_COLOR_20)
         pcd_gt = make_pcd(original_coord, gt_rgb, offset=(2 * shift, 0.0, 0.0))
         geometries.append(pcd_gt)
     elif gt_segment_full is not None:
-        # segment200: we can't map to the 20-class palette, just show it as
-        # a randomized palette so the structure is visible.
         rng = np.random.default_rng(0)
         max_lbl = int(gt_segment_full.max()) + 1 if (gt_segment_full >= 0).any() else 1
-        palette200 = (rng.random((max_lbl, 3)) * 255.0)
+        palette200 = rng.random((max_lbl, 3)) * 255.0
         gt_rgb = labels_to_rgb(gt_segment_full, palette200)
         pcd_gt = make_pcd(original_coord, gt_rgb, offset=(2 * shift, 0.0, 0.0))
         geometries.append(pcd_gt)
 
-    titles = ["input RGB", f"prediction (ScanNet20)"]
+    titles = ["input RGB", "prediction (ScanNet20)"]
     if len(geometries) == 3:
         titles.append(f"GT ({args.gt_segment})")
-    print("\nLayout (left -> right):", " | ".join(titles))
 
-    # ---- Save / visualize ----
-    did_save = False
-
-    if args.save_ply_dir:
-        os.makedirs(args.save_ply_dir, exist_ok=True)
-        o3d.io.write_point_cloud(
-            os.path.join(args.save_ply_dir, "input_rgb.ply"), pcd_input
-        )
-        o3d.io.write_point_cloud(
-            os.path.join(args.save_ply_dir, "pred_seg20.ply"), pcd_pred
-        )
+    # ---- Save PLY ----
+    if args.save_ply:
+        ply_dir = os.path.join(out_dir, "ply")
+        os.makedirs(ply_dir, exist_ok=True)
+        o3d.io.write_point_cloud(os.path.join(ply_dir, "input_rgb.ply"), pcd_input)
+        o3d.io.write_point_cloud(os.path.join(ply_dir, "pred_seg20.ply"), pcd_pred)
         if len(geometries) == 3:
             o3d.io.write_point_cloud(
-                os.path.join(args.save_ply_dir, f"gt_{args.gt_segment}.ply"),
-                geometries[2],
+                os.path.join(ply_dir, f"gt_{args.gt_segment}.ply"), geometries[2]
             )
-        print(f"Saved PLY files to: {args.save_ply_dir}")
-        did_save = True
 
-    if args.save_png_dir:
-        print(f"Rendering PNG snapshots to: {args.save_png_dir} "
-              f"(backend={args.backend})")
+    # ---- Save PNG ----
+    if args.save_png:
+        png_dir = os.path.join(out_dir, "png")
         used = render_views_to_png(
             geometries,
             titles,
-            out_dir=args.save_png_dir,
+            out_dir=png_dir,
             backend=args.backend,
             width=args.png_width,
             height=args.png_height,
             point_size=args.point_size,
             max_points=args.max_points,
         )
-        print(f"PNG rendering done (backend used: {used})")
-        did_save = True
+        metrics["png_backend_used"] = used
+        # Rewrite metrics.json with the backend info
+        with open(os.path.join(out_dir, "metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
 
-    if not did_save:
-        o3d.visualization.draw_geometries(
-            geometries, window_name="Utonia semseg: input | pred | gt"
+    return metrics, confmat
+
+
+def discover_scenes(root: str) -> list:
+    """Return a sorted list of scene directories under `root`.
+
+    A scene directory is any directory containing a coord.npy file. If `root`
+    itself is a scene directory, returns [root]. Otherwise recurses one level
+    into subdirectories.
+    """
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"Not a directory: {root}")
+    if os.path.isfile(os.path.join(root, "coord.npy")):
+        return [root]
+    scenes = []
+    for name in sorted(os.listdir(root)):
+        sub = os.path.join(root, name)
+        if os.path.isdir(sub) and os.path.isfile(os.path.join(sub, "coord.npy")):
+            scenes.append(sub)
+    return scenes
+
+
+def write_summary(
+    scene_metrics_list: list,
+    aggregate_confmat: np.ndarray,
+    out_dir: str,
+):
+    """Write summary.json + summary.csv across all processed scenes.
+
+    - Macro average: per-scene mIoU averaged across scenes.
+    - Micro average: mIoU computed from the aggregated confusion matrix.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Macro averages from per-scene numbers
+    scene_mious = [m["mIoU"] for m in scene_metrics_list if "mIoU" in m]
+    scene_accs = [m["overall_accuracy"] for m in scene_metrics_list if "overall_accuracy" in m]
+    macro_miou = float(np.nanmean(scene_mious)) if scene_mious else float("nan")
+    macro_acc = float(np.nanmean(scene_accs)) if scene_accs else float("nan")
+
+    # Macro per-class IoU: average per-class IoUs across scenes (nan-aware)
+    macro_per_class = {}
+    for cls in CLASS_LABELS_20:
+        vals = []
+        for m in scene_metrics_list:
+            v = m.get("per_class_iou", {}).get(cls)
+            if v is not None:
+                vals.append(v)
+        macro_per_class[cls] = float(np.mean(vals)) if vals else None
+
+    # Micro averages from aggregate confmat
+    if aggregate_confmat is not None and aggregate_confmat.sum() > 0:
+        micro = metrics_from_confmat(aggregate_confmat)
+    else:
+        micro = None
+
+    summary = {
+        "num_scenes_processed": len(scene_metrics_list),
+        "num_scenes_with_gt": sum(1 for m in scene_metrics_list if "mIoU" in m),
+        "macro_average": {
+            "overall_accuracy": macro_acc,
+            "mIoU": macro_miou,
+            "per_class_iou": macro_per_class,
+        },
+        "micro_average": micro,
+        "scenes": [
+            {
+                "scene_id": m["scene_id"],
+                "num_points_input": m.get("num_points_input"),
+                "overall_accuracy": m.get("overall_accuracy"),
+                "mIoU": m.get("mIoU"),
+                "inference_seconds": m.get("inference_seconds"),
+            }
+            for m in scene_metrics_list
+        ],
+    }
+
+    with open(os.path.join(out_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # CSV: one row per scene, columns = scene_id, num_points, acc, mIoU,
+    # then per-class IoUs.
+    csv_path = os.path.join(out_dir, "summary.csv")
+    header = ["scene_id", "num_points", "overall_accuracy", "mIoU"] + list(CLASS_LABELS_20)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        for m in scene_metrics_list:
+            row = [
+                m["scene_id"],
+                m.get("num_points_input", ""),
+                f"{m['overall_accuracy']:.6f}" if "overall_accuracy" in m else "",
+                f"{m['mIoU']:.6f}" if "mIoU" in m else "",
+            ]
+            per_cls = m.get("per_class_iou", {})
+            for cls in CLASS_LABELS_20:
+                v = per_cls.get(cls)
+                row.append(f"{v:.6f}" if v is not None else "")
+            writer.writerow(row)
+        # Aggregate rows
+        if micro is not None:
+            writer.writerow([])
+            writer.writerow(
+                ["MICRO_AVG", micro["num_points_evaluated"],
+                 f"{micro['overall_accuracy']:.6f}", f"{micro['mIoU']:.6f}"]
+                + [
+                    f"{micro['per_class_iou'][cls]:.6f}"
+                    if micro['per_class_iou'][cls] is not None else ""
+                    for cls in CLASS_LABELS_20
+                ]
+            )
+        writer.writerow(
+            ["MACRO_AVG", "", f"{macro_acc:.6f}", f"{macro_miou:.6f}"]
+            + [
+                f"{macro_per_class[cls]:.6f}" if macro_per_class[cls] is not None else ""
+                for cls in CLASS_LABELS_20
+            ]
         )
+
+    if aggregate_confmat is not None:
+        np.save(os.path.join(out_dir, "aggregate_confmat.npy"), aggregate_confmat)
+
+    print(f"\nSummary written: {csv_path}")
+    print(f"Summary written: {os.path.join(out_dir, 'summary.json')}")
+    print(f"\nMacro avg  | acc={macro_acc:.4f}  mIoU={macro_miou:.4f}")
+    if micro is not None:
+        print(f"Micro avg  | acc={micro['overall_accuracy']:.4f}  mIoU={micro['mIoU']:.4f}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run Utonia semantic segmentation on a preprocessed scene folder "
+            "or a parent directory containing many scenes."
+        )
+    )
+    parser.add_argument(
+        "input",
+        help=(
+            "Either a single scene folder (containing coord.npy/color.npy/...) "
+            "or a parent directory whose subfolders are scenes. Auto-detected."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir", "-o", default="./utonia_semseg_out",
+        help="Output root directory. Per-scene outputs go to <out-dir>/<scene_id>/ "
+             "and aggregated summary to <out-dir>/summary.{json,csv}.",
+    )
+    parser.add_argument(
+        "--gt-segment", choices=["segment20", "segment200"], default="segment20",
+        help="Which ground-truth segment file to compare against (default: segment20).",
+    )
+    parser.add_argument(
+        "--wo_color", action="store_true", help="disable the color."
+    )
+    parser.add_argument(
+        "--wo_normal", action="store_true", help="disable the normal."
+    )
+    parser.add_argument(
+        "--save-ply", action="store_true",
+        help="Save input/pred/gt PLY files under <out-dir>/<scene_id>/ply/.",
+    )
+    parser.add_argument(
+        "--save-png", action="store_true",
+        help="Render PNG snapshots under <out-dir>/<scene_id>/png/.",
+    )
+    parser.add_argument(
+        "--png-width", type=int, default=1280, help="PNG width (default 1280)"
+    )
+    parser.add_argument(
+        "--png-height", type=int, default=960, help="PNG height (default 960)"
+    )
+    parser.add_argument(
+        "--point-size", type=float, default=2.0,
+        help="Point size for PNG rendering (default 2.0)",
+    )
+    parser.add_argument(
+        "--backend", choices=["auto", "open3d", "matplotlib"], default="auto",
+        help="PNG rendering backend. 'matplotlib' works on headless servers; "
+             "'open3d' is higher quality but needs OpenGL.",
+    )
+    parser.add_argument(
+        "--max-points", type=int, default=150_000,
+        help="Max points for matplotlib rendering (subsample above this).",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="In batch mode, only process the first N scenes (for testing).",
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="Skip scenes whose metrics.json already exists in the output dir.",
+    )
+    args = parser.parse_args()
+
+    utonia.utils.set_seed(46647087)
+
+    # ---- Discover scenes ----
+    scenes = discover_scenes(args.input)
+    if not scenes:
+        raise RuntimeError(
+            f"No scenes found under {args.input}. A scene folder must contain "
+            f"a coord.npy file."
+        )
+    if args.limit is not None:
+        scenes = scenes[: args.limit]
+    print(f"Discovered {len(scenes)} scene(s) to process.")
+
+    # ---- Load model once ----
+    print("Loading Utonia model...")
+    model, seg_head = load_utonia_model()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # ---- Process scenes ----
+    all_metrics = []
+    aggregate_confmat = np.zeros((20, 20), dtype=np.int64)
+    n_ok, n_fail, n_skipped = 0, 0, 0
+
+    for i, scene_dir in enumerate(scenes, start=1):
+        scene_id = os.path.basename(os.path.normpath(scene_dir))
+        scene_out = os.path.join(args.out_dir, scene_id)
+        print(f"\n[{i}/{len(scenes)}] {scene_id}")
+
+        metrics_path = os.path.join(scene_out, "metrics.json")
+        if args.skip_existing and os.path.isfile(metrics_path):
+            print(f"  (skipped: {metrics_path} exists)")
+            try:
+                with open(metrics_path) as f:
+                    prev = json.load(f)
+                all_metrics.append(prev)
+                confmat_path = os.path.join(scene_out, "confmat.npy")
+                if os.path.isfile(confmat_path):
+                    aggregate_confmat += np.load(confmat_path)
+                n_skipped += 1
+            except Exception as e:
+                print(f"  warning: could not load cached metrics: {e}")
+            continue
+
+        try:
+            metrics, confmat = process_scene(
+                model, seg_head, scene_dir, scene_out, args
+            )
+            all_metrics.append(metrics)
+            if confmat is not None:
+                aggregate_confmat += confmat
+            if "mIoU" in metrics:
+                print(
+                    f"  acc={metrics['overall_accuracy']:.4f}  "
+                    f"mIoU={metrics['mIoU']:.4f}  "
+                    f"({metrics['inference_seconds']:.2f}s)"
+                )
+            else:
+                print(f"  (no GT available) ({metrics['inference_seconds']:.2f}s)")
+            n_ok += 1
+        except Exception as e:
+            n_fail += 1
+            print(f"  ERROR: {e}")
+            traceback.print_exc()
+            # Keep a failure record so batch run can continue
+            with open(os.path.join(args.out_dir, "failures.log"), "a") as f:
+                f.write(f"{scene_id}\t{type(e).__name__}: {e}\n")
+
+    # ---- Aggregate summary ----
+    print(f"\nProcessed: {n_ok} ok, {n_skipped} skipped, {n_fail} failed")
+    if all_metrics:
+        write_summary(all_metrics, aggregate_confmat, args.out_dir)
+    else:
+        print("No scenes successfully processed; no summary written.")
