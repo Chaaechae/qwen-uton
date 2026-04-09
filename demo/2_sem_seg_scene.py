@@ -160,6 +160,224 @@ def make_pcd(coord: np.ndarray, rgb: np.ndarray, offset=(0.0, 0.0, 0.0)):
     return pcd
 
 
+# --- Matplotlib / Open3D rendering view presets ---------------------------
+# Keys are used as filename suffixes; values are (elev, azim) for matplotlib
+# and (front, up) vectors for Open3D.
+MPL_VIEW_PRESETS = {
+    "top":   (90.0,  -90.0),
+    "front": (0.0,   -90.0),
+    "back":  (0.0,    90.0),
+    "left":  (0.0,     0.0),
+    "right": (0.0,   180.0),
+    "iso":   (30.0,  -45.0),
+}
+
+O3D_VIEW_PRESETS = {
+    "top":   ([0.0,  0.0, -1.0], [0.0,  1.0, 0.0]),
+    "front": ([0.0, -1.0,  0.0], [0.0,  0.0, 1.0]),
+    "back":  ([0.0,  1.0,  0.0], [0.0,  0.0, 1.0]),
+    "left":  ([1.0,  0.0,  0.0], [0.0,  0.0, 1.0]),
+    "right": ([-1.0, 0.0,  0.0], [0.0,  0.0, 1.0]),
+    "iso":   ([-0.7, -0.7, -0.7], [0.0, 0.0, 1.0]),
+}
+
+
+def _safe_name(title: str) -> str:
+    return title.replace(" ", "_").replace("(", "").replace(")", "")
+
+
+def render_views_to_png_open3d(
+    pcd_list,
+    titles,
+    out_dir: str,
+    width: int = 1280,
+    height: int = 960,
+    point_size: float = 2.0,
+    bg_color=(1.0, 1.0, 1.0),
+):
+    """Open3D offscreen renderer. Requires OpenGL/X. May fail headless."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    def _render(geoms, filename):
+        vis = o3d.visualization.Visualizer()
+        created = vis.create_window(
+            window_name="render", width=width, height=height, visible=False
+        )
+        if not created:
+            raise RuntimeError("Open3D failed to create a rendering window")
+        for g in geoms:
+            vis.add_geometry(g)
+        opt = vis.get_render_option()
+        if opt is not None:
+            opt.background_color = np.asarray(bg_color)
+            opt.point_size = point_size
+        for view_name, (front, up) in O3D_VIEW_PRESETS.items():
+            ctr = vis.get_view_control()
+            ctr.set_front(front)
+            ctr.set_up(up)
+            ctr.set_lookat(
+                np.mean(
+                    np.concatenate([np.asarray(g.points) for g in geoms], axis=0),
+                    axis=0,
+                ).tolist()
+            )
+            ctr.set_zoom(0.7)
+            vis.poll_events()
+            vis.update_renderer()
+            out_path = os.path.join(out_dir, f"{filename}_{view_name}.png")
+            vis.capture_screen_image(out_path, do_render=True)
+            print(f"  saved: {out_path}")
+        vis.destroy_window()
+
+    for pcd, title in zip(pcd_list, titles):
+        pts = np.asarray(pcd.points)
+        centered = o3d.geometry.PointCloud()
+        centered.points = o3d.utility.Vector3dVector(pts - pts.mean(axis=0))
+        centered.colors = pcd.colors
+        _render([centered], _safe_name(title))
+
+    _render(list(pcd_list), "all")
+
+
+def render_views_to_png_matplotlib(
+    pcd_list,
+    titles,
+    out_dir: str,
+    width: int = 1280,
+    height: int = 960,
+    point_size: float = 2.0,
+    bg_color=(1.0, 1.0, 1.0),
+    max_points: int = 150_000,
+):
+    """Pure-CPU renderer using matplotlib. No OpenGL / display needed.
+
+    Large point clouds are randomly subsampled to `max_points` to keep
+    rendering tractable (matplotlib's 3D scatter is ~O(N)).
+    """
+    # Force non-interactive backend BEFORE importing pyplot.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    # Registering the 3D projection import is required for side-effects.
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    os.makedirs(out_dir, exist_ok=True)
+    dpi = 100
+    figsize = (width / dpi, height / dpi)
+
+    rng = np.random.default_rng(0)
+
+    def _subsample(pts, cols):
+        if pts.shape[0] > max_points:
+            idx = rng.choice(pts.shape[0], size=max_points, replace=False)
+            return pts[idx], cols[idx]
+        return pts, cols
+
+    def _set_equal_aspect(ax, pts):
+        mins = pts.min(axis=0)
+        maxs = pts.max(axis=0)
+        center = (mins + maxs) / 2.0
+        half = (maxs - mins).max() / 2.0 * 1.05
+        ax.set_xlim(center[0] - half, center[0] + half)
+        ax.set_ylim(center[1] - half, center[1] + half)
+        ax.set_zlim(center[2] - half, center[2] + half)
+
+    def _render_single(pts, cols, filename, title):
+        pts, cols = _subsample(pts, cols)
+        for view_name, (elev, azim) in MPL_VIEW_PRESETS.items():
+            fig = plt.figure(figsize=figsize, dpi=dpi)
+            fig.patch.set_facecolor(bg_color)
+            ax = fig.add_subplot(111, projection="3d")
+            ax.set_facecolor(bg_color)
+            ax.scatter(
+                pts[:, 0], pts[:, 1], pts[:, 2],
+                c=np.clip(cols, 0.0, 1.0),
+                s=point_size, marker=".", linewidths=0, depthshade=False,
+            )
+            _set_equal_aspect(ax, pts)
+            ax.view_init(elev=elev, azim=azim)
+            ax.set_axis_off()
+            ax.set_title(f"{title} — {view_name}")
+            fig.tight_layout(pad=0)
+            out_path = os.path.join(out_dir, f"{_safe_name(title)}_{view_name}.png")
+            fig.savefig(out_path, dpi=dpi, facecolor=bg_color,
+                        bbox_inches="tight", pad_inches=0.1)
+            plt.close(fig)
+            print(f"  saved: {out_path}")
+
+    def _render_combined(pcd_list, titles):
+        """One figure per view containing all point clouds as subplots."""
+        n = len(pcd_list)
+        for view_name, (elev, azim) in MPL_VIEW_PRESETS.items():
+            fig = plt.figure(figsize=(figsize[0] * n, figsize[1]), dpi=dpi)
+            fig.patch.set_facecolor(bg_color)
+            for i, (pcd, title) in enumerate(zip(pcd_list, titles)):
+                pts = np.asarray(pcd.points)
+                cols = np.asarray(pcd.colors)
+                pts_c = pts - pts.mean(axis=0)  # center each
+                pts_c, cols_c = _subsample(pts_c, cols)
+                ax = fig.add_subplot(1, n, i + 1, projection="3d")
+                ax.set_facecolor(bg_color)
+                ax.scatter(
+                    pts_c[:, 0], pts_c[:, 1], pts_c[:, 2],
+                    c=np.clip(cols_c, 0.0, 1.0),
+                    s=point_size, marker=".", linewidths=0, depthshade=False,
+                )
+                _set_equal_aspect(ax, pts_c)
+                ax.view_init(elev=elev, azim=azim)
+                ax.set_axis_off()
+                ax.set_title(title, fontsize=10)
+            fig.tight_layout(pad=0.5)
+            out_path = os.path.join(out_dir, f"all_{view_name}.png")
+            fig.savefig(out_path, dpi=dpi, facecolor=bg_color,
+                        bbox_inches="tight", pad_inches=0.1)
+            plt.close(fig)
+            print(f"  saved: {out_path}")
+
+    for pcd, title in zip(pcd_list, titles):
+        pts = np.asarray(pcd.points)
+        cols = np.asarray(pcd.colors)
+        pts_c = pts - pts.mean(axis=0)
+        _render_single(pts_c, cols, _safe_name(title), title)
+
+    _render_combined(pcd_list, titles)
+
+
+def render_views_to_png(
+    pcd_list,
+    titles,
+    out_dir: str,
+    backend: str = "auto",
+    **kwargs,
+):
+    """Dispatch to the requested rendering backend.
+
+    backend:
+        "open3d"     - Open3D offscreen (needs OpenGL / X / xvfb)
+        "matplotlib" - Matplotlib Agg (pure CPU, no display needed)
+        "auto"       - try Open3D, fall back to matplotlib on failure
+    """
+    # open3d backend does not accept `max_points`; strip it when dispatching.
+    o3d_kwargs = {k: v for k, v in kwargs.items() if k != "max_points"}
+
+    if backend == "open3d":
+        render_views_to_png_open3d(pcd_list, titles, out_dir, **o3d_kwargs)
+        return "open3d"
+    if backend == "matplotlib":
+        render_views_to_png_matplotlib(pcd_list, titles, out_dir, **kwargs)
+        return "matplotlib"
+    if backend == "auto":
+        try:
+            render_views_to_png_open3d(pcd_list, titles, out_dir, **o3d_kwargs)
+            return "open3d"
+        except Exception as e:
+            print(f"[render] Open3D backend failed ({e}); "
+                  f"falling back to matplotlib.")
+            render_views_to_png_matplotlib(pcd_list, titles, out_dir, **kwargs)
+            return "matplotlib"
+    raise ValueError(f"Unknown backend: {backend}")
+
+
 def compute_miou(pred: np.ndarray, gt: np.ndarray, num_classes: int = 20):
     """Compute mean IoU and per-class IoU, ignoring gt == -1."""
     valid = gt >= 0
@@ -203,6 +421,34 @@ if __name__ == "__main__":
         "--save-ply-dir", default=None,
         help="If set, save pred/gt/input PLY files to this directory instead of "
              "opening an interactive viewer.",
+    )
+    parser.add_argument(
+        "--save-png-dir", default=None,
+        help="If set, render PNG snapshots from multiple viewpoints "
+             "(top/front/back/left/right/iso) for input/pred/gt and a combined "
+             "side-by-side 'all' view. Can be combined with --save-ply-dir.",
+    )
+    parser.add_argument(
+        "--png-width", type=int, default=1280, help="PNG width (default 1280)"
+    )
+    parser.add_argument(
+        "--png-height", type=int, default=960, help="PNG height (default 960)"
+    )
+    parser.add_argument(
+        "--point-size", type=float, default=2.0,
+        help="Point size for PNG rendering (default 2.0)",
+    )
+    parser.add_argument(
+        "--backend", choices=["auto", "open3d", "matplotlib"], default="auto",
+        help="PNG rendering backend. 'matplotlib' works on headless servers "
+             "with no OpenGL/display; 'open3d' is higher quality but needs "
+             "OpenGL; 'auto' tries open3d first and falls back to matplotlib.",
+    )
+    parser.add_argument(
+        "--max-points", type=int, default=150_000,
+        help="Max points for matplotlib rendering (subsample above this). "
+             "Matplotlib 3D scatter is slow; lower this for faster PNG output. "
+             "Ignored for open3d backend. Default 150000.",
     )
     args = parser.parse_args()
 
@@ -337,7 +583,9 @@ if __name__ == "__main__":
         titles.append(f"GT ({args.gt_segment})")
     print("\nLayout (left -> right):", " | ".join(titles))
 
-    # ---- Visualize or save ----
+    # ---- Save / visualize ----
+    did_save = False
+
     if args.save_ply_dir:
         os.makedirs(args.save_ply_dir, exist_ok=True)
         o3d.io.write_point_cloud(
@@ -352,7 +600,25 @@ if __name__ == "__main__":
                 geometries[2],
             )
         print(f"Saved PLY files to: {args.save_ply_dir}")
-    else:
+        did_save = True
+
+    if args.save_png_dir:
+        print(f"Rendering PNG snapshots to: {args.save_png_dir} "
+              f"(backend={args.backend})")
+        used = render_views_to_png(
+            geometries,
+            titles,
+            out_dir=args.save_png_dir,
+            backend=args.backend,
+            width=args.png_width,
+            height=args.png_height,
+            point_size=args.point_size,
+            max_points=args.max_points,
+        )
+        print(f"PNG rendering done (backend used: {used})")
+        did_save = True
+
+    if not did_save:
         o3d.visualization.draw_geometries(
             geometries, window_name="Utonia semseg: input | pred | gt"
         )
