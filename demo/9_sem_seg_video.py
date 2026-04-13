@@ -744,10 +744,10 @@ if __name__ == "__main__":
                         help="Path to input video file")
     parser.add_argument("--conf-thres", type=float, default=10.0,
                         help="VGGT confidence threshold percentile")
-    parser.add_argument("--frame-interval", type=float, default=0,
-                        help="Frame interval in seconds. "
-                             "0 = use ALL frames (default), "
-                             "e.g. 1.0 = 1 frame per second")
+    parser.add_argument("--frame-interval", type=float, default=1.0,
+                        help="Frame interval in seconds (default: 1.0 = 1 fps). "
+                             "0 = use ALL frames (not recommended: too many frames "
+                             "degrades VGGT reconstruction quality).")
     parser.add_argument("--prediction-mode", type=str,
                         choices=["Pointmap Branch", "Depthmap and Camera Branch"],
                         default="Depthmap and Camera Branch")
