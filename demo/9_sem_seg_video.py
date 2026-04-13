@@ -269,6 +269,43 @@ def voxel_downsample(coord, color, normal, voxel_size):
     )
 
 
+def _render_diagnostic_png(
+    coord, color, out_dir, prefix, max_points=120_000,
+):
+    """Render a single point cloud from 4 views and save as PNG."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa
+
+    os.makedirs(out_dir, exist_ok=True)
+    rng = np.random.default_rng(42)
+    pts = coord - coord.mean(axis=0)
+    col = np.clip(color, 0, 1)
+    if pts.shape[0] > max_points:
+        idx = rng.choice(pts.shape[0], max_points, replace=False)
+        pts, col = pts[idx], col[idx]
+    lim = np.abs(pts).max() * 1.1
+
+    views = {"top": (90, -90), "front": (0, -90), "side": (0, 0), "iso": (30, -45)}
+    for vname, (elev, azim) in views.items():
+        fig = plt.figure(figsize=(8, 8), dpi=120)
+        fig.patch.set_facecolor("white")
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_facecolor("white")
+        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2],
+                   c=col, s=1.5, marker=".", linewidths=0, depthshade=False)
+        ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_axis_off()
+        ax.set_title(f"{prefix} — {vname} ({coord.shape[0]} pts)", fontsize=10)
+        fig.tight_layout(pad=0)
+        path = os.path.join(out_dir, f"{prefix}_{vname}.png")
+        fig.savefig(path, dpi=120, bbox_inches="tight", pad_inches=0.1)
+        plt.close(fig)
+        print(f"  saved: {path}")
+
+
 def reconstruct_from_video(
     video_path, conf_thres, frame_interval, prediction_mode, if_TSDF,
     output_dir, native_resolution=False, voxel_size=0.0,
@@ -292,7 +329,7 @@ def reconstruct_from_video(
     target_images = os.path.join(output_dir, "images")
     os.makedirs(target_images, exist_ok=True)
 
-    # Extract frames
+    # Extract frames (use simple counter for reliability across codecs)
     vs = cv2.VideoCapture(video_path)
     fps = vs.get(cv2.CAP_PROP_FPS)
     total_frames = int(vs.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -302,15 +339,15 @@ def reconstruct_from_video(
     else:
         skip = max(1, int(fps * frame_interval))
 
-    idx = 0
+    count, idx = 0, 0
     while True:
         ok, frame = vs.read()
         if not ok:
             break
-        frame_no = int(vs.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-        if frame_no % skip == 0:
+        if count % skip == 0:
             cv2.imwrite(os.path.join(target_images, f"{idx:06d}.png"), frame)
             idx += 1
+        count += 1
     vs.release()
     print(f"Extracted {idx}/{total_frames} frames from video "
           f"(fps={fps:.1f}, interval={frame_interval}s, skip={skip})")
@@ -399,7 +436,8 @@ def reconstruct_from_video(
             thr = np.percentile(conf, conf_thres) if conf_thres > 0 else 0.0
             mask = (conf >= thr) & (conf > 1e-5)
             points, colors = points[mask], colors[mask]
-            view_dirs_filtered = view_dirs[mask] if view_dirs.shape[0] == mask.shape[0] else None
+            if view_dirs.shape[0] == mask.shape[0]:
+                view_dirs = view_dirs[mask]
             points, Ts_inv, _ = Coord2zup(points, Ts_inv)
             scale = 3 / (points[:, 2].max() - points[:, 2].min())
             points *= scale
@@ -433,6 +471,12 @@ def reconstruct_from_video(
             coord, color_out, normal_out, voxel_size
         )
         print(f"Points after voxel downsample (voxel_size={voxel_size}): {coord.shape[0]}")
+
+    # Save raw VGGT point cloud diagnostic as PNG (matplotlib, headless-safe)
+    diag_dir = os.path.join(output_dir, "diagnostics")
+    os.makedirs(diag_dir, exist_ok=True)
+    _render_diagnostic_png(coord, np.clip(color_out, 0, 1), diag_dir, "vggt_raw")
+    print(f"Diagnostic: saved VGGT cloud PNGs to {diag_dir}/")
 
     # Color from VGGT is [0,1] float; Utonia expects [0,255]
     if color_out.max() <= 1.0:
@@ -605,8 +649,17 @@ def run_utonia_semseg(coord, color, normal, model, seg_head, scale=0.5):
 def render_comparison_png(
     coord, color_rgb, pred_labels, gt_labels,
     out_dir, point_size=1.5, max_points=120_000,
+    gt_ref_coord=None, gt_ref_labels=None, gt_ref_color=None,
 ):
-    """Render input / prediction / GT side-by-side from multiple views."""
+    """Render comparison panels from multiple views.
+
+    Panels (left to right):
+      1. Input RGB (VGGT geometry + VGGT color)
+      2. Prediction (VGGT geometry + predicted seg colors)
+      3. GT-on-VGGT (VGGT geometry + transferred GT labels)   [if gt_labels]
+      4. GT reference (GT geometry + GT labels)                [if gt_ref_coord]
+      5. GT reference RGB (GT geometry + GT color)             [if gt_ref_color]
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -621,17 +674,27 @@ def render_comparison_png(
             return (pts[idx],) + tuple(a[idx] for a in arrs)
         return (pts,) + arrs
 
-    # Prepare colors
-    pred_color = CLASS_COLOR_20[pred_labels] / 255.0
-    if gt_labels is not None:
-        gt_color = np.zeros((gt_labels.shape[0], 3))
-        valid = gt_labels >= 0
-        gt_color[valid] = CLASS_COLOR_20[gt_labels[valid]] / 255.0
-    input_color = np.clip(color_rgb / 255.0, 0, 1) if color_rgb.max() > 1 else np.clip(color_rgb, 0, 1)
+    def _labels_to_color(labels):
+        c = np.zeros((labels.shape[0], 3))
+        valid = labels >= 0
+        c[valid] = CLASS_COLOR_20[labels[valid]] / 255.0
+        return c
 
-    panels = [("input_RGB", input_color), ("prediction", pred_color)]
+    input_color = np.clip(color_rgb / 255.0, 0, 1) if color_rgb.max() > 1 else np.clip(color_rgb, 0, 1)
+    pred_color = CLASS_COLOR_20[pred_labels] / 255.0
+
+    # Each panel: (title, coord, color)
+    panels = [
+        ("input RGB (VGGT)", coord, input_color),
+        ("prediction (VGGT)", coord, pred_color),
+    ]
     if gt_labels is not None:
-        panels.append(("GT_segment20", gt_color))
+        panels.append(("GT labels on VGGT geom", coord, _labels_to_color(gt_labels)))
+    if gt_ref_coord is not None and gt_ref_labels is not None:
+        panels.append(("GT reference (GT geom)", gt_ref_coord, _labels_to_color(gt_ref_labels)))
+    if gt_ref_coord is not None and gt_ref_color is not None:
+        gt_rgb = np.clip(gt_ref_color / 255.0, 0, 1) if gt_ref_color.max() > 1 else np.clip(gt_ref_color, 0, 1)
+        panels.append(("GT RGB (GT geom)", gt_ref_coord, gt_rgb))
 
     views = {
         "top":   (90, -90),
@@ -639,10 +702,6 @@ def render_comparison_png(
         "side":  (0, 0),
         "iso":   (30, -45),
     }
-
-    # Center
-    center = coord.mean(axis=0)
-    pts_c = coord - center
 
     def _set_equal(ax, pts):
         lim = np.abs(pts).max() * 1.1
@@ -652,9 +711,10 @@ def render_comparison_png(
 
     for view_name, (elev, azim) in views.items():
         n = len(panels)
-        fig = plt.figure(figsize=(7 * n, 7), dpi=120)
+        fig = plt.figure(figsize=(6 * n, 6), dpi=120)
         fig.patch.set_facecolor("white")
-        for i, (title, col) in enumerate(panels):
+        for i, (title, pts, col) in enumerate(panels):
+            pts_c = pts - pts.mean(axis=0)
             pts_s, col_s = _sub(pts_c, col)
             ax = fig.add_subplot(1, n, i + 1, projection="3d")
             ax.set_facecolor("white")
@@ -663,7 +723,7 @@ def render_comparison_png(
             _set_equal(ax, pts_s)
             ax.view_init(elev=elev, azim=azim)
             ax.set_axis_off()
-            ax.set_title(title, fontsize=11)
+            ax.set_title(title, fontsize=10)
         fig.tight_layout(pad=0.5)
         path = os.path.join(out_dir, f"comparison_{view_name}.png")
         fig.savefig(path, dpi=120, bbox_inches="tight", pad_inches=0.1)
@@ -912,13 +972,16 @@ if __name__ == "__main__":
             pc.export(os.path.join(ply_dir, "gt_seg20.ply"))
         print(f"PLY saved: {ply_dir}")
 
-    # PNG
+    # PNG — include actual GT geometry as reference panels
     if args.save_png:
         png_dir = os.path.join(args.out_dir, "png")
         render_comparison_png(
             coord_for_utonia, color_for_utonia, pred_full,
             gt_labels_transferred, png_dir,
             point_size=args.point_size, max_points=args.max_points,
+            gt_ref_coord=gt["coord"] if gt is not None else None,
+            gt_ref_labels=gt["segment"] if gt is not None else None,
+            gt_ref_color=gt.get("color") if gt is not None else None,
         )
 
     # ---- Summary ----
