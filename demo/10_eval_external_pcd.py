@@ -122,11 +122,242 @@ def load_gt_scene(scene_dir, gt_segment="segment20"):
 
 
 # ---------------------------------------------------------------------------
-# ICP alignment
+# Outlier removal
 # ---------------------------------------------------------------------------
+def remove_statistical_outliers(coord, labels, color=None, nb_neighbors=20, std_ratio=2.0):
+    """Remove statistical outliers using Open3D SOR.
+
+    Points whose mean distance to k-nearest neighbors exceeds
+    (global_mean + std_ratio * global_std) are removed.
+    """
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(coord)
+    _, inlier_idx = pcd.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors, std_ratio=std_ratio,
+    )
+    inlier_idx = np.asarray(inlier_idx)
+    n_before = coord.shape[0]
+    coord = coord[inlier_idx]
+    labels = labels[inlier_idx]
+    if color is not None:
+        color = color[inlier_idx]
+    n_removed = n_before - coord.shape[0]
+    print(f"  SOR: {n_before} -> {coord.shape[0]} ({n_removed} removed, "
+          f"nb={nb_neighbors}, std={std_ratio})")
+    return coord, labels, color
+
+
+def clip_to_bbox(coord, labels, ref_coord, margin=0.1, color=None):
+    """Remove points outside the bounding box of ref_coord (+ margin).
+
+    margin is a fraction of the bbox diagonal added on each side.
+    """
+    ref_min = ref_coord.min(axis=0)
+    ref_max = ref_coord.max(axis=0)
+    diag = np.linalg.norm(ref_max - ref_min)
+    pad = diag * margin
+    lo = ref_min - pad
+    hi = ref_max + pad
+    mask = np.all((coord >= lo) & (coord <= hi), axis=1)
+    n_before = coord.shape[0]
+    coord = coord[mask]
+    labels = labels[mask]
+    if color is not None:
+        color = color[mask]
+    n_removed = n_before - coord.shape[0]
+    print(f"  BBox clip: {n_before} -> {coord.shape[0]} ({n_removed} removed, "
+          f"margin={margin})")
+    return coord, labels, color
+
+
+# ---------------------------------------------------------------------------
+# Alignment
+# ---------------------------------------------------------------------------
+def _umeyama(src, dst):
+    """Estimate similarity transform (scale, R, t) from corresponding points.
+
+    Solves:  dst = scale * R @ src + t   (least-squares, closed-form).
+    Returns scale (float), R (3x3), t (3,).
+    Reference: Umeyama, PAMI 1991.
+    """
+    n = src.shape[0]
+    mu_s = src.mean(axis=0)
+    mu_d = dst.mean(axis=0)
+    src_c = src - mu_s
+    dst_c = dst - mu_d
+    var_s = (src_c ** 2).sum() / n
+    cov = (dst_c.T @ src_c) / n
+    U, D, Vt = np.linalg.svd(cov)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[2, 2] = -1
+    R = U @ S @ Vt
+    scale = (D * np.diag(S)).sum() / var_s
+    t = mu_d - scale * R @ mu_s
+    return scale, R, t
+
+
+def _make_pcd(pts, voxel_size=0.0):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    if voxel_size > 0:
+        pcd = pcd.voxel_down_sample(voxel_size)
+    return pcd
+
+
+def robust_align(source_pts, target_pts, downsample_voxel=0.05,
+                 ransac_distance_multiplier=0.05, icp_refine=True,
+                 percentile_scale=True):
+    """Robust alignment: FPFH+RANSAC global registration → Umeyama scale → ICP refine.
+
+    Steps:
+      1. Coarse scale via percentile-based bbox (robust to outliers)
+      2. Downsample + FPFH feature extraction
+      3. RANSAC-based global registration (robust to outliers/ghosts)
+      4. Umeyama on RANSAC inlier correspondences → refine scale+R+t
+      5. Optional ICP refinement on the Umeyama-aligned result
+
+    Returns (aligned_pts, stats_dict).
+    """
+    # --- Step 1: Robust scale estimation ---
+    if percentile_scale:
+        # Use 5th-95th percentile extents instead of min/max
+        src_lo = np.percentile(source_pts, 5, axis=0)
+        src_hi = np.percentile(source_pts, 95, axis=0)
+        tgt_lo = np.percentile(target_pts, 5, axis=0)
+        tgt_hi = np.percentile(target_pts, 95, axis=0)
+    else:
+        src_lo, src_hi = source_pts.min(0), source_pts.max(0)
+        tgt_lo, tgt_hi = target_pts.min(0), target_pts.max(0)
+
+    src_diag = np.linalg.norm(src_hi - src_lo)
+    tgt_diag = np.linalg.norm(tgt_hi - tgt_lo)
+    coarse_scale = tgt_diag / max(src_diag, 1e-8)
+
+    src_center = np.median(source_pts, axis=0)
+    tgt_center = np.median(target_pts, axis=0)
+    src_prescaled = (source_pts - src_center) * coarse_scale + tgt_center
+
+    print(f"  Coarse scale: {coarse_scale:.4f} "
+          f"(src_diag={src_diag:.3f}, tgt_diag={tgt_diag:.3f})")
+
+    # --- Step 2: Downsample + FPFH ---
+    # Use a voxel size relative to target diagonal for consistent feature extraction
+    if downsample_voxel > 0:
+        fpfh_voxel = downsample_voxel
+    else:
+        fpfh_voxel = tgt_diag * 0.01  # fallback: 1% of target diagonal
+
+    pcd_src = _make_pcd(src_prescaled, fpfh_voxel)
+    pcd_tgt = _make_pcd(target_pts, fpfh_voxel)
+    print(f"  Downsampled: source {source_pts.shape[0]}->{len(pcd_src.points)}, "
+          f"target {target_pts.shape[0]}->{len(pcd_tgt.points)} "
+          f"(voxel={fpfh_voxel:.4f})")
+
+    radius_normal = fpfh_voxel * 2
+    radius_feature = fpfh_voxel * 5
+
+    pcd_src.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+    pcd_tgt.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=radius_normal, max_nn=30))
+
+    fpfh_src = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_src, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+    fpfh_tgt = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_tgt, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+
+    # --- Step 3: RANSAC global registration ---
+    ransac_dist = tgt_diag * ransac_distance_multiplier
+    print(f"  RANSAC (max_corr_dist={ransac_dist:.4f})...")
+    reg_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        pcd_src, pcd_tgt, fpfh_src, fpfh_tgt,
+        mutual_filter=True,
+        max_correspondence_distance=ransac_dist,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        ransac_n=3,
+        checkers=[
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(ransac_dist),
+        ],
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 0.999),
+    )
+    T_ransac = reg_ransac.transformation
+    print(f"  RANSAC fitness={reg_ransac.fitness:.4f}, "
+          f"inlier_rmse={reg_ransac.inlier_rmse:.6f}")
+
+    # Apply RANSAC transform to prescaled source
+    src_ransac = (T_ransac[:3, :3] @ src_prescaled.T).T + T_ransac[:3, 3]
+
+    # --- Step 4: Umeyama on correspondences → refine scale ---
+    # Find correspondences within ransac_dist
+    pcd_src_ransac = _make_pcd(src_ransac, fpfh_voxel)
+    pcd_tgt_for_corr = _make_pcd(target_pts, fpfh_voxel)
+
+    src_tree = KDTree(np.asarray(pcd_tgt_for_corr.points))
+    src_ransac_down = np.asarray(pcd_src_ransac.points)
+    dists, indices = src_tree.query(src_ransac_down, k=1)
+    inlier_mask = dists < ransac_dist
+    n_inliers = inlier_mask.sum()
+    print(f"  Correspondence inliers: {n_inliers}/{len(src_ransac_down)}")
+
+    umeyama_scale = 1.0
+    if n_inliers >= 10:
+        corr_src = src_ransac_down[inlier_mask]
+        corr_tgt = np.asarray(pcd_tgt_for_corr.points)[indices[inlier_mask]]
+        u_scale, u_R, u_t = _umeyama(corr_src, corr_tgt)
+        print(f"  Umeyama refinement: scale={u_scale:.4f}")
+        src_final = u_scale * (u_R @ src_ransac.T).T + u_t
+        umeyama_scale = u_scale
+    else:
+        print("  Too few inliers for Umeyama, using RANSAC transform only")
+        src_final = src_ransac
+
+    # --- Step 5: Optional ICP refinement ---
+    icp_stats = {}
+    if icp_refine:
+        pcd_src_final = _make_pcd(src_final)
+        pcd_tgt_full = _make_pcd(target_pts)
+        if downsample_voxel > 0:
+            pcd_src_icp = pcd_src_final.voxel_down_sample(downsample_voxel)
+            pcd_tgt_icp = pcd_tgt_full.voxel_down_sample(downsample_voxel)
+        else:
+            pcd_src_icp = pcd_src_final
+            pcd_tgt_icp = pcd_tgt_full
+
+        icp_dist = tgt_diag * 0.02  # tight distance for refinement
+        reg_icp = o3d.pipelines.registration.registration_icp(
+            pcd_src_icp, pcd_tgt_icp,
+            max_correspondence_distance=icp_dist,
+            init=np.eye(4),
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+        )
+        T_icp = reg_icp.transformation
+        src_final = (T_icp[:3, :3] @ src_final.T).T + T_icp[:3, 3]
+        icp_stats = {
+            "icp_fitness": float(reg_icp.fitness),
+            "icp_inlier_rmse": float(reg_icp.inlier_rmse),
+        }
+        print(f"  ICP refine: fitness={reg_icp.fitness:.4f}, "
+              f"rmse={reg_icp.inlier_rmse:.6f}")
+
+    total_scale = coarse_scale * umeyama_scale
+    stats = {
+        "coarse_scale": float(coarse_scale),
+        "umeyama_scale": float(umeyama_scale),
+        "total_scale": float(total_scale),
+        "ransac_fitness": float(reg_ransac.fitness),
+        "ransac_inlier_rmse": float(reg_ransac.inlier_rmse),
+        "n_correspondence_inliers": int(n_inliers),
+        **icp_stats,
+    }
+    return src_final, stats
+
+
 def icp_align(source_pts, target_pts, max_correspondence_distance=0.5,
               icp_downsample_voxel=0.05):
-    """Align source_pts to target_pts using ICP. Returns (aligned_pts, T_4x4, stats)."""
+    """Legacy ICP alignment (bbox-diagonal scale + rigid ICP). Returns (aligned_pts, T_4x4, stats)."""
     src_diag = np.linalg.norm(source_pts.max(0) - source_pts.min(0))
     tgt_diag = np.linalg.norm(target_pts.max(0) - target_pts.min(0))
     scale = tgt_diag / max(src_diag, 1e-8)
@@ -351,13 +582,38 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default=None,
                         help="Output directory (default: next to input file)")
 
-    # ICP
-    parser.add_argument("--no-icp", action="store_true",
-                        help="Skip ICP alignment (assume coords are already aligned)")
-    parser.add_argument("--icp-downsample-voxel", type=float, default=0.05,
-                        help="Voxel size for ICP downsampling (0 = no downsample)")
-    parser.add_argument("--icp-max-corr-dist", type=float, default=0.5,
-                        help="ICP max correspondence distance (fraction of bbox diag)")
+    # Outlier removal
+    parser.add_argument("--sor", action="store_true",
+                        help="Apply Statistical Outlier Removal before ICP")
+    parser.add_argument("--sor-neighbors", type=int, default=20,
+                        help="SOR: number of neighbors to consider (default: 20)")
+    parser.add_argument("--sor-std", type=float, default=2.0,
+                        help="SOR: std ratio threshold (default: 2.0, lower=stricter)")
+    parser.add_argument("--clip-bbox", action="store_true",
+                        help="Clip points to GT bounding box after ICP alignment")
+    parser.add_argument("--clip-margin", type=float, default=0.1,
+                        help="BBox clip: margin as fraction of GT diagonal (default: 0.1)")
+
+    # Alignment
+    align_group = parser.add_mutually_exclusive_group()
+    align_group.add_argument("--no-align", action="store_true",
+                             help="Skip alignment (assume coords are already aligned)")
+    align_group.add_argument("--legacy-icp", action="store_true",
+                             help="Use legacy ICP (bbox-scale + rigid ICP) instead of "
+                                  "robust alignment")
+    parser.add_argument("--align-downsample-voxel", type=float, default=0.05,
+                        help="Voxel size for alignment downsampling (default: 0.05)")
+    parser.add_argument("--ransac-dist-mult", type=float, default=0.05,
+                        help="RANSAC max correspondence distance as fraction of "
+                             "target bbox diagonal (default: 0.05)")
+    parser.add_argument("--no-icp-refine", action="store_true",
+                        help="Skip ICP refinement after RANSAC+Umeyama")
+
+    # Post-alignment outlier removal
+    parser.add_argument("--post-align-nn-filter", type=float, default=0,
+                        help="After alignment, remove points farther than this distance "
+                             "from any GT point. 0 = disabled (default). "
+                             "Recommended: 0.1-0.3")
 
     # Label transfer
     parser.add_argument("--nn-max-dist", type=float, default=0.1,
@@ -389,21 +645,56 @@ if __name__ == "__main__":
     print(f"  {gt_coord.shape[0]} points, "
           f"label range [{gt_labels.min()}, {gt_labels.max()}]")
 
-    # ---- ICP alignment ----
-    icp_stats = None
-    if not args.no_icp:
-        print("\nRunning ICP alignment...")
-        pred_coord_aligned, T_icp, icp_stats = icp_align(
-            pred_coord, gt_coord,
-            max_correspondence_distance=args.icp_max_corr_dist,
-            icp_downsample_voxel=args.icp_downsample_voxel,
+    # ---- Outlier removal (before ICP) ----
+    if args.sor:
+        print("\nStatistical Outlier Removal...")
+        pred_coord, pred_labels, pred_color = remove_statistical_outliers(
+            pred_coord, pred_labels, pred_color,
+            nb_neighbors=args.sor_neighbors, std_ratio=args.sor_std,
         )
-        print(f"  scale={icp_stats['scale']:.4f}, "
-              f"fitness={icp_stats['fitness']:.4f}, "
-              f"rmse={icp_stats['inlier_rmse']:.6f}")
-    else:
+
+    # ---- Alignment ----
+    align_stats = None
+    if args.no_align:
         pred_coord_aligned = pred_coord
-        print("\nSkipping ICP (--no-icp)")
+        print("\nSkipping alignment (--no-align)")
+    elif args.legacy_icp:
+        print("\nRunning legacy ICP alignment...")
+        pred_coord_aligned, _, align_stats = icp_align(
+            pred_coord, gt_coord,
+            max_correspondence_distance=args.ransac_dist_mult,
+            icp_downsample_voxel=args.align_downsample_voxel,
+        )
+    else:
+        print("\nRunning robust alignment (RANSAC + Umeyama + ICP)...")
+        pred_coord_aligned, align_stats = robust_align(
+            pred_coord, gt_coord,
+            downsample_voxel=args.align_downsample_voxel,
+            ransac_distance_multiplier=args.ransac_dist_mult,
+            icp_refine=not args.no_icp_refine,
+        )
+
+    # ---- Post-alignment outlier removal (NN distance to GT) ----
+    if args.post_align_nn_filter > 0:
+        print(f"\nPost-alignment NN filter (max_dist={args.post_align_nn_filter})...")
+        tree = KDTree(gt_coord)
+        dists, _ = tree.query(pred_coord_aligned, k=1)
+        keep = dists <= args.post_align_nn_filter
+        n_before = pred_coord_aligned.shape[0]
+        pred_coord_aligned = pred_coord_aligned[keep]
+        pred_labels = pred_labels[keep]
+        if pred_color is not None:
+            pred_color = pred_color[keep]
+        print(f"  {n_before} -> {pred_coord_aligned.shape[0]} "
+              f"({n_before - pred_coord_aligned.shape[0]} removed)")
+
+    # ---- BBox clip (after alignment, in GT coordinate frame) ----
+    if args.clip_bbox:
+        print("\nClipping to GT bounding box...")
+        pred_coord_aligned, pred_labels, pred_color = clip_to_bbox(
+            pred_coord_aligned, pred_labels, gt_coord,
+            margin=args.clip_margin, color=pred_color,
+        )
 
     # ---- Transfer GT labels to prediction points via NN ----
     print(f"\nTransferring GT labels (nn_max_dist={args.nn_max_dist})...")
@@ -427,8 +718,8 @@ if __name__ == "__main__":
         "input": os.path.abspath(args.input),
         "gt_scene_dir": os.path.abspath(args.gt_scene_dir),
         "gt_segment": args.gt_segment,
-        "icp_enabled": not args.no_icp,
-        "icp_stats": icp_stats,
+        "align_mode": "none" if args.no_align else ("legacy_icp" if args.legacy_icp else "robust"),
+        "align_stats": align_stats,
         "transfer_stats": transfer_stats,
         "metrics": metrics,
     }
