@@ -229,18 +229,26 @@ def reconstruct_from_video(
     # Extract frames
     vs = cv2.VideoCapture(video_path)
     fps = vs.get(cv2.CAP_PROP_FPS)
-    skip = int(fps * frame_interval)
-    count, idx = 0, 0
+    total_frames = int(vs.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if frame_interval <= 0:
+        # Use ALL frames
+        skip = 1
+    else:
+        skip = max(1, int(fps * frame_interval))
+
+    idx = 0
     while True:
         ok, frame = vs.read()
         if not ok:
             break
-        count += 1
-        if count % skip == 0:
+        frame_no = int(vs.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        if frame_no % skip == 0:
             cv2.imwrite(os.path.join(target_images, f"{idx:06d}.png"), frame)
             idx += 1
     vs.release()
-    print(f"Extracted {idx} frames from video")
+    print(f"Extracted {idx}/{total_frames} frames from video "
+          f"(fps={fps:.1f}, interval={frame_interval}s, skip={skip})")
 
     # Load VGGT
     vggt_model = VGGT().to(device)
@@ -574,8 +582,10 @@ if __name__ == "__main__":
                         help="Path to input video file")
     parser.add_argument("--conf-thres", type=float, default=10.0,
                         help="VGGT confidence threshold percentile")
-    parser.add_argument("--frame-interval", type=float, default=1.0,
-                        help="Frame interval in seconds")
+    parser.add_argument("--frame-interval", type=float, default=0,
+                        help="Frame interval in seconds. "
+                             "0 = use ALL frames (default), "
+                             "e.g. 1.0 = 1 frame per second")
     parser.add_argument("--prediction-mode", type=str,
                         choices=["Pointmap Branch", "Depthmap and Camera Branch"],
                         default="Depthmap and Camera Branch")
