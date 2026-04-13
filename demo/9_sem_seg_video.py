@@ -208,14 +208,80 @@ def extract_and_align_ground_plane(
     raise ValueError("Failed to find a valid ground plane within max trials.")
 
 
+def load_images_native_resolution(image_paths, target_size=None):
+    """Load images at their native resolution (or a specific target_size)
+    without upscaling to 518px.
+
+    VGGT requires H and W to be divisible by 14. If the native size is already
+    divisible (e.g. 224 = 14*16), no resize is performed. Otherwise the image
+    is resized to the nearest 14-divisible dimensions.
+
+    Args:
+        image_paths: list of image file paths.
+        target_size: int or None. If given, resize the short side to this value
+                     (keeping aspect ratio, rounded to 14-divisible). If None,
+                     use native resolution.
+    Returns:
+        torch.Tensor of shape (N, 3, H, W), float32, range [0, 1].
+    """
+    from torchvision import transforms as TF
+    from PIL import Image
+
+    to_tensor = TF.ToTensor()
+    tensors = []
+    for p in image_paths:
+        img = Image.open(p).convert("RGB")
+        w, h = img.size
+        if target_size is not None:
+            # Resize so that min(h, w) == target_size
+            if w <= h:
+                new_w = target_size
+                new_h = round(h * (new_w / w) / 14) * 14
+            else:
+                new_h = target_size
+                new_w = round(w * (new_h / h) / 14) * 14
+            new_w = max(14, (new_w // 14) * 14)
+            new_h = max(14, (new_h // 14) * 14)
+        else:
+            # Round to nearest 14-divisible
+            new_w = max(14, (w // 14) * 14)
+            new_h = max(14, (h // 14) * 14)
+        if (new_w, new_h) != (w, h):
+            img = img.resize((new_w, new_h), Image.Resampling.BICUBIC)
+        tensors.append(to_tensor(img))
+    return torch.stack(tensors)
+
+
+def voxel_downsample(coord, color, normal, voxel_size):
+    """Downsample point cloud using Open3D voxel grid.
+
+    Returns (coord, color, normal) as numpy arrays.
+    """
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(coord)
+    pcd.colors = o3d.utility.Vector3dVector(color)
+    pcd.normals = o3d.utility.Vector3dVector(normal)
+    pcd_down = pcd.voxel_down_sample(voxel_size)
+    return (
+        np.asarray(pcd_down.points),
+        np.asarray(pcd_down.colors),
+        np.asarray(pcd_down.normals),
+    )
+
+
 def reconstruct_from_video(
     video_path, conf_thres, frame_interval, prediction_mode, if_TSDF,
-    output_dir,
+    output_dir, native_resolution=False, voxel_size=0.0,
 ):
     """Run VGGT on video and return (coord, color, normal) numpy arrays.
 
-    Heavily based on 8_pca_video.py handle_uploads + parse_frames, but
-    restructured to avoid globals and return raw arrays.
+    Args:
+        native_resolution: if True, feed images at their native resolution
+                           instead of upscaling to 518px. Significant speedup
+                           when native is smaller (e.g. 224x224).
+        voxel_size: if > 0, voxel-downsample the output point cloud to this
+                    grid size (in VGGT world units). Reduces point count to a
+                    manageable level for ICP / Utonia / visualization.
     """
     from vggt.models.vggt import VGGT
     from vggt.utils.load_fn import load_and_preprocess_images
@@ -232,7 +298,6 @@ def reconstruct_from_video(
     total_frames = int(vs.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if frame_interval <= 0:
-        # Use ALL frames
         skip = 1
     else:
         skip = max(1, int(fps * frame_interval))
@@ -257,8 +322,13 @@ def reconstruct_from_video(
     vggt_model.eval()
 
     image_names = sorted(glob.glob(os.path.join(target_images, "*")))
-    images = load_and_preprocess_images(image_names).to(device)
-    print(f"VGGT input: {images.shape}")
+
+    if native_resolution:
+        images = load_images_native_resolution(image_names).to(device)
+        print(f"VGGT input (native resolution): {images.shape}")
+    else:
+        images = load_and_preprocess_images(image_names).to(device)
+        print(f"VGGT input (default 518px): {images.shape}")
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -355,6 +425,14 @@ def reconstruct_from_video(
     coord = np.asarray(pcd.points).astype(np.float64)
     color_out = np.asarray(pcd.colors).astype(np.float64)
     normal_out = np.asarray(pcd.normals).astype(np.float64)
+    print(f"Points before voxel downsample: {coord.shape[0]}")
+
+    # Voxel downsample to reduce point count
+    if voxel_size > 0:
+        coord, color_out, normal_out = voxel_downsample(
+            coord, color_out, normal_out, voxel_size
+        )
+        print(f"Points after voxel downsample (voxel_size={voxel_size}): {coord.shape[0]}")
 
     # Color from VGGT is [0,1] float; Utonia expects [0,255]
     if color_out.max() <= 1.0:
@@ -383,11 +461,22 @@ def load_gt_scene(scene_dir):
     return {"coord": coord, "segment": segment, "color": color, "normal": normal}
 
 
-def icp_align(source_pts, target_pts, max_correspondence_distance=0.5):
+def icp_align(source_pts, target_pts, max_correspondence_distance=0.5,
+              icp_downsample_voxel=0.05):
     """Align source_pts to target_pts using ICP. Returns (aligned_pts, transform_4x4).
 
-    The function first does a coarse scale normalization, then ICP, then applies
-    the combined transformation.
+    The function first does a coarse scale normalization, then runs ICP on
+    downsampled point clouds for speed, then applies the estimated transform
+    to ALL source points.
+
+    Args:
+        source_pts: (N, 3) source points to align.
+        target_pts: (M, 3) target points (reference).
+        max_correspondence_distance: fraction of target bbox diagonal used as
+            the ICP max correspondence distance.
+        icp_downsample_voxel: voxel size for downsampling before ICP. If 0,
+            no downsampling (use all points). Relative to centered/scaled
+            coordinate frame.
     """
     # Coarse scale alignment: match bounding box diagonals
     src_diag = np.linalg.norm(source_pts.max(0) - source_pts.min(0))
@@ -398,16 +487,29 @@ def icp_align(source_pts, target_pts, max_correspondence_distance=0.5):
     src_center = source_pts.mean(0)
     tgt_center = target_pts.mean(0)
     src_scaled = (source_pts - src_center) * scale
+    tgt_centered = target_pts - tgt_center
 
     pcd_src = o3d.geometry.PointCloud()
     pcd_src.points = o3d.utility.Vector3dVector(src_scaled)
     pcd_tgt = o3d.geometry.PointCloud()
-    tgt_centered = target_pts - tgt_center
     pcd_tgt.points = o3d.utility.Vector3dVector(tgt_centered)
 
-    # ICP (point-to-point)
+    # Downsample for fast ICP (transform estimation only)
+    if icp_downsample_voxel > 0:
+        n_src_before = len(pcd_src.points)
+        n_tgt_before = len(pcd_tgt.points)
+        pcd_src_down = pcd_src.voxel_down_sample(icp_downsample_voxel)
+        pcd_tgt_down = pcd_tgt.voxel_down_sample(icp_downsample_voxel)
+        print(f"  ICP downsample: source {n_src_before}->{len(pcd_src_down.points)}, "
+              f"target {n_tgt_before}->{len(pcd_tgt_down.points)} "
+              f"(voxel={icp_downsample_voxel})")
+    else:
+        pcd_src_down = pcd_src
+        pcd_tgt_down = pcd_tgt
+
+    # ICP (point-to-point) on downsampled clouds
     reg = o3d.pipelines.registration.registration_icp(
-        pcd_src, pcd_tgt,
+        pcd_src_down, pcd_tgt_down,
         max_correspondence_distance=max_correspondence_distance * tgt_diag,
         init=np.eye(4),
         estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
@@ -416,9 +518,9 @@ def icp_align(source_pts, target_pts, max_correspondence_distance=0.5):
         ),
     )
     T_icp = reg.transformation  # 4x4
-    print(f"ICP fitness={reg.fitness:.4f}  inlier_rmse={reg.inlier_rmse:.6f}")
+    print(f"  ICP fitness={reg.fitness:.4f}  inlier_rmse={reg.inlier_rmse:.6f}")
 
-    # Apply full transform: center -> scale -> ICP -> un-center
+    # Apply transform to ALL source points (full resolution)
     ones = np.ones((src_scaled.shape[0], 1))
     src_h = np.hstack([src_scaled, ones])
     aligned_h = (T_icp @ src_h.T).T[:, :3]
@@ -590,6 +692,19 @@ if __name__ == "__main__":
                         choices=["Pointmap Branch", "Depthmap and Camera Branch"],
                         default="Depthmap and Camera Branch")
     parser.add_argument("--if-TSDF", action="store_true")
+    parser.add_argument("--native-resolution", action="store_true",
+                        help="Feed images to VGGT at native resolution instead of "
+                             "upscaling to 518px. Large speedup when native is "
+                             "smaller (e.g. 224x224). Requires H,W divisible by 14.")
+    parser.add_argument("--voxel-size", type=float, default=0.02,
+                        help="Voxel size for downsampling VGGT output (in VGGT world "
+                             "units). Reduces 30M+ points to ~200-300k. "
+                             "Set to 0 to disable. Default 0.02.")
+    parser.add_argument("--icp-downsample-voxel", type=float, default=0.05,
+                        help="Voxel size for downsampling before ICP (in centered/ "
+                             "scaled coordinate frame). Dramatically speeds up ICP "
+                             "with negligible accuracy loss. Set to 0 to disable. "
+                             "Default 0.05.")
 
     # GT evaluation args
     parser.add_argument("--gt-scene-dir", type=str, default=None,
@@ -638,6 +753,8 @@ if __name__ == "__main__":
         prediction_mode=args.prediction_mode,
         if_TSDF=args.if_TSDF,
         output_dir=args.out_dir,
+        native_resolution=args.native_resolution,
+        voxel_size=args.voxel_size,
     )
     t_vggt = time.time() - t0
     print(f"VGGT reconstruction: {vggt_coord.shape[0]} points ({t_vggt:.1f}s)")
@@ -680,6 +797,7 @@ if __name__ == "__main__":
         aligned, T_icp, icp_stats = icp_align(
             vggt_coord, gt["coord"],
             max_correspondence_distance=args.icp_max_corr,
+            icp_downsample_voxel=args.icp_downsample_voxel,
         )
         print(f"  scale={icp_stats['scale']:.4f}  "
               f"fitness={icp_stats['fitness']:.4f}  "
