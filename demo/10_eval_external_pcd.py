@@ -205,9 +205,136 @@ def _make_pcd(pts, voxel_size=0.0):
     return pcd
 
 
+def _enumerate_axis_rotations():
+    """Return the 24 proper rotation matrices over signed axis permutations."""
+    from itertools import permutations
+    mats = []
+    for perm in permutations(range(3)):
+        for s0 in (1, -1):
+            for s1 in (1, -1):
+                for s2 in (1, -1):
+                    M = np.zeros((3, 3))
+                    M[0, perm[0]] = s0
+                    M[1, perm[1]] = s1
+                    M[2, perm[2]] = s2
+                    if np.isclose(np.linalg.det(M), 1.0):
+                        mats.append(M)
+    return mats  # 24 entries
+
+
+def _best_axis_permutation(src_pts, tgt_pts, voxel=0.1, dist_mult=0.1,
+                           max_iter=30):
+    """Brute-force 24 signed-axis rotations of src about its centroid.
+
+    For each rotation, runs a coarse point-to-plane ICP against tgt and keeps
+    the rotation with highest fitness. Returns (R_best, fitness_best, per_rot).
+    """
+    rotations = _enumerate_axis_rotations()
+    tgt_diag = np.linalg.norm(tgt_pts.max(0) - tgt_pts.min(0))
+    icp_dist = tgt_diag * dist_mult
+
+    pcd_tgt = _make_pcd(tgt_pts, voxel)
+    pcd_tgt.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 2, max_nn=30))
+
+    src_center = src_pts.mean(axis=0)
+    per_rot = []
+    best_fit = -1.0
+    best_R = np.eye(3)
+    for i, R in enumerate(rotations):
+        rotated = (R @ (src_pts - src_center).T).T + src_center
+        pcd_src = _make_pcd(rotated, voxel)
+        pcd_src.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=voxel * 2, max_nn=30))
+        reg = o3d.pipelines.registration.registration_icp(
+            pcd_src, pcd_tgt,
+            max_correspondence_distance=icp_dist,
+            init=np.eye(4),
+            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=max_iter),
+        )
+        per_rot.append({
+            "idx": i,
+            "fitness": float(reg.fitness),
+            "rmse": float(reg.inlier_rmse),
+        })
+        if reg.fitness > best_fit:
+            best_fit = reg.fitness
+            best_R = R
+
+    top3 = sorted(per_rot, key=lambda x: -x["fitness"])[:3]
+    top3_str = ", ".join(f"{x['fitness']:.3f}" for x in top3)
+    print(f"  Axis permute: tested 24 rotations, best fitness={best_fit:.4f} "
+          f"(top-3: [{top3_str}])")
+    return best_R, best_fit, per_rot
+
+
+def _multi_scale_icp(src_pts, tgt_pts, voxels, method="point2plane",
+                     max_iter=100):
+    """Coarse-to-fine ICP. voxels: iterable of decreasing voxel sizes.
+
+    method: 'point2point' | 'point2plane' | 'gicp'.
+    Returns (T_4x4, per_scale_stats). Non-plane methods skip normal estimation.
+    """
+    T = np.eye(4)
+    stats = []
+    for voxel in voxels:
+        pcd_src = _make_pcd(src_pts, voxel) if voxel > 0 else _make_pcd(src_pts)
+        pcd_tgt = _make_pcd(tgt_pts, voxel) if voxel > 0 else _make_pcd(tgt_pts)
+
+        v_eff = max(voxel, 1e-3)
+        if method in ("point2plane", "gicp"):
+            pcd_src.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=v_eff * 2, max_nn=30))
+            pcd_tgt.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=v_eff * 2, max_nn=30))
+
+        dist = v_eff * 2.0
+        criteria = o3d.pipelines.registration.ICPConvergenceCriteria(
+            max_iteration=max_iter,
+            relative_fitness=1e-7,
+            relative_rmse=1e-7,
+        )
+
+        if method == "point2point":
+            reg = o3d.pipelines.registration.registration_icp(
+                pcd_src, pcd_tgt, dist, T,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                criteria,
+            )
+        elif method == "point2plane":
+            reg = o3d.pipelines.registration.registration_icp(
+                pcd_src, pcd_tgt, dist, T,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                criteria,
+            )
+        elif method == "gicp":
+            reg = o3d.pipelines.registration.registration_generalized_icp(
+                pcd_src, pcd_tgt, dist, T,
+                o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
+                criteria,
+            )
+        else:
+            raise ValueError(f"Unknown ICP method: {method}")
+
+        T = reg.transformation
+        stats.append({
+            "voxel": float(voxel),
+            "fitness": float(reg.fitness),
+            "rmse": float(reg.inlier_rmse),
+        })
+        print(f"  ICP[{method}] voxel={voxel:.3f}: "
+              f"fitness={reg.fitness:.4f} rmse={reg.inlier_rmse:.6f}")
+    return T, stats
+
+
 def robust_align(source_pts, target_pts, downsample_voxel=0.05,
                  ransac_distance_multiplier=0.05, icp_refine=True,
-                 percentile_scale=True):
+                 percentile_scale=True, axis_permute=False,
+                 icp_method="point2plane",
+                 icp_voxels=(0.08, 0.04, 0.02, 0.01),
+                 icp_max_iter=100):
     """Robust alignment: FPFH+RANSAC global registration → Umeyama scale → ICP refine.
 
     Steps:
@@ -240,6 +367,22 @@ def robust_align(source_pts, target_pts, downsample_voxel=0.05,
 
     print(f"  Coarse scale: {coarse_scale:.4f} "
           f"(src_diag={src_diag:.3f}, tgt_diag={tgt_diag:.3f})")
+
+    # --- Step 1b: Optional axis-permutation brute-force ---
+    axis_permute_stats = None
+    if axis_permute:
+        # Coarse voxel ~ 8% of target diagonal keeps this cheap.
+        perm_voxel = max(tgt_diag * 0.02, 0.05)
+        print(f"  Axis permute screening (voxel={perm_voxel:.3f})...")
+        R_init, perm_fit, per_rot = _best_axis_permutation(
+            src_prescaled, target_pts, voxel=perm_voxel,
+        )
+        center = src_prescaled.mean(axis=0)
+        src_prescaled = (R_init @ (src_prescaled - center).T).T + center
+        axis_permute_stats = {
+            "best_fitness": float(perm_fit),
+            "per_rotation": per_rot,
+        }
 
     # --- Step 2: Downsample + FPFH ---
     # Use a voxel size relative to target diagonal for consistent feature extraction
@@ -313,34 +456,22 @@ def robust_align(source_pts, target_pts, downsample_voxel=0.05,
         print("  Too few inliers for Umeyama, using RANSAC transform only")
         src_final = src_ransac
 
-    # --- Step 5: Optional ICP refinement ---
+    # --- Step 5: Multi-scale ICP refinement ---
     icp_stats = {}
     if icp_refine:
-        pcd_src_final = _make_pcd(src_final)
-        pcd_tgt_full = _make_pcd(target_pts)
-        if downsample_voxel > 0:
-            pcd_src_icp = pcd_src_final.voxel_down_sample(downsample_voxel)
-            pcd_tgt_icp = pcd_tgt_full.voxel_down_sample(downsample_voxel)
-        else:
-            pcd_src_icp = pcd_src_final
-            pcd_tgt_icp = pcd_tgt_full
-
-        icp_dist = tgt_diag * 0.02  # tight distance for refinement
-        reg_icp = o3d.pipelines.registration.registration_icp(
-            pcd_src_icp, pcd_tgt_icp,
-            max_correspondence_distance=icp_dist,
-            init=np.eye(4),
-            estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100),
+        print(f"  Multi-scale ICP ({icp_method}, voxels={list(icp_voxels)})...")
+        T_icp, per_scale_stats = _multi_scale_icp(
+            src_final, target_pts,
+            voxels=icp_voxels, method=icp_method, max_iter=icp_max_iter,
         )
-        T_icp = reg_icp.transformation
         src_final = (T_icp[:3, :3] @ src_final.T).T + T_icp[:3, 3]
         icp_stats = {
-            "icp_fitness": float(reg_icp.fitness),
-            "icp_inlier_rmse": float(reg_icp.inlier_rmse),
+            "icp_method": icp_method,
+            "icp_voxels": list(icp_voxels),
+            "icp_per_scale": per_scale_stats,
+            "icp_final_fitness": float(per_scale_stats[-1]["fitness"]),
+            "icp_final_rmse": float(per_scale_stats[-1]["rmse"]),
         }
-        print(f"  ICP refine: fitness={reg_icp.fitness:.4f}, "
-              f"rmse={reg_icp.inlier_rmse:.6f}")
 
     total_scale = coarse_scale * umeyama_scale
     stats = {
@@ -350,6 +481,7 @@ def robust_align(source_pts, target_pts, downsample_voxel=0.05,
         "ransac_fitness": float(reg_ransac.fitness),
         "ransac_inlier_rmse": float(reg_ransac.inlier_rmse),
         "n_correspondence_inliers": int(n_inliers),
+        "axis_permute": axis_permute_stats,
         **icp_stats,
     }
     return src_final, stats
@@ -413,22 +545,61 @@ def icp_align(source_pts, target_pts, max_correspondence_distance=0.5,
 # ---------------------------------------------------------------------------
 # Label transfer via nearest neighbor
 # ---------------------------------------------------------------------------
-def transfer_gt_labels(query_pts, gt_pts, gt_labels, max_distance=0.1):
-    """Transfer GT labels to query points via KDTree NN. Returns (labels, stats)."""
-    tree = KDTree(gt_pts)
-    dists, indices = tree.query(query_pts, k=1)
-    labels = gt_labels[indices].copy()
-    too_far = dists > max_distance
-    labels[too_far] = -1
+def transfer_labels_knn(query_pts, source_pts, source_labels,
+                        k=1, weighted=False, max_distance=0.1, num_classes=20):
+    """Transfer labels from source → query via KDTree.
 
+    k=1: nearest neighbor.
+    k>1: majority voting over k nearest; if weighted, votes are 1/(dist+eps).
+    Any query point whose valid neighbors (within max_distance) vote 0 → -1.
+    """
+    tree = KDTree(source_pts)
+    dists, indices = tree.query(query_pts, k=k)
+
+    if k == 1:
+        labels = source_labels[indices].astype(np.int64).copy()
+        too_far = dists > max_distance
+        labels[too_far] = -1
+        nearest = dists
+    else:
+        dists = np.asarray(dists)
+        indices = np.asarray(indices)
+        Nq = query_pts.shape[0]
+        valid_mask = dists <= max_distance
+        neighbor_labels = source_labels[indices].astype(np.int64)
+        valid_cls = (neighbor_labels >= 0) & (neighbor_labels < num_classes)
+
+        if weighted:
+            w = 1.0 / (dists + 1e-8)
+        else:
+            w = np.ones_like(dists, dtype=np.float64)
+        w = w * valid_mask * valid_cls
+
+        scores = np.zeros((Nq, num_classes), dtype=np.float64)
+        for j in range(k):
+            lbl_j = neighbor_labels[:, j]
+            w_j = w[:, j]
+            active = w_j > 0
+            if active.any():
+                rows = np.where(active)[0]
+                np.add.at(scores, (rows, lbl_j[rows]), w_j[rows])
+
+        labels = np.full(Nq, -1, dtype=np.int64)
+        has_vote = scores.max(axis=1) > 0
+        labels[has_vote] = scores[has_vote].argmax(axis=1)
+        nearest = dists[:, 0]
+
+    matched = labels >= 0
     stats = {
         "num_query": int(query_pts.shape[0]),
-        "num_matched": int((~too_far).sum()),
-        "num_unmatched": int(too_far.sum()),
-        "match_rate": float((~too_far).mean()),
-        "mean_dist": float(dists[~too_far].mean()) if (~too_far).any() else float("nan"),
-        "median_dist": float(np.median(dists[~too_far])) if (~too_far).any() else float("nan"),
+        "num_matched": int(matched.sum()),
+        "num_unmatched": int((~matched).sum()),
+        "match_rate": float(matched.mean()) if matched.size else 0.0,
+        "mean_dist": float(nearest[matched].mean()) if matched.any() else float("nan"),
+        "median_dist": float(np.median(nearest[matched])) if matched.any() else float("nan"),
         "max_distance_threshold": float(max_distance),
+        "k": int(k),
+        "weighted": bool(weighted),
     }
     return labels, stats
 
@@ -488,16 +659,18 @@ def render_comparison_png(
     pred_coord, pred_labels, gt_coord, gt_labels,
     out_dir, pred_color=None, gt_color=None,
     gt_transferred_labels=None,
+    pred_transferred_labels=None,
     point_size=1.5, max_points=120_000,
 ):
     """Render multi-panel comparison from multiple views.
 
-    Panels:
+    Panels (in order, only included when data present):
       1. Prediction (pred geometry + predicted seg colors)
       2. GT reference (GT geometry + GT seg colors)
-      3. Pred RGB (pred geometry + original color)       [if pred_color given]
-      4. GT RGB (GT geometry + original color)            [if gt_color given]
-      5. GT transferred (pred geometry + transferred GT labels) [if gt_transferred_labels given]
+      3. Pred RGB (pred geometry + original color)
+      4. GT RGB (GT geometry + original color)
+      5. GT→pred transferred (pred geometry + transferred GT labels)
+      6. pred→GT transferred (GT geometry + transferred pred labels)
     """
     os.makedirs(out_dir, exist_ok=True)
     rng = np.random.default_rng(42)
@@ -526,8 +699,11 @@ def render_comparison_png(
     if gt_color is not None:
         panels.append(("GT RGB", gt_coord, _norm_rgb(gt_color)))
     if gt_transferred_labels is not None:
-        panels.append(("GT transferred\n(on pred geom)", pred_coord,
+        panels.append(("GT→pred transferred\n(on pred geom)", pred_coord,
                         _labels_to_color(gt_transferred_labels)))
+    if pred_transferred_labels is not None:
+        panels.append(("pred→GT transferred\n(on GT geom)", gt_coord,
+                        _labels_to_color(pred_transferred_labels)))
 
     views = {
         "top":   (90, -90),
@@ -608,6 +784,19 @@ if __name__ == "__main__":
                              "target bbox diagonal (default: 0.05)")
     parser.add_argument("--no-icp-refine", action="store_true",
                         help="Skip ICP refinement after RANSAC+Umeyama")
+    parser.add_argument("--icp-method", type=str, default="point2plane",
+                        choices=["point2point", "point2plane", "gicp"],
+                        help="ICP refinement method (default: point2plane)")
+    parser.add_argument("--multi-scale-icp", type=str,
+                        default="0.08,0.04,0.02,0.01",
+                        help="Comma-separated voxel sizes (coarse→fine) for "
+                             "multi-scale ICP. Single value = single scale.")
+    parser.add_argument("--icp-max-iter", type=int, default=100,
+                        help="Max iterations per ICP scale (default: 100)")
+    parser.add_argument("--axis-permute", action="store_true",
+                        help="Brute-force 24 signed-axis rotations before RANSAC "
+                             "(helps with Y-up vs Z-up mismatches). Adds ~24 coarse "
+                             "ICP screenings upfront.")
 
     # Post-alignment outlier removal
     parser.add_argument("--post-align-nn-filter", type=float, default=0,
@@ -618,6 +807,16 @@ if __name__ == "__main__":
     # Label transfer
     parser.add_argument("--nn-max-dist", type=float, default=0.1,
                         help="Max distance for NN label transfer (in GT coord units)")
+    parser.add_argument("--nn-k", type=int, default=1,
+                        help="kNN for label transfer; k=1 nearest, k>1 majority vote "
+                             "(default: 1). Try 5-9 for noisy boundaries.")
+    parser.add_argument("--nn-weighted", action="store_true",
+                        help="Use 1/dist weighted voting when --nn-k > 1")
+    parser.add_argument("--eval-direction", type=str, default="both",
+                        choices=["pred2gt", "gt2pred", "both"],
+                        help="pred2gt: transfer GT→pred pts (eval on pred domain). "
+                             "gt2pred: transfer pred→GT pts (standard ScanNet). "
+                             "both (default): run and report both.")
 
     # Visualization
     parser.add_argument("--save-png", action="store_true",
@@ -666,12 +865,21 @@ if __name__ == "__main__":
             icp_downsample_voxel=args.align_downsample_voxel,
         )
     else:
-        print("\nRunning robust alignment (RANSAC + Umeyama + ICP)...")
+        print("\nRunning robust alignment (RANSAC + Umeyama + multi-scale ICP)...")
+        icp_voxels = tuple(
+            float(v) for v in args.multi_scale_icp.split(",") if v.strip()
+        )
+        if not icp_voxels:
+            raise ValueError("--multi-scale-icp must list at least one voxel size")
         pred_coord_aligned, align_stats = robust_align(
             pred_coord, gt_coord,
             downsample_voxel=args.align_downsample_voxel,
             ransac_distance_multiplier=args.ransac_dist_mult,
             icp_refine=not args.no_icp_refine,
+            axis_permute=args.axis_permute,
+            icp_method=args.icp_method,
+            icp_voxels=icp_voxels,
+            icp_max_iter=args.icp_max_iter,
         )
 
     # ---- Post-alignment outlier removal (NN distance to GT) ----
@@ -696,22 +904,55 @@ if __name__ == "__main__":
             margin=args.clip_margin, color=pred_color,
         )
 
-    # ---- Transfer GT labels to prediction points via NN ----
-    print(f"\nTransferring GT labels (nn_max_dist={args.nn_max_dist})...")
-    gt_transferred, transfer_stats = transfer_gt_labels(
-        pred_coord_aligned, gt_coord, gt_labels,
-        max_distance=args.nn_max_dist,
-    )
-    print(f"  matched: {transfer_stats['num_matched']}/{transfer_stats['num_query']} "
-          f"({transfer_stats['match_rate']:.1%})")
-    print(f"  mean_dist={transfer_stats['mean_dist']:.4f}, "
-          f"median_dist={transfer_stats['median_dist']:.4f}")
+    # ---- Bidirectional label transfer + metrics ----
+    directions = (["pred2gt", "gt2pred"] if args.eval_direction == "both"
+                  else [args.eval_direction])
 
-    # ---- Compute metrics ----
-    print("\nComputing metrics...")
-    confmat = confusion_matrix(pred_labels, gt_transferred, num_classes=20)
-    metrics = metrics_from_confmat(confmat)
-    print_metrics(metrics, title="Evaluation Results")
+    transfer_stats_by_dir = {}
+    metrics_by_dir = {}
+    confmat_by_dir = {}
+    gt_on_pred = None
+    pred_on_gt = None
+
+    if "pred2gt" in directions:
+        print(f"\n[pred2gt] Transferring GT→pred points "
+              f"(k={args.nn_k}, weighted={args.nn_weighted}, "
+              f"max_dist={args.nn_max_dist})...")
+        gt_on_pred, stats_p2g = transfer_labels_knn(
+            pred_coord_aligned, gt_coord, gt_labels,
+            k=args.nn_k, weighted=args.nn_weighted,
+            max_distance=args.nn_max_dist, num_classes=20,
+        )
+        print(f"  matched: {stats_p2g['num_matched']}/{stats_p2g['num_query']} "
+              f"({stats_p2g['match_rate']:.1%}), "
+              f"mean_dist={stats_p2g['mean_dist']:.4f}, "
+              f"median_dist={stats_p2g['median_dist']:.4f}")
+        cm = confusion_matrix(pred_labels, gt_on_pred, num_classes=20)
+        m = metrics_from_confmat(cm)
+        print_metrics(m, title="pred→GT (metrics on pred points)")
+        transfer_stats_by_dir["pred2gt"] = stats_p2g
+        metrics_by_dir["pred2gt"] = m
+        confmat_by_dir["pred2gt"] = cm
+
+    if "gt2pred" in directions:
+        print(f"\n[gt2pred] Transferring pred→GT points "
+              f"(k={args.nn_k}, weighted={args.nn_weighted}, "
+              f"max_dist={args.nn_max_dist})...")
+        pred_on_gt, stats_g2p = transfer_labels_knn(
+            gt_coord, pred_coord_aligned, pred_labels,
+            k=args.nn_k, weighted=args.nn_weighted,
+            max_distance=args.nn_max_dist, num_classes=20,
+        )
+        print(f"  matched: {stats_g2p['num_matched']}/{stats_g2p['num_query']} "
+              f"({stats_g2p['match_rate']:.1%}), "
+              f"mean_dist={stats_g2p['mean_dist']:.4f}, "
+              f"median_dist={stats_g2p['median_dist']:.4f}")
+        cm = confusion_matrix(pred_on_gt, gt_labels, num_classes=20)
+        m = metrics_from_confmat(cm)
+        print_metrics(m, title="GT→pred (metrics on GT points, ScanNet-style)")
+        transfer_stats_by_dir["gt2pred"] = stats_g2p
+        metrics_by_dir["gt2pred"] = m
+        confmat_by_dir["gt2pred"] = cm
 
     # ---- Save results ----
     results = {
@@ -720,17 +961,22 @@ if __name__ == "__main__":
         "gt_segment": args.gt_segment,
         "align_mode": "none" if args.no_align else ("legacy_icp" if args.legacy_icp else "robust"),
         "align_stats": align_stats,
-        "transfer_stats": transfer_stats,
-        "metrics": metrics,
+        "eval_direction": args.eval_direction,
+        "nn_k": args.nn_k,
+        "nn_weighted": bool(args.nn_weighted),
+        "nn_max_dist": args.nn_max_dist,
+        "transfer_stats": transfer_stats_by_dir,
+        "metrics": metrics_by_dir,
     }
     results_path = os.path.join(args.out_dir, "metrics.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved metrics: {results_path}")
 
-    confmat_path = os.path.join(args.out_dir, "confmat.npy")
-    np.save(confmat_path, confmat)
-    print(f"Saved confusion matrix: {confmat_path}")
+    for direction, cm in confmat_by_dir.items():
+        p = os.path.join(args.out_dir, f"confmat_{direction}.npy")
+        np.save(p, cm)
+        print(f"Saved confusion matrix: {p}")
 
     # ---- Visualization ----
     if args.save_png:
@@ -743,7 +989,8 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             pred_color=pred_color,
             gt_color=gt_color,
-            gt_transferred_labels=gt_transferred,
+            gt_transferred_labels=gt_on_pred,
+            pred_transferred_labels=pred_on_gt,
             max_points=args.max_points,
         )
 
