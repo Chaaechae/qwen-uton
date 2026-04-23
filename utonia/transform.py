@@ -22,14 +22,20 @@ Please cite our work if the code is helpful to you.
 
 import random
 import numbers
-import scipy
-import scipy.ndimage
-import scipy.interpolate
-import scipy.stats
 import numpy as np
 import torch
 import copy
 from collections.abc import Sequence, Mapping
+
+import numpy.core  # noqa: F401
+for _name in list(sys.modules):
+    if _name == "numpy.core" or _name.startswith("numpy.core."):
+        sys.modules[_name.replace("numpy.core", "numpy._core", 1)] = sys.modules[_name]
+
+import scipy
+import scipy.ndimage
+import scipy.interpolate
+import scipy.stats
 
 from .registry import Registry
 
