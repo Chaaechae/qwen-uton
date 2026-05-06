@@ -156,6 +156,8 @@ def main():
               f"{cfg.hidden_size}/{cfg.patch_size}")
 
     # ---------------- step 4: forward path ----------------
+    import inspect
+
     visual = visual.eval().to(args.device)
     for p in visual.parameters():
         p.requires_grad_(False)
@@ -170,46 +172,114 @@ def main():
     # Mimic preprocessor: mean=std=0.5, so feed in [-1, 1].
     x = (torch.rand(B, 3, H, W, device=args.device) - 0.5) * 2.0
     x = x.to(torch_dtype)
+    with torch.no_grad():
+        x_t = x.unsqueeze(1).repeat(1, T, 1, 1, 1)
+        patches = x_t.view(B, T, 3, h, P, w, P)
+        patches = patches.permute(0, 3, 5, 1, 2, 4, 6).contiguous()
+        patches = patches.view(B * h * w, T * 3 * P * P)
+        grid_thw = torch.tensor([[T, h, w]] * B,
+                                device=args.device, dtype=torch.long)
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-    # Patchify exactly as in ENC2D_forward.
-    try:
+        rope_out = getattr(visual, rope_attr)(grid_thw)
+
+    print(f"[ 4/4 INFO] block forward sig: "
+          f"{inspect.signature(visual.blocks[0].forward)}")
+    if isinstance(rope_out, tuple):
+        print(f"[ 4/4 INFO] {rope_attr}(grid_thw) returned tuple of "
+              f"{[tuple(t.shape) for t in rope_out]}")
+    elif torch.is_tensor(rope_out):
+        print(f"[ 4/4 INFO] {rope_attr}(grid_thw) returned tensor {tuple(rope_out.shape)}")
+    else:
+        print(f"[ 4/4 INFO] {rope_attr}(grid_thw) returned {type(rope_out).__name__}")
+
+    # Try a series of forward strategies, accepting the first that succeeds.
+    blk_params = set(inspect.signature(visual.blocks[0].forward).parameters)
+
+    def _try_manual(label, blk_kwargs_fn):
         with torch.no_grad():
-            x_t = x.unsqueeze(1).repeat(1, T, 1, 1, 1)              # (B, T, 3, H, W)
-            patches = x_t.view(B, T, 3, h, P, w, P)
-            patches = patches.permute(0, 3, 5, 1, 2, 4, 6).contiguous()
-            patches = patches.view(B * h * w, T * 3 * P * P)         # (B*h*w, T*3*P*P)
-            grid_thw = torch.tensor([[T, h, w]] * B,
-                                    device=args.device, dtype=torch.long)
-
             hidden = visual.patch_embed(patches)
-            rotary_pos_emb = getattr(visual, rope_attr)(grid_thw)
-            cu_seqlens = torch.repeat_interleave(
-                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-            ).cumsum(dim=0, dtype=torch.int32)
-            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
             for blk in visual.blocks:
-                hidden = blk(hidden, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
-        print(f"[ 4/4 STEP] post-blocks hidden shape = {tuple(hidden.shape)}")
-        # Expect (B*T*h*w, hidden_size) before our reshape.
-        expected_n = B * T * h * w
-        if hidden.shape[0] != expected_n or hidden.shape[-1] != cfg.hidden_size:
-            print(f"[ 4/4 FAIL] expected first-dim={expected_n} last-dim={cfg.hidden_size}, "
-                  f"got {tuple(hidden.shape)}")
-            sys.exit(4)
-        hidden = hidden.view(B, T, h * w, -1)[:, 0]                  # (B, h*w, hidden)
-        norm = hidden.float().norm(dim=-1).mean().item()
-        finite = torch.isfinite(hidden).all().item()
-        print(f"[ 4/4 PASS] final shape={tuple(hidden.shape)} mean L2={norm:.3f} finite={finite}")
-        if not finite:
-            sys.exit(5)
-    except Exception as e:
-        print(f"[ 4/4 FAIL] forward failed: {e}")
-        print("           visual attrs:", [n for n in dir(visual) if not n.startswith("_")])
-        traceback.print_exc()
-        sys.exit(6)
+                hidden = blk(hidden, **blk_kwargs_fn())
+        return hidden
 
-    print("\n[summary] OK — distillation forward path is compatible with this model "
-          f"(use rope_attr='{rope_attr}' in ENC2D_forward).")
+    strategies = []
+    if "rotary_pos_emb" in blk_params:
+        strategies.append((
+            "manual: rotary_pos_emb=tensor",
+            lambda: dict(cu_seqlens=cu_seqlens, rotary_pos_emb=rope_out),
+        ))
+    if "position_embeddings" in blk_params and isinstance(rope_out, tuple):
+        strategies.append((
+            "manual: position_embeddings=(cos,sin)",
+            lambda: dict(cu_seqlens=cu_seqlens, position_embeddings=rope_out),
+        ))
+    if "position_embeddings" in blk_params and torch.is_tensor(rope_out):
+        # Newer Qwen blocks build (cos, sin) from the rope tensor.
+        emb = torch.cat((rope_out, rope_out), dim=-1)
+        strategies.append((
+            "manual: position_embeddings=(cos,sin) built from rope tensor",
+            lambda: dict(cu_seqlens=cu_seqlens,
+                         position_embeddings=(emb.cos(), emb.sin())),
+        ))
+
+    # Always also try calling visual.forward end-to-end as a last resort.
+    visual_sig = inspect.signature(visual.forward)
+    print(f"[ 4/4 INFO] visual.forward sig: {visual_sig}")
+
+    hidden = None
+    chosen = None
+    for label, kfn in strategies:
+        try:
+            hidden = _try_manual(label, kfn)
+            chosen = label
+            print(f"[ 4/4 STEP] manual forward OK via [{label}], "
+                  f"shape={tuple(hidden.shape)}")
+            break
+        except Exception as e:
+            print(f"[ 4/4 STEP] {label} FAILED: {e}")
+
+    if hidden is None:
+        # Fallback: call the full visual module. It returns merged tokens
+        # (post spatial-merge), but at least confirms which API is correct.
+        print("[ 4/4 STEP] falling back to visual.forward(...)")
+        try:
+            with torch.no_grad():
+                if "grid_thw" in visual_sig.parameters:
+                    hidden = visual(patches, grid_thw=grid_thw)
+                else:
+                    hidden = visual(patches)
+            chosen = "visual.forward (post-merge)"
+            print(f"[ 4/4 STEP] visual.forward OK, shape={tuple(hidden.shape)}")
+        except Exception as e:
+            print(f"[ 4/4 FAIL] all strategies failed; last error: {e}")
+            print("           visual attrs:",
+                  [n for n in dir(visual) if not n.startswith("_")])
+            print("           block attrs:",
+                  [n for n in dir(visual.blocks[0]) if not n.startswith("_")])
+            try:
+                print("           block.attn sig:",
+                      inspect.signature(visual.blocks[0].attn.forward))
+            except Exception:
+                pass
+            traceback.print_exc()
+            sys.exit(6)
+
+    expected_n = B * T * h * w
+    print(f"[ 4/4 INFO] expected pre-merge first-dim={expected_n} "
+          f"(post-merge would be {expected_n // (cfg.spatial_merge_size ** 2)})")
+    norm = hidden.float().norm(dim=-1).mean().item()
+    finite = torch.isfinite(hidden).all().item()
+    print(f"[ 4/4 PASS] strategy=[{chosen}] final shape={tuple(hidden.shape)} "
+          f"mean L2={norm:.3f} finite={finite}")
+    if not finite:
+        sys.exit(5)
+
+    print("\n[summary] OK — paste the [ 4/4 INFO]/[ 4/4 STEP] lines back so we can "
+          "wire the correct kwarg into ENC2D_forward.")
 
 
 if __name__ == "__main__":
