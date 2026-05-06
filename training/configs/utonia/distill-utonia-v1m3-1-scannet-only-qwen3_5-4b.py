@@ -22,8 +22,9 @@ UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", None)
 crop_h = 512
 crop_w = 512
 patch_size = 16
-batch_size = 256  # bs: total bs in all gpus
-num_worker = 1024
+# Sanity-check / single-machine setting. For multi-GPU scale this up.
+batch_size = 8
+num_worker = 8
 mix_prob = 0.0
 clip_grad = 1.0
 
@@ -149,8 +150,9 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 100
-eval_epoch = 100
+# 5-epoch sanity run; raise to 100 for real training.
+epoch = 5
+eval_epoch = 5
 base_lr = 0.004
 lr_decay = 0.9  # layer-wise lr decay
 
@@ -917,204 +919,19 @@ hk_transform = [
 data_weight = None
 data_length = None
 data = dict(
-    sampled_dataset_index=4,
-    sampled_dataset_limit=90000,
     train=dict(
         type="ConcatDataset",
         datasets=[
-            # HK
-            dict(
-                type="HKDataset",
-                split=["train"],
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                data_root="data/hk_3d_maps_N",
-                transform=hk_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # NuScenes
-            dict(
-                type="NuScenesImagePointDataset",
-                if_sweep=True,
-                if_img=True,
-                sweeps_max=10,
-                sweeps=3,
-                sweep_gap=1,
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train", "val", "test"],
-                data_root="data/nuscenes",
-                transform=outdoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # SemanticKITTI
-            dict(
-                type="SemanticKITTIImagePointDataset",
-                if_sweep=True,
-                if_img=True,
-                sweeps=3,
-                sweep_gap=5,
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train", "val", "test"],
-                data_root="data/semantic_kitti",
-                transform=outdoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # Waymo
-            dict(
-                type="WaymoImagePointDataset",
-                if_sweep=True,
-                if_img=True,
-                sweeps=3,
-                sweep_gap=1,
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["training", "validation"],
-                data_root="data/waymo",
-                transform=outdoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # Cap3D
-            dict(
-                type="Cap3DImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train"],
-                data_root="data/cap3d",
-                transform=obj_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # PartNet
-            dict(
-                type="PartNetDataDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train"],
-                data_root="data/partnet_data_v0",
-                transform=obj_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # GraspNet
-            dict(
-                type="DefaultMultiViewImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train", "val", "test"],
-                data_root="data/graspnet",
-                transform=obj_realscale_withbg_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # ScanObjectNN
-            dict(
-                type="ScanObjectNNRawDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train"],
-                data_root="data/scanobjectnn_raw",
-                transform=obj_realscale_nobg_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # ArkitScenes
-            dict(
-                type="DefaultImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["Training", "Validation"],
-                data_root="data/arkitscenes",
-                transform=indoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # ScanNet
-            dict(
-                type="DefaultImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train", "val", "test"],
-                data_root="data/scannet",
-                transform=indoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # ScanNet++
-            dict(
-                type="DefaultImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=[
-                    "train",
-                    "val",
-                    "test",
-                ],
-                data_root="data/scannetpp",
-                transform=indoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # S3DIS
-            dict(
-                type="DefaultImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5", "Area_6"],
-                data_root="data/s3dis",
-                transform=indoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # HM3D
+            # ScanNet (only).
+            # Layout under data/scannet/ is the Concerto/Utonia preprocessed
+            # form; see training/README.md for preprocessing instructions.
             dict(
                 type="DefaultImagePointDataset",
                 crop_h=crop_h,
                 crop_w=crop_w,
                 patch_size=patch_size,
                 split=["train", "val"],
-                data_root="data/hm3d_fix",
-                transform=indoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # Structured3D
-            dict(
-                type="DefaultImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train", "val", "test"],
-                data_root="data/structured3d",
-                transform=indoor_transform,
-                test_mode=False,
-                loop=1,
-            ),
-            # RE10K
-            dict(
-                type="DefaultImagePointDataset",
-                crop_h=crop_h,
-                crop_w=crop_w,
-                patch_size=patch_size,
-                split=["train", "test"],
-                data_root="data/re10k_align",
+                data_root="data/scannet",
                 transform=indoor_transform,
                 test_mode=False,
                 loop=1,
@@ -1122,6 +939,7 @@ data = dict(
         ],
     ),
 )
+
 
 hooks = [
     dict(type="CheckpointLoader"),
