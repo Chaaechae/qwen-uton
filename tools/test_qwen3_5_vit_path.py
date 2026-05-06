@@ -13,16 +13,27 @@ Checks (in order, each is independent):
      image batch produces (B, h*w, 1024) features without error.
   4. Output L2 norm and dim are sane (non-zero, finite, last-dim==hidden_size==1024).
 
-Run:
-    cd /home/chewry/GitHub/Pointcept
-    HF_HOME=... python3 tools/test_qwen3_5_vit_path.py
-        [--model Qwen/Qwen3.5-4B] [--device cuda] [--dtype bfloat16]
+Run (HF Hub repo id — uses HF cache, downloads if missing):
+    python3 tools/test_qwen3_5_vit_path.py --model Qwen/Qwen3.5-4B
+
+Run (local path — never touches the network):
+    python3 tools/test_qwen3_5_vit_path.py --model /path/to/Qwen3.5-4B
+    # If --model points to an existing directory or file, --local_files_only
+    # is implied automatically. Pass --no-local_files_only to override.
+
+Run (HF cache only, skip network even with a repo id):
+    python3 tools/test_qwen3_5_vit_path.py --model Qwen/Qwen3.5-4B --local_files_only
+    # Equivalent to setting HF_HUB_OFFLINE=1 in the environment.
+
+Custom HF cache root (alternative to HF_HOME env var):
+    python3 tools/test_qwen3_5_vit_path.py --cache_dir /scratch/hf_cache --model Qwen/Qwen3.5-4B
 
 It will print PASS/FAIL for each check and a short diagnostic dump of
 `dir(visual)` if any attribute is missing, so you can paste the output back.
 """
 
 import argparse
+import os
 import sys
 import traceback
 
@@ -32,7 +43,27 @@ import torch.nn.functional as F
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="Qwen/Qwen3.5-4B")
+    parser.add_argument(
+        "--model",
+        default="Qwen/Qwen3.5-4B",
+        help="HF Hub repo id (e.g. Qwen/Qwen3.5-4B) OR an absolute/relative "
+             "filesystem path to a directory containing config.json and the "
+             "model weights. If a path, --local_files_only is implied.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        default=None,
+        help="HF cache root (forwarded to from_pretrained). Defaults to "
+             "$HF_HOME or ~/.cache/huggingface when omitted.",
+    )
+    parser.add_argument(
+        "--local_files_only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force transformers to use only on-disk files (no network). "
+             "Auto-enabled when --model is a local path; pass "
+             "--no-local_files_only to override.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--crop", type=int, default=512)
@@ -43,19 +74,40 @@ def main():
         float32=torch.float32, float16=torch.float16, bfloat16=torch.bfloat16
     )[args.dtype]
 
-    print(f"[info] model={args.model} device={args.device} dtype={args.dtype}")
+    # Resolve --model: if it's an existing path, expand it and force offline mode.
+    model_arg = os.path.expanduser(args.model)
+    is_local_path = os.path.isdir(model_arg) or os.path.isfile(model_arg)
+    if is_local_path:
+        model_arg = os.path.abspath(model_arg)
+        if args.local_files_only is None:
+            args.local_files_only = True
+    elif args.local_files_only is None:
+        args.local_files_only = False
+
+    print(f"[info] model={model_arg} (local_path={is_local_path}) "
+          f"device={args.device} dtype={args.dtype} "
+          f"local_files_only={args.local_files_only} cache_dir={args.cache_dir}")
 
     # ---------------- step 1: load full VLM ----------------
     try:
         from transformers import AutoModelForImageTextToText
-        full = AutoModelForImageTextToText.from_pretrained(
-            args.model,
+        from_pretrained_kwargs = dict(
             trust_remote_code=True,
             torch_dtype=torch_dtype,
+            local_files_only=args.local_files_only,
+        )
+        if args.cache_dir is not None:
+            from_pretrained_kwargs["cache_dir"] = os.path.expanduser(args.cache_dir)
+        full = AutoModelForImageTextToText.from_pretrained(
+            model_arg, **from_pretrained_kwargs
         )
         print("[ 1/4 PASS] full VLM loaded")
     except Exception as e:
         print(f"[ 1/4 FAIL] could not load full VLM: {e}")
+        if is_local_path:
+            print(f"           checked path: {model_arg}")
+            print(f"           dir contents: {sorted(os.listdir(model_arg))[:20]}"
+                  if os.path.isdir(model_arg) else "           (path is a file, not a directory)")
         traceback.print_exc()
         sys.exit(1)
 
