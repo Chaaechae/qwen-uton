@@ -177,7 +177,9 @@ def main():
         patches = x_t.view(B, T, 3, h, P, w, P)
         patches = patches.permute(0, 3, 5, 1, 2, 4, 6).contiguous()
         patches = patches.view(B * h * w, T * 3 * P * P)
-        grid_thw = torch.tensor([[T, h, w]] * B,
+        # T_grid = 1: post-patch-embed temporal length (the conv3d in
+        # patch_embed collapses temporal_patch_size frames into one token).
+        grid_thw = torch.tensor([[1, h, w]] * B,
                                 device=args.device, dtype=torch.long)
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
@@ -268,7 +270,8 @@ def main():
             traceback.print_exc()
             sys.exit(6)
 
-    expected_n = B * T * h * w
+    # post-patch-embed token count is B*h*w (T collapses in patch_embed).
+    expected_n = B * h * w
     print(f"[ 4/4 INFO] expected pre-merge first-dim={expected_n} "
           f"(post-merge would be {expected_n // (cfg.spatial_merge_size ** 2)})")
     norm = hidden.float().norm(dim=-1).mean().item()

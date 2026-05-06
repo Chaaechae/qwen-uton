@@ -314,10 +314,17 @@ class UtoniaQwen3_5Distill(PointModel):
 
         Qwen3.5 vision tower expects flattened pixel-patch tokens
         (B*patch_h*patch_w, in_channels * temporal_patch_size * patch_size**2)
-        with a `grid_thw` tensor of shape (B, 3) holding (T, H, W) per sample,
-        and returns merged tokens by default. We instead bypass the merger and
-        run only `blocks` so we keep the per-patch (hidden=1024) representation
-        on a (T*H*W, hidden) flat layout, then reshape to (B, H*W, hidden).
+        with a `grid_thw` tensor of shape (B, 3) holding (T, H, W) per sample.
+        Crucially, `T` in grid_thw is the *post-patch-embed* temporal length
+        (i.e. input_temporal // temporal_patch_size). For single-image inputs
+        we replicate the frame `temporal_patch_size` times into the per-patch
+        feature dim, so post-patch-embed T equals 1.
+
+        We bypass the spatial merger and only run `patch_embed` + `blocks`,
+        keeping per-patch (hidden=1024) representation. Block forward in
+        Qwen3.5 takes `position_embeddings=(cos, sin)` (the `rotary_pos_emb`
+        argument is in the signature but the block unconditionally unpacks
+        position_embeddings, so we must provide it as a tuple).
 
         x: (B, 3, crop_h, crop_w) — already normalized with image_mean/std
         from preprocessor_config.json (mean=std=0.5).
@@ -331,36 +338,36 @@ class UtoniaQwen3_5Distill(PointModel):
         h, w = H_pix // P, W_pix // P
         assert h == self.patch_h and w == self.patch_w
 
-        # Qwen image processor expects grids with merge_size>=1; keep
-        # temporal_patch_size by repeating the single frame T times so
-        # the model accepts the input.
+        # Replicate the single image `temporal_patch_size` times so the
+        # conv3d in patch_embed sees a valid temporal kernel; the temporal
+        # dim collapses to 1 in patch_embed output.
         x_t = x.unsqueeze(1).repeat(1, T, 1, 1, 1)  # (B, T, C, H, W)
-        # Patchify to (B, h, w, T*C*P*P) then flatten over batch and grid.
-        # We follow the same layout Qwen2VLImageProcessor produces.
         patches = x_t.view(B, T, C, h, P, w, P)
         patches = patches.permute(0, 3, 5, 1, 2, 4, 6).contiguous()
         patches = patches.view(B * h * w, T * C * P * P)
 
+        # T_grid = 1 (post-patch-embed temporal length).
         grid_thw = torch.tensor(
-            [[T, h, w]] * B, device=x.device, dtype=torch.long
+            [[1, h, w]] * B, device=x.device, dtype=torch.long
         )
 
-        # Run patch embed + transformer blocks, but skip the spatial-merge head
-        # so we keep per-patch (hidden=1024) features.
-        hidden = self.enc2d_model.patch_embed(patches)
+        hidden = self.enc2d_model.patch_embed(patches)  # (B*h*w, 1024)
         rotary_pos_emb = self.enc2d_model.rot_pos_emb(grid_thw)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
         cu_seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
         for blk in self.enc2d_model.blocks:
             hidden = blk(
                 hidden,
                 cu_seqlens=cu_seqlens,
-                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
             )
-        # hidden: (B*T*h*w, hidden=1024). Drop temporal dup and reshape.
-        hidden = hidden.view(B, T, h * w, -1)[:, 0]  # (B, h*w, hidden)
+        # (B*h*w, 1024) → (B, h*w, 1024)
+        hidden = hidden.view(B, h * w, -1)
         return hidden
 
     def before_train(self):
