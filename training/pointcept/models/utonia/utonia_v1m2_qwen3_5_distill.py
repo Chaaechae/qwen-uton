@@ -130,6 +130,7 @@ class UtoniaQwen3_5Distill(PointModel):
         match_max_r=0.08,
         up_cast_level=2,
         teacher_pretrained_path=None,
+        student_pretrained_path=None,
         enc2d_upcast_level=4,
         enc2d_cos_shift=True,
     ):
@@ -256,9 +257,17 @@ class UtoniaQwen3_5Distill(PointModel):
 
         self.student = nn.ModuleDict(student_model_dict)
         self.teacher = nn.ModuleDict(teacher_model_dict)
+        # Optional warm-start of the student backbone from a pretrained ckpt
+        # (e.g. the published Utonia weight). Loads ONLY backbone weights;
+        # newly added modules (mask/unmask/enc2d heads, patch_proj) stay
+        # random so the recipe can drive them with a much higher LR.
+        if student_pretrained_path is not None:
+            self.student = self._load_backbone_warmstart(
+                self.student, student_pretrained_path
+            )
         if teacher_pretrained_path is not None:
-            self.teacher = self.load_sonata(
-                self.teacher, path=teacher_pretrained_path
+            self.teacher = self._load_backbone_warmstart(
+                self.teacher, teacher_pretrained_path
             )
         for p in self.teacher.parameters():
             p.requires_grad = False
@@ -279,6 +288,38 @@ class UtoniaQwen3_5Distill(PointModel):
         # Legacy paths kept for compatibility.
         model = AutoModel.from_pretrained(model_weight, trust_remote_code=True)
         return model.eval()
+
+    def _load_backbone_warmstart(self, module_dict, path):
+        """
+        Auto-dispatch loader: works for both
+          (a) Pointcept training-format ckpts with `module.student.backbone.*`
+              keys (handled by load_sonata, if_loadhead=False), and
+          (b) the published Utonia HF ckpt (`utonia.pth`) where the state_dict
+              has raw PTv3 keys (`embedding.*`, `enc.*`, optionally `dec.*`).
+        Always loads only the backbone; mask/unmask/enc2d heads stay random.
+        """
+        ckpt = torch.load(path, map_location="cpu")
+        # Utonia HF ckpt is `dict(config=..., state_dict=...)`.
+        state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"Unexpected ckpt format at {path}: {type(state_dict)}")
+
+        sample_key = next(iter(state_dict.keys()))
+        if sample_key.startswith("module."):
+            # Pointcept training-format → reuse load_sonata's prefix surgery.
+            return self.load_sonata(module_dict, path=path, if_loadhead=False)
+
+        # Raw PTv3 (HF format). Prefix every key with "backbone." so it lands
+        # on module_dict.backbone. Decoder keys (if `enc_mode=False` was used
+        # to save the ckpt) are kept; they will be reported as unexpected and
+        # silently dropped under strict=False, since our student/teacher use
+        # `enc_mode=True` (encoder-only).
+        prefixed = {f"backbone.{k}": v for k, v in state_dict.items()}
+        info = module_dict.load_state_dict(prefixed, strict=False)
+        print(f"[warm-start] {path}: "
+              f"loaded {len(prefixed) - len(info[1])} keys, "
+              f"missing={len(info[0])}, unexpected={len(info[1])}")
+        return module_dict
 
     def load_sonata(self, model, path, if_loadhead=True):
         checkpoint = torch.load(path, map_location=lambda storage, loc: storage.cuda())

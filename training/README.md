@@ -66,27 +66,59 @@ bash training/install_into_pointcept.sh
 
 ## External resources (env-var overrides)
 
-Both recipes resolve the Qwen3.5 weight and the optional Utonia warm-start
-ckpt from environment variables, so you don't edit the config to change paths:
+Both recipes resolve external paths via environment variables — no edits to
+the config files needed.
 
 ```bash
-export QWEN3_5_4B_PATH=/data/hf/Qwen3.5-4B          # local path or HF repo id
-export UTONIA_TEACHER_CKPT=/data/ckpt/utonia.pth    # optional; recommended
+# Qwen3.5-4B (local path or HF repo id).
+export QWEN3_5_4B_PATH=/data/hf/Qwen3.5-4B
+
+# Utonia warm-start ckpt — strongly recommended (see below).
+# Loaded into BOTH student and teacher backbones.
+export UTONIA_PRETRAINED_CKPT=/data/ckpt/utonia.pth
+
+# Or, if you want different ckpts on each side, override individually:
+# export UTONIA_STUDENT_CKPT=/data/ckpt/utonia.pth
+# export UTONIA_TEACHER_CKPT=/data/ckpt/utonia.pth
 ```
 
-Or pass them inline via Pointcept's CLI:
+The loader auto-detects two ckpt formats:
+- the published Utonia HF ckpt (`Pointcept/Utonia → utonia.pth`, a
+  `dict(config=..., state_dict=...)` with raw PTv3 keys), and
+- a Pointcept training-format ckpt (with `module.student.backbone.*` keys).
 
-```bash
-python tools/train.py --config-file ... \
-    --options model.image_weight_path=/data/hf/Qwen3.5-4B \
-              model.teacher_pretrained_path=/data/ckpt/utonia.pth
-```
+It loads only the backbone weights — the new alignment modules
+(`patch_proj`, `enc2d_head_student`, mask/unmask heads) stay random so the
+recipe can drive them with full LR while the backbone is barely nudged.
 
-`UTONIA_TEACHER_CKPT` should point to the Utonia HuggingFace checkpoint
-(`Pointcept/Utonia → utonia.pth`); it is loaded *only* into the teacher's
-PTv3 backbone — student is trained from scratch. If you leave it unset, the
-teacher starts at random init and is pulled toward student via EMA only;
-training still works but converges much more slowly.
+### Layer-grouped learning rate
+
+The recipe applies different LRs to different parameter groups:
+
+| group | LR | rationale |
+|---|---|---|
+| `enc{e}.block{b}.*` (backbone blocks) | `base_lr * 0.05 * 0.9^k` | preserve Utonia's geometry; layer-wise decay (deeper → smaller). |
+| `student.backbone.*` / `teacher.backbone.*` (catch-all) | `base_lr * 0.05` | embedding, GridPooling `down`, etc. |
+| `patch_proj.*`, `enc2d_head_*.*`, `student.mask_head.*`, `student.unmask_head.*` | `base_lr` | newly-initialized → full LR. |
+
+Tune via `backbone_lr_scale` at the top of the config:
+- **Default `0.05`** — assumes `UTONIA_PRETRAINED_CKPT` is set.
+- **Set to `1.0`** if you train backbone from scratch (no warm-start).
+
+### Why warm-start the student too (not just the teacher)
+
+You may have seen Concerto-v1m2_distill *only* warm-start the teacher and
+train the student from scratch. That recipe is for **3D→3D distillation**
+(big teacher → smaller student) where the student deliberately starts blank.
+We are not doing that — student and teacher are the same Utonia base size,
+and we want to add Qwen3.5 alignment *on top of* Utonia's existing strengths.
+Initializing both sides from the Utonia ckpt + freezing-equivalent low LR on
+the backbone is therefore the right setup: the student starts useful, the
+SSL targets are useful from step 0, and the new alignment modules learn fast.
+
+If `UTONIA_PRETRAINED_CKPT` is unset, both backbones start at random init.
+Training still runs but converges much more slowly (teacher starts useless
+→ EMA must pull it toward student over many epochs).
 
 ## ScanNet sanity-check (recommended first run)
 
@@ -129,11 +161,11 @@ python tools/test_qwen3_5_vit_path.py --model "$QWEN3_5_4B_PATH"
 # Expect [4/4 PASS] with strategy=[manual: position_embeddings=(cos,sin) ...]
 ```
 
-### 3. (Optional but recommended) Get the Utonia warm-start ckpt
+### 3. (Strongly recommended) Get the Utonia warm-start ckpt
 
 ```bash
 huggingface-cli download Pointcept/Utonia utonia.pth --local-dir /data/ckpt
-export UTONIA_TEACHER_CKPT=/data/ckpt/utonia.pth
+export UTONIA_PRETRAINED_CKPT=/data/ckpt/utonia.pth
 ```
 
 ### 4. Launch ScanNet-only sanity run
@@ -141,7 +173,7 @@ export UTONIA_TEACHER_CKPT=/data/ckpt/utonia.pth
 ```bash
 cd third_party/Pointcept
 export QWEN3_5_4B_PATH=/data/hf/Qwen3.5-4B
-# UTONIA_TEACHER_CKPT optional — leave unset to skip teacher warm-start.
+export UTONIA_PRETRAINED_CKPT=/data/ckpt/utonia.pth   # optional but recommended
 
 python tools/train.py \
     --config-file configs/utonia/distill-utonia-v1m3-1-scannet-only-qwen3_5-4b.py \

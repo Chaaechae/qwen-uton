@@ -11,9 +11,11 @@ import os
 #   python tools/train.py --options model.image_weight_path=/data/hf/Qwen3.5-4B \
 #                                   model.teacher_pretrained_path=/data/ckpt/utonia.pth
 QWEN3_5_4B_PATH = os.environ.get("QWEN3_5_4B_PATH", "Qwen/Qwen3.5-4B")
-# None → teacher initialized from random + EMA self-distillation (slower).
-# Recommended: set to the Utonia HF checkpoint (utonia.pth) for warm-start.
-UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", None)
+# UTONIA_PRETRAINED_CKPT — strongly recommended. Used as warm-start for BOTH
+# student and teacher backbones. See base recipe for full notes.
+UTONIA_PRETRAINED_CKPT = os.environ.get("UTONIA_PRETRAINED_CKPT", None)
+UTONIA_STUDENT_CKPT = os.environ.get("UTONIA_STUDENT_CKPT", UTONIA_PRETRAINED_CKPT)
+UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", UTONIA_PRETRAINED_CKPT)
 
 # misc custom setting
 # Qwen3.5 ViT: patch_size=16 (pre-merge), crop must be multiple of 16.
@@ -146,6 +148,7 @@ model = dict(
     match_max_r=0.32,
     up_cast_level=0,
     enc2d_cos_shift=True,
+    student_pretrained_path=UTONIA_STUDENT_CKPT,
     teacher_pretrained_path=UTONIA_TEACHER_CKPT,
 )
 
@@ -154,19 +157,31 @@ model = dict(
 epoch = 5
 eval_epoch = 5
 base_lr = 0.004
-lr_decay = 0.9  # layer-wise lr decay
+backbone_lr_scale = 0.05  # set to 1.0 if no UTONIA_PRETRAINED_CKPT.
+lr_decay = 0.9            # layer-wise decay on top of backbone LR.
 
-base_wd = 0.04  # wd scheduler enable in hooks
-final_wd = 0.2  # wd scheduler enable in hooks
+base_wd = 0.04
+final_wd = 0.2
 
+backbone_base_lr = base_lr * backbone_lr_scale
 dec_depths = model["backbone_s"]["enc_depths"]
 param_dicts = [
     dict(
         keyword=f"enc{e}.block{b}.",
-        lr=base_lr * lr_decay ** (sum(dec_depths) - sum(dec_depths[:e]) - b - 1),
+        lr=backbone_base_lr
+            * lr_decay ** (sum(dec_depths) - sum(dec_depths[:e]) - b - 1),
     )
     for e in range(len(dec_depths))
     for b in range(dec_depths[e])
+]
+param_dicts += [
+    dict(keyword="student.backbone.", lr=backbone_base_lr),
+    dict(keyword="teacher.backbone.", lr=backbone_base_lr),
+    dict(keyword="patch_proj.", lr=base_lr),
+    dict(keyword="enc2d_head_student.", lr=base_lr),
+    dict(keyword="enc2d_head_teacher.", lr=base_lr),
+    dict(keyword="student.mask_head.", lr=base_lr),
+    dict(keyword="student.unmask_head.", lr=base_lr),
 ]
 del dec_depths
 

@@ -11,9 +11,19 @@ import os
 #   python tools/train.py --options model.image_weight_path=/data/hf/Qwen3.5-4B \
 #                                   model.teacher_pretrained_path=/data/ckpt/utonia.pth
 QWEN3_5_4B_PATH = os.environ.get("QWEN3_5_4B_PATH", "Qwen/Qwen3.5-4B")
-# None → teacher initialized from random + EMA self-distillation (slower).
-# Recommended: set to the Utonia HF checkpoint (utonia.pth) for warm-start.
-UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", None)
+# UTONIA_PRETRAINED_CKPT — strongly recommended. Used as warm-start for BOTH
+# student and teacher backbones. Combined with the layer-grouped LR below
+# (small lr for backbone, full lr for the new align modules) this preserves
+# Utonia's geometric strength while letting the Qwen3.5 alignment learn fast.
+# Accepts either:
+#   - the published Utonia HF ckpt (`utonia.pth` from Pointcept/Utonia), or
+#   - a Pointcept training-format ckpt (`module.student.backbone.*` keys).
+# If unset, both backbones start at random init (slow EMA self-distillation).
+UTONIA_PRETRAINED_CKPT = os.environ.get("UTONIA_PRETRAINED_CKPT", None)
+# Legacy override: lets you pass different ckpts to student vs teacher if you
+# really want to. Defaults to UTONIA_PRETRAINED_CKPT for both.
+UTONIA_STUDENT_CKPT = os.environ.get("UTONIA_STUDENT_CKPT", UTONIA_PRETRAINED_CKPT)
+UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", UTONIA_PRETRAINED_CKPT)
 
 # misc custom setting
 # Qwen3.5 ViT: patch_size=16 (pre-merge), crop must be multiple of 16.
@@ -145,26 +155,56 @@ model = dict(
     match_max_r=0.32,
     up_cast_level=0,
     enc2d_cos_shift=True,
+    student_pretrained_path=UTONIA_STUDENT_CKPT,
     teacher_pretrained_path=UTONIA_TEACHER_CKPT,
 )
 
 # scheduler settings
 epoch = 100
 eval_epoch = 100
-base_lr = 0.004
-lr_decay = 0.9  # layer-wise lr decay
+base_lr = 0.004        # LR for newly-initialized align modules
+                       # (patch_proj, enc2d_head_student, mask/unmask heads).
+backbone_lr_scale = 0.05  # backbone LR = base_lr * backbone_lr_scale.
+                          # When student is warm-started from Utonia ckpt, we
+                          # only want to *gently* nudge the backbone toward a
+                          # ViT-friendly manifold, not retrain it. If you start
+                          # from scratch (no UTONIA_PRETRAINED_CKPT), set this
+                          # to 1.0 so the backbone learns at full LR.
+lr_decay = 0.9         # layer-wise decay applied on top of backbone LR.
 
-base_wd = 0.04  # wd scheduler enable in hooks
-final_wd = 0.2  # wd scheduler enable in hooks
+base_wd = 0.04         # wd scheduler enable in hooks
+final_wd = 0.2         # wd scheduler enable in hooks
 
+# Pointcept's optimizer applies a `param_dicts` entry to every parameter whose
+# fully-qualified name CONTAINS the `keyword` substring; the first match wins.
+# Order matters → list backbone-block entries first, then the catch-all
+# backbone entry, then the align-module entries (which are only matched if
+# none of the backbone keywords matched).
+backbone_base_lr = base_lr * backbone_lr_scale
 dec_depths = model["backbone_s"]["enc_depths"]
 param_dicts = [
+    # Per-block backbone LR with layer-wise decay (deeper block → smaller LR).
     dict(
         keyword=f"enc{e}.block{b}.",
-        lr=base_lr * lr_decay ** (sum(dec_depths) - sum(dec_depths[:e]) - b - 1),
+        lr=backbone_base_lr
+            * lr_decay ** (sum(dec_depths) - sum(dec_depths[:e]) - b - 1),
     )
     for e in range(len(dec_depths))
     for b in range(dec_depths[e])
+]
+# Catch-all for backbone params not in enc{e}.block{b} (embedding, GridPooling
+# `down`, attention norms, etc.).
+param_dicts += [
+    dict(keyword="student.backbone.", lr=backbone_base_lr),
+    dict(keyword="teacher.backbone.", lr=backbone_base_lr),
+]
+# Newly-initialized align modules — full base_lr.
+param_dicts += [
+    dict(keyword="patch_proj.", lr=base_lr),
+    dict(keyword="enc2d_head_student.", lr=base_lr),
+    dict(keyword="enc2d_head_teacher.", lr=base_lr),
+    dict(keyword="student.mask_head.", lr=base_lr),
+    dict(keyword="student.unmask_head.", lr=base_lr),
 ]
 del dec_depths
 
