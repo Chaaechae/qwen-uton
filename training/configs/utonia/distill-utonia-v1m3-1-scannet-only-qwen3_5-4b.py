@@ -16,6 +16,10 @@ QWEN3_5_4B_PATH = os.environ.get("QWEN3_5_4B_PATH", "Qwen/Qwen3.5-4B")
 UTONIA_PRETRAINED_CKPT = os.environ.get("UTONIA_PRETRAINED_CKPT", None)
 UTONIA_STUDENT_CKPT = os.environ.get("UTONIA_STUDENT_CKPT", UTONIA_PRETRAINED_CKPT)
 UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", UTONIA_PRETRAINED_CKPT)
+# Pointcept's Config loader stores every non-dunder module-level name into
+# cfg, then deepcopies cfg. Module objects don't pickle → drop `os` from the
+# config namespace once we're done reading env vars.
+del os
 
 # misc custom setting
 # Qwen3.5 ViT: patch_size=16 (pre-merge), crop must be multiple of 16.
