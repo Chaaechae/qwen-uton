@@ -48,6 +48,9 @@ evaluate = False
 find_unused_parameters = True
 
 train = dict(type="PartialSampledTrainer")
+# Disable wandb so the run does not prompt for an API key on start.
+# Override at the CLI with `--options enable_wandb=True wandb_key=<token>`.
+enable_wandb = False
 
 # model settings
 model = dict(

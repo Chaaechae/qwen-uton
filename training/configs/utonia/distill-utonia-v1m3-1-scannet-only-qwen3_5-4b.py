@@ -40,7 +40,12 @@ amp_dtype = "bfloat16"
 evaluate = False
 find_unused_parameters = True
 
-train = dict(type="PartialSampledTrainer")
+# Single-dataset sanity run → use default Trainer.
+# (PartialSampledTrainer requires `data.sampled_dataset_index` /
+#  `data.sampled_dataset_limit` and only makes sense over a ConcatDataset.)
+train = dict(type="DefaultTrainer")
+# Disable wandb so the run does not prompt for an API key on start.
+enable_wandb = False
 
 # model settings
 model = dict(
