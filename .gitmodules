@@ -1,3 +1,7 @@
 [submodule "third_party/Pointcept"]
 	path = third_party/Pointcept
 	url = https://github.com/Pointcept/Pointcept.git
+	# `install_into_pointcept.sh` drops symlinks into this submodule's working
+	# tree as an install step. Those are derived artifacts, not content to
+	# commit, so the parent repo treats the submodule working tree as clean.
+	ignore = dirty
