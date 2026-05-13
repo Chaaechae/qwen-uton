@@ -28,9 +28,13 @@ link() {
 
 echo "Installing Utonia distill files into ${PCEPT_ROOT}:"
 
-# New distill module + extended __init__.py for the utonia model package.
+# New distill modules + extended __init__.py for the utonia model package.
 link "${UTONIA_ROOT}/training/pointcept/models/utonia/utonia_v1m2_qwen3_5_distill.py" \
      "${PCEPT_ROOT}/pointcept/models/utonia/utonia_v1m2_qwen3_5_distill.py"
+link "${UTONIA_ROOT}/training/pointcept/models/utonia/utonia_v1m3a_qwen3_5_align_only.py" \
+     "${PCEPT_ROOT}/pointcept/models/utonia/utonia_v1m3a_qwen3_5_align_only.py"
+link "${UTONIA_ROOT}/training/pointcept/models/utonia/utonia_v1m3b_qwen3_5_distill_ema.py" \
+     "${PCEPT_ROOT}/pointcept/models/utonia/utonia_v1m3b_qwen3_5_distill_ema.py"
 link "${UTONIA_ROOT}/training/pointcept/models/utonia/__init__.py" \
      "${PCEPT_ROOT}/pointcept/models/utonia/__init__.py"
 
