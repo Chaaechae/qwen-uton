@@ -121,14 +121,15 @@ if [[ "${SKIP_CONDA:-0}" != "1" ]]; then
     echo "[setup] Activated conda env: ${CONDA_ENV} ($(python --version 2>&1))"
 fi
 
-# ---- 1. Submodule -----------------------------------------------------------
+# ---- 1. Pointcept checkout --------------------------------------------------
 # Prefer a local Pointcept mirror (e.g. /group-volume/chaewon.yun/Pointcept_org
-# on this cluster) — clones from there are network-free and faster. The
-# submodule URL in .git/config is overridden to point at the local mirror
-# before `git submodule update` runs, so the working tree at
-# third_party/Pointcept is still a regular checkout (no symlink games),
-# meaning install_into_pointcept.sh can safely drop our symlinks into it
-# without touching the shared mirror.
+# on this cluster) — no network needed.
+#
+# We deliberately AVOID `git submodule update` for the local-mirror path.
+# Since git 2.38.1 (CVE-2022-39253), file:// transports inside submodule
+# operations are blocked even with `-c protocol.file.allow=always` in some
+# git versions (the protocol policy isn't reliably propagated to the inner
+# clone child processes). A plain `git clone --shared` sidesteps that.
 #
 # Priority:  --pointcept-local flag > POINTCEPT_LOCAL env > cluster default.
 if [[ -n "${POINTCEPT_LOCAL_ARG}" ]]; then
@@ -138,19 +139,33 @@ else
 fi
 
 if [[ ! -d "${PCEPT_ROOT}/pointcept" ]]; then
-    if [[ -d "${POINTCEPT_LOCAL}/pointcept" || -d "${POINTCEPT_LOCAL}/.git" ]]; then
-        echo "[setup] Initializing Pointcept submodule from local mirror: ${POINTCEPT_LOCAL}"
-        # Since git 2.38.1 (CVE-2022-39253) submodule clones from a local
-        # file path are blocked by default — even when the path obviously
-        # exists. Re-enable file:// protocol for this one-shot operation.
-        git -C "${UTONIA_ROOT}" submodule init -- third_party/Pointcept
-        git -C "${UTONIA_ROOT}" config "submodule.third_party/Pointcept.url" "${POINTCEPT_LOCAL}"
-        git -C "${UTONIA_ROOT}" \
-            -c protocol.file.allow=always \
-            submodule update --recursive third_party/Pointcept
+    if [[ -d "${POINTCEPT_LOCAL}/pointcept" ]]; then
+        echo "[setup] Cloning Pointcept from local mirror: ${POINTCEPT_LOCAL}"
+        # Remove an empty placeholder dir left over from a prior partial init.
+        if [[ -e "${PCEPT_ROOT}" && ! -d "${PCEPT_ROOT}/.git" ]]; then
+            rmdir "${PCEPT_ROOT}" 2>/dev/null || true
+        fi
+        # --shared : new clone's .git/objects points at mirror's objects via
+        #            alternates → working tree is cheap, doesn't duplicate
+        #            the whole pack. Read-only sharing.
+        # -c protocol.file.allow=always : needed since git 2.38.1 even for
+        #            user-initiated file:// clones in some configurations.
+        git -c protocol.file.allow=always clone \
+            --shared "${POINTCEPT_LOCAL}" "${PCEPT_ROOT}"
+
+        # If the parent qwen-uton repo pins a specific commit for the
+        # submodule, check it out so subsequent installs are deterministic.
+        SUB_COMMIT="$(git -C "${UTONIA_ROOT}" ls-tree HEAD third_party/Pointcept 2>/dev/null | awk '{print $3}' || true)"
+        if [[ -n "${SUB_COMMIT}" ]] && \
+                git -C "${PCEPT_ROOT}" cat-file -e "${SUB_COMMIT}" 2>/dev/null; then
+            git -C "${PCEPT_ROOT}" checkout -q --detach "${SUB_COMMIT}"
+            echo "[setup] Checked out submodule-pinned commit: ${SUB_COMMIT:0:8}"
+        else
+            echo "[setup] Using mirror's current HEAD ($(git -C "${PCEPT_ROOT}" rev-parse --short HEAD))"
+        fi
     else
         echo "[warn] Local Pointcept mirror not found at ${POINTCEPT_LOCAL};"
-        echo "       falling back to GitHub clone..."
+        echo "       falling back to GitHub clone via git submodule..."
         git -C "${UTONIA_ROOT}" submodule update --init --recursive
     fi
 fi
