@@ -28,9 +28,19 @@
 import argparse
 import copy
 import os
+import sys
 
 import numpy as np
 import torch
+
+# Make the local `utonia` package importable regardless of cwd / PYTHONPATH.
+# Existing demo scripts assume `export PYTHONPATH=./` from the repo root;
+# this auto-prepends the qwen-uton repo root (= this file's parent dir's
+# parent) so `python demo/compare_pca.py` works from anywhere.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(_HERE)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import utonia
 from utonia.model import PointTransformerV3
