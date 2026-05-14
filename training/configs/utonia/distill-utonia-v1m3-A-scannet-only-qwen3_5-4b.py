@@ -175,7 +175,12 @@ indoor_transform = [
         type="MultiViewGenerator",
         global_view_num=2,
         global_view_scale=(0.4, 1.0),
-        local_view_num=0,
+        # MultiViewGenerator unconditionally computes view_dict["local_offset"]
+        # from view_dict["local_coord"], so local_view_num must be > 0 even
+        # though the align-only model never reads `local_*` features. The
+        # smallest view is generated and discarded by Collect (which omits
+        # local_* from its keys).
+        local_view_num=1,
         local_view_scale=(0.1, 0.4),
         global_shared_transform=[
             dict(
@@ -199,7 +204,12 @@ indoor_transform = [
             dict(type="RandomJitter", sigma=0.0025, clip=0.01),
             dict(type="ElasticDistortion", distortion_params=[[0.1, 0.2], [0.4, 0.8]]),
         ],
-        local_transform=[],
+        # Minimal local_transform — the local view is generated only so that
+        # MultiViewGenerator does not KeyError on `view_dict["local_coord"]`,
+        # then dropped by Collect.
+        local_transform=[
+            dict(type="NormalizeColor"),
+        ],
         max_size=65536,
         enc2d_max_size=65536,
         enc2d_scale=(0.8, 1),
