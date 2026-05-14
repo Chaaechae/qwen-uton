@@ -13,12 +13,18 @@
 #   UTONIA_PRETRAINED_CKPT  e.g. /data/ckpt/utonia.pth (strongly recommended)
 #
 # Optional env vars / overrides:
-#   UTONIA_ROOT   path to this qwen-uton checkout. Order of resolution:
-#                 (1) --utonia-root flag, (2) UTONIA_ROOT env var,
-#                 (3) auto-detect from script location.
-#                 The cluster default is /group-volume/chaewon.yun/qwen-uton.
-#   DATASET_ROOT  (default /group-volume/chaewon.yun/dataset)
-#   NUM_GPUS      (default 1)
+#   UTONIA_ROOT      path to this qwen-uton checkout. Order of resolution:
+#                    (1) --utonia-root flag, (2) UTONIA_ROOT env var,
+#                    (3) auto-detect from script location.
+#                    Cluster default: /group-volume/chaewon.yun/qwen-uton.
+#   POINTCEPT_LOCAL  path to a local Pointcept clone used instead of fetching
+#                    from GitHub when initializing the submodule. Order:
+#                    (1) --pointcept-local flag, (2) POINTCEPT_LOCAL env,
+#                    (3) cluster default /group-volume/chaewon.yun/Pointcept_org.
+#                    Falls back to GitHub if no local mirror is found.
+#   DATASET_ROOT     (default /group-volume/3Ddataset)
+#   DIST_BACKEND     (default gloo; nccl|mpi also valid)
+#   NUM_GPUS         (default 1)
 #
 # What this script does, in order:
 #   0. Activate the conda env (skip via SKIP_CONDA=1).
@@ -32,9 +38,11 @@
 set -eo pipefail
 
 # ---- Flag parsing -----------------------------------------------------------
-# Pull out `--utonia-root <path>` (or `--utonia-root=<path>`) before treating
-# the remaining args as `[VARIANT] [extra train.py --options ...]`.
+# Pull out `--utonia-root <path>` (or `--utonia-root=<path>`) and
+# `--pointcept-local <path>` before treating the remaining args as
+# `[VARIANT] [extra train.py --options ...]`.
 UTONIA_ROOT_ARG=""
+POINTCEPT_LOCAL_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utonia-root)
@@ -43,6 +51,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --utonia-root=*)
             UTONIA_ROOT_ARG="${1#--utonia-root=}"
+            shift
+            ;;
+        --pointcept-local)
+            POINTCEPT_LOCAL_ARG="$2"
+            shift 2
+            ;;
+        --pointcept-local=*)
+            POINTCEPT_LOCAL_ARG="${1#--pointcept-local=}"
             shift
             ;;
         --)
@@ -106,9 +122,32 @@ if [[ "${SKIP_CONDA:-0}" != "1" ]]; then
 fi
 
 # ---- 1. Submodule -----------------------------------------------------------
+# Prefer a local Pointcept mirror (e.g. /group-volume/chaewon.yun/Pointcept_org
+# on this cluster) — clones from there are network-free and faster. The
+# submodule URL in .git/config is overridden to point at the local mirror
+# before `git submodule update` runs, so the working tree at
+# third_party/Pointcept is still a regular checkout (no symlink games),
+# meaning install_into_pointcept.sh can safely drop our symlinks into it
+# without touching the shared mirror.
+#
+# Priority:  --pointcept-local flag > POINTCEPT_LOCAL env > cluster default.
+if [[ -n "${POINTCEPT_LOCAL_ARG}" ]]; then
+    POINTCEPT_LOCAL="${POINTCEPT_LOCAL_ARG}"
+else
+    POINTCEPT_LOCAL="${POINTCEPT_LOCAL:-/group-volume/chaewon.yun/Pointcept_org}"
+fi
+
 if [[ ! -d "${PCEPT_ROOT}/pointcept" ]]; then
-    echo "[setup] Pointcept submodule not initialized — fetching..."
-    git -C "${UTONIA_ROOT}" submodule update --init --recursive
+    if [[ -d "${POINTCEPT_LOCAL}/pointcept" || -d "${POINTCEPT_LOCAL}/.git" ]]; then
+        echo "[setup] Initializing Pointcept submodule from local mirror: ${POINTCEPT_LOCAL}"
+        git -C "${UTONIA_ROOT}" submodule init -- third_party/Pointcept
+        git -C "${UTONIA_ROOT}" config "submodule.third_party/Pointcept.url" "${POINTCEPT_LOCAL}"
+        git -C "${UTONIA_ROOT}" submodule update --recursive third_party/Pointcept
+    else
+        echo "[warn] Local Pointcept mirror not found at ${POINTCEPT_LOCAL};"
+        echo "       falling back to GitHub clone..."
+        git -C "${UTONIA_ROOT}" submodule update --init --recursive
+    fi
 fi
 
 # ---- 2. Install symlinks ----------------------------------------------------
@@ -194,6 +233,7 @@ echo "  num_gpus             : ${NUM_GPUS}"
 echo "  --options            : ${EXTRA_OPTS}"
 echo "  QWEN3_5_4B_PATH      : ${QWEN3_5_4B_PATH}"
 echo "  UTONIA_PRETRAINED... : ${UTONIA_PRETRAINED_CKPT:-<unset>}"
+echo "  POINTCEPT_LOCAL      : ${POINTCEPT_LOCAL}"
 echo "  DATASET_ROOT         : ${DATASET_ROOT}"
 echo "  DIST_BACKEND         : ${DIST_BACKEND}"
 echo "=========================================================="
