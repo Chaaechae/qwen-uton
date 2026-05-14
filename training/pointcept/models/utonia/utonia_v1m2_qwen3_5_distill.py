@@ -887,6 +887,11 @@ class UtoniaQwen3_5Distill(PointModel):
         result_dict["loss"] = sum(result_dict["loss"])
 
         if get_world_size() > 1:
+            # Gloo backend doesn't support ReduceOp.AVG; do SUM + manual divide
+            # so this stays correct under both NCCL and Gloo.
+            ws = get_world_size()
             for loss in result_dict.values():
-                dist.all_reduce(loss, op=dist.ReduceOp.AVG)
+                if torch.is_tensor(loss):
+                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                    loss.div_(ws)
         return result_dict

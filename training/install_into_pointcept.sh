@@ -38,6 +38,10 @@ link "${UTONIA_ROOT}/training/pointcept/models/utonia/utonia_v1m3b_qwen3_5_disti
 link "${UTONIA_ROOT}/training/pointcept/models/utonia/__init__.py" \
      "${PCEPT_ROOT}/pointcept/models/utonia/__init__.py"
 
+# Replacement launch.py — adds DIST_BACKEND env var support (NCCL | gloo).
+link "${UTONIA_ROOT}/training/pointcept/engines/launch.py" \
+     "${PCEPT_ROOT}/pointcept/engines/launch.py"
+
 # Recipes.
 for cfg in "${UTONIA_ROOT}/training/configs/utonia/"distill-utonia-v1m3-*.py; do
     [[ -e "$cfg" ]] || continue

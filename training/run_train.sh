@@ -150,7 +150,12 @@ if [[ ! -f "${UTONIA_PRETRAINED_CKPT}" ]]; then
     echo "[warn] UTONIA_PRETRAINED_CKPT=${UTONIA_PRETRAINED_CKPT} not found —"
     echo "       student/teacher PTv3 will start from random init."
 fi
-export QWEN3_5_4B_PATH UTONIA_PRETRAINED_CKPT DATASET_ROOT
+# Distributed backend. NCCL is broken on this cluster, so default to gloo.
+# Override with `DIST_BACKEND=nccl bash run_train.sh ...` if NCCL becomes
+# available. Our launch.py (symlinked into Pointcept) reads this env var.
+DIST_BACKEND="${DIST_BACKEND:-gloo}"
+
+export QWEN3_5_4B_PATH UTONIA_PRETRAINED_CKPT DATASET_ROOT DIST_BACKEND
 
 # ---- 5. Pick config ---------------------------------------------------------
 case "${VARIANT}" in
@@ -190,6 +195,7 @@ echo "  --options            : ${EXTRA_OPTS}"
 echo "  QWEN3_5_4B_PATH      : ${QWEN3_5_4B_PATH}"
 echo "  UTONIA_PRETRAINED... : ${UTONIA_PRETRAINED_CKPT:-<unset>}"
 echo "  DATASET_ROOT         : ${DATASET_ROOT}"
+echo "  DIST_BACKEND         : ${DIST_BACKEND}"
 echo "=========================================================="
 echo
 
