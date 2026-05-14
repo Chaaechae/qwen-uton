@@ -240,7 +240,7 @@ data = dict(
         type="ConcatDataset",
         datasets=[
             dict(
-                type="DefaultImagePointDataset",
+                type="SkipOnErrorImagePointDataset",
                 crop_h=crop_h,
                 crop_w=crop_w,
                 patch_size=patch_size,

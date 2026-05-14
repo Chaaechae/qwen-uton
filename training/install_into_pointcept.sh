@@ -42,6 +42,11 @@ link "${UTONIA_ROOT}/training/pointcept/models/utonia/__init__.py" \
 link "${UTONIA_ROOT}/training/pointcept/engines/launch.py" \
      "${PCEPT_ROOT}/pointcept/engines/launch.py"
 
+# Skip-on-error dataset wrapper — logs and skips bad samples instead of
+# crashing the run on a single bad scene.
+link "${UTONIA_ROOT}/training/pointcept/datasets/skip_on_error_dataset.py" \
+     "${PCEPT_ROOT}/pointcept/datasets/skip_on_error_dataset.py"
+
 # Recipes.
 for cfg in "${UTONIA_ROOT}/training/configs/utonia/"distill-utonia-v1m3-*.py; do
     [[ -e "$cfg" ]] || continue
