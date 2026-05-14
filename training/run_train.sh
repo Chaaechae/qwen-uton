@@ -2,20 +2,26 @@
 # Single-shot launcher for Utonia × Qwen3.5 distillation training.
 #
 # Usage:
-#   bash training/run_train.sh                       # defaults to variant B
-#   bash training/run_train.sh A                     # align-only
-#   bash training/run_train.sh B                     # align + EMA-fixed SSL
-#   bash training/run_train.sh B save_path=exp/foo   # extra train.py --options
+#   bash run_train.sh                                # defaults to variant B
+#   bash run_train.sh A                              # align-only
+#   bash run_train.sh B                              # align + EMA-fixed SSL
+#   bash run_train.sh B save_path=exp/foo            # extra train.py --options
+#   bash run_train.sh --utonia-root /path/to/repo B  # override repo location
 #
 # Required env vars (overridable):
 #   QWEN3_5_4B_PATH         e.g. /data/hf/Qwen3.5-4B   (or HF repo id)
 #   UTONIA_PRETRAINED_CKPT  e.g. /data/ckpt/utonia.pth (strongly recommended)
 #
-# Optional env vars:
+# Optional env vars / overrides:
+#   UTONIA_ROOT   path to this qwen-uton checkout. Order of resolution:
+#                 (1) --utonia-root flag, (2) UTONIA_ROOT env var,
+#                 (3) auto-detect from script location.
+#                 The cluster default is /group-volume/chaewon.yun/qwen-uton.
 #   DATASET_ROOT  (default /group-volume/chaewon.yun/dataset)
 #   NUM_GPUS      (default 1)
 #
 # What this script does, in order:
+#   0. Activate the conda env (skip via SKIP_CONDA=1).
 #   1. Initialize the Pointcept submodule if it isn't yet.
 #   2. Re-run install_into_pointcept.sh to symlink our model files + configs.
 #   3. Symlink ${DATASET_ROOT}/data into Pointcept (Pointcept resolves splits.json
@@ -25,11 +31,58 @@
 
 set -eo pipefail
 
+# ---- Flag parsing -----------------------------------------------------------
+# Pull out `--utonia-root <path>` (or `--utonia-root=<path>`) before treating
+# the remaining args as `[VARIANT] [extra train.py --options ...]`.
+UTONIA_ROOT_ARG=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --utonia-root)
+            UTONIA_ROOT_ARG="$2"
+            shift 2
+            ;;
+        --utonia-root=*)
+            UTONIA_ROOT_ARG="${1#--utonia-root=}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -h|--help)
+            sed -n '2,30p' "${BASH_SOURCE[0]}"
+            exit 0
+            ;;
+        -*)
+            echo "[error] Unknown flag: $1" >&2
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 VARIANT="${1:-B}"
 shift || true
 EXTRA_OPTS="$*"
 
-UTONIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# ---- Resolve UTONIA_ROOT ----------------------------------------------------
+# Priority: --utonia-root flag > UTONIA_ROOT env var > auto-detect from script.
+if [[ -n "${UTONIA_ROOT_ARG}" ]]; then
+    UTONIA_ROOT="${UTONIA_ROOT_ARG}"
+elif [[ -n "${UTONIA_ROOT:-}" ]]; then
+    : # use env var as-is
+else
+    UTONIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
+# Canonicalize and validate.
+UTONIA_ROOT="$(cd "${UTONIA_ROOT}" 2>/dev/null && pwd || echo "${UTONIA_ROOT}")"
+if [[ ! -f "${UTONIA_ROOT}/training/install_into_pointcept.sh" ]]; then
+    echo "[error] UTONIA_ROOT=${UTONIA_ROOT} does not look like a qwen-uton checkout" >&2
+    echo "         (missing training/install_into_pointcept.sh)." >&2
+    exit 1
+fi
 PCEPT_ROOT="${UTONIA_ROOT}/third_party/Pointcept"
 
 # ---- 0. Conda env ------------------------------------------------------------
