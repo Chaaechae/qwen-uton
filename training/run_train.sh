@@ -2,11 +2,13 @@
 # Single-shot launcher for Utonia × Qwen3.5 distillation training.
 #
 # Usage:
-#   bash run_train.sh                                # defaults to variant B
-#   bash run_train.sh A                              # align-only
-#   bash run_train.sh B                              # align + EMA-fixed SSL
-#   bash run_train.sh B save_path=exp/foo            # extra train.py --options
-#   bash run_train.sh --utonia-root /path/to/repo B  # override repo location
+#   bash run_train.sh                                  # variant B, 1 GPU
+#   bash run_train.sh A                                # align-only
+#   bash run_train.sh B                                # align + EMA-fixed SSL
+#   bash run_train.sh --num-gpus 4 B                   # 4 GPUs
+#   bash run_train.sh B save_path=exp/foo              # extra train.py --options
+#   bash run_train.sh --utonia-root /path/to/repo B    # override repo location
+#   bash run_train.sh --pointcept-local /path B        # override Pointcept mirror
 #
 # Required env vars (overridable):
 #   QWEN3_5_4B_PATH         e.g. /data/hf/Qwen3.5-4B   (or HF repo id)
@@ -24,7 +26,8 @@
 #                    Falls back to GitHub if no local mirror is found.
 #   DATASET_ROOT     (default /group-volume/3Ddataset)
 #   DIST_BACKEND     (default gloo; nccl|mpi also valid)
-#   NUM_GPUS         (default 1)
+#   NUM_GPUS         number of GPUs per machine. Order of resolution:
+#                    (1) --num-gpus flag, (2) NUM_GPUS env var, (3) 1.
 #
 # What this script does, in order:
 #   0. Activate the conda env (skip via SKIP_CONDA=1).
@@ -38,11 +41,12 @@
 set -eo pipefail
 
 # ---- Flag parsing -----------------------------------------------------------
-# Pull out `--utonia-root <path>` (or `--utonia-root=<path>`) and
-# `--pointcept-local <path>` before treating the remaining args as
+# Pull out `--utonia-root <path>`, `--pointcept-local <path>`, `--num-gpus <N>`
+# (each also accepts `=`-form) before treating the remaining args as
 # `[VARIANT] [extra train.py --options ...]`.
 UTONIA_ROOT_ARG=""
 POINTCEPT_LOCAL_ARG=""
+NUM_GPUS_ARG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utonia-root)
@@ -61,12 +65,20 @@ while [[ $# -gt 0 ]]; do
             POINTCEPT_LOCAL_ARG="${1#--pointcept-local=}"
             shift
             ;;
+        --num-gpus)
+            NUM_GPUS_ARG="$2"
+            shift 2
+            ;;
+        --num-gpus=*)
+            NUM_GPUS_ARG="${1#--num-gpus=}"
+            shift
+            ;;
         --)
             shift
             break
             ;;
         -h|--help)
-            sed -n '2,30p' "${BASH_SOURCE[0]}"
+            sed -n '2,32p' "${BASH_SOURCE[0]}"
             exit 0
             ;;
         -*)
@@ -237,7 +249,12 @@ if [[ "${EXTRA_OPTS}" != *save_path* ]]; then
     EXTRA_OPTS="save_path=${DEFAULT_SAVE} ${EXTRA_OPTS}"
 fi
 
-NUM_GPUS="${NUM_GPUS:-1}"
+# NUM_GPUS resolution: --num-gpus flag > NUM_GPUS env var > 1 (default).
+if [[ -n "${NUM_GPUS_ARG}" ]]; then
+    NUM_GPUS="${NUM_GPUS_ARG}"
+else
+    NUM_GPUS="${NUM_GPUS:-1}"
+fi
 
 # ---- 7. Launch --------------------------------------------------------------
 cd "${PCEPT_ROOT}"
