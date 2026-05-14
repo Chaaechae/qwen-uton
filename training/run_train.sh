@@ -211,7 +211,7 @@ fi
 # ---- 4. Env vars ------------------------------------------------------------
 # Cluster defaults — override with `export QWEN3_5_4B_PATH=... etc` before
 # invoking this script, or pass via the environment.
-QWEN3_5_4B_PATH="${QWEN3_5_4B_PATH:-/group-volume/chaewon.yun/QWEN3.5-4B}"
+QWEN3_5_4B_PATH="${QWEN3_5_4B_PATH:-/group-volume/chaewon.yun/Qwen3.5-4B}"
 UTONIA_PRETRAINED_CKPT="${UTONIA_PRETRAINED_CKPT:-/group-volume/Utonia/utonia.pth}"
 if [[ ! -e "${QWEN3_5_4B_PATH}" ]]; then
     echo "[warn] QWEN3_5_4B_PATH=${QWEN3_5_4B_PATH} does not exist locally;"
