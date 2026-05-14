@@ -25,7 +25,7 @@ UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", UTONIA_PRETRAINED_CK
 #   /group-volume/chaewon.yun/dataset/data/scannet/{train,val,images,...}
 # so the config-side `data_root` reaches scannet at
 #   ${DATASET_ROOT}/data/scannet
-DATASET_ROOT = os.environ.get("DATASET_ROOT", "/group-volume/chaewon.yun/dataset")
+DATASET_ROOT = os.environ.get("DATASET_ROOT", "/group-volume/3Ddataset")
 del os
 
 crop_h = 512

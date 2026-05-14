@@ -27,7 +27,7 @@ UTONIA_TEACHER_CKPT = os.environ.get("UTONIA_TEACHER_CKPT", UTONIA_PRETRAINED_CK
 # Dataset root. Real layout on this cluster is
 #   /group-volume/chaewon.yun/dataset/data/{scannet, nuscenes, waymo, ...}
 # so every `data_root` resolves to ${DATASET_ROOT}/data/<dataset>.
-DATASET_ROOT = os.environ.get("DATASET_ROOT", "/group-volume/chaewon.yun/dataset")
+DATASET_ROOT = os.environ.get("DATASET_ROOT", "/group-volume/3Ddataset")
 # Pointcept's Config loader stores every non-dunder module-level name into
 # cfg, then deepcopies cfg. Module objects don't pickle → drop `os` from the
 # config namespace once we're done reading env vars.

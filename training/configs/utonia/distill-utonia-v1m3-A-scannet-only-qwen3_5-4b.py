@@ -24,7 +24,7 @@ UTONIA_STUDENT_CKPT = os.environ.get("UTONIA_STUDENT_CKPT", UTONIA_PRETRAINED_CK
 # so the config-side `data_root` reaches scannet at
 #   ${DATASET_ROOT}/data/scannet
 # Override per-machine with the DATASET_ROOT env var if needed.
-DATASET_ROOT = os.environ.get("DATASET_ROOT", "/group-volume/chaewon.yun/dataset")
+DATASET_ROOT = os.environ.get("DATASET_ROOT", "/group-volume/3Ddataset")
 del os
 
 crop_h = 512

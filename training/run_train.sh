@@ -116,13 +116,19 @@ echo "[setup] Installing Utonia model files + configs into Pointcept tree..."
 bash "${UTONIA_ROOT}/training/install_into_pointcept.sh" >/dev/null
 
 # ---- 3. Dataset symlink -----------------------------------------------------
-DATASET_ROOT="${DATASET_ROOT:-/group-volume/chaewon.yun/dataset}"
+# `data_root` in the configs and splits.json reach the data either as an
+# absolute path or relative to cwd (third_party/Pointcept). We create both:
+# DATASET_ROOT for the configs, and a `./data` symlink for any path inside
+# splits.json that starts with literal "data/...".
+DATASET_ROOT="${DATASET_ROOT:-/group-volume/3Ddataset}"
 if [[ ! -d "${DATASET_ROOT}/data" ]]; then
     echo "[error] DATASET_ROOT=${DATASET_ROOT} has no data/ subdirectory." >&2
     exit 1
 fi
 if [[ -L "${PCEPT_ROOT}/data" ]]; then
-    echo "[setup] Pointcept/data already symlinked to $(readlink "${PCEPT_ROOT}/data")"
+    # Re-point if pointing somewhere else (idempotent for repeated runs).
+    ln -sfn "${DATASET_ROOT}/data" "${PCEPT_ROOT}/data"
+    echo "[setup] Re-linked ${PCEPT_ROOT}/data -> $(readlink "${PCEPT_ROOT}/data")"
 elif [[ -e "${PCEPT_ROOT}/data" ]]; then
     echo "[error] ${PCEPT_ROOT}/data exists and is not a symlink; refusing to overwrite." >&2
     exit 1
@@ -132,17 +138,19 @@ else
 fi
 
 # ---- 4. Env vars ------------------------------------------------------------
-if [[ -z "${QWEN3_5_4B_PATH:-}" ]]; then
-    echo "[error] QWEN3_5_4B_PATH must be set (local path to Qwen3.5-4B, or HF repo id)." >&2
-    exit 1
+# Cluster defaults — override with `export QWEN3_5_4B_PATH=... etc` before
+# invoking this script, or pass via the environment.
+QWEN3_5_4B_PATH="${QWEN3_5_4B_PATH:-/group-volume/chaewon.yun/QWEN3.5-4B}"
+UTONIA_PRETRAINED_CKPT="${UTONIA_PRETRAINED_CKPT:-/group-volume/Utonia/utonia.pth}"
+if [[ ! -e "${QWEN3_5_4B_PATH}" ]]; then
+    echo "[warn] QWEN3_5_4B_PATH=${QWEN3_5_4B_PATH} does not exist locally;"
+    echo "       transformers will try to interpret it as an HF repo id."
 fi
-if [[ -z "${UTONIA_PRETRAINED_CKPT:-}" ]]; then
-    echo "[warn] UTONIA_PRETRAINED_CKPT not set — both student and teacher PTv3"
-    echo "       will start from random init. Strongly recommended to set this to utonia.pth."
+if [[ ! -f "${UTONIA_PRETRAINED_CKPT}" ]]; then
+    echo "[warn] UTONIA_PRETRAINED_CKPT=${UTONIA_PRETRAINED_CKPT} not found —"
+    echo "       student/teacher PTv3 will start from random init."
 fi
-export QWEN3_5_4B_PATH
-export UTONIA_PRETRAINED_CKPT="${UTONIA_PRETRAINED_CKPT:-}"
-export DATASET_ROOT
+export QWEN3_5_4B_PATH UTONIA_PRETRAINED_CKPT DATASET_ROOT
 
 # ---- 5. Pick config ---------------------------------------------------------
 case "${VARIANT}" in
