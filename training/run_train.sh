@@ -26,6 +26,9 @@
 #                    Falls back to GitHub if no local mirror is found.
 #   DATASET_ROOT     (default /group-volume/3Ddataset)
 #   DIST_BACKEND     (default gloo; nccl|mpi also valid)
+#   DIST_TIMEOUT_MIN distributed init timeout in minutes (default 120). Bump
+#                    for slow fabrics or large datasets if you see
+#                    `gloo::EnforceNotMet` or hangs at dataloader start.
 #   NUM_GPUS         number of GPUs per machine. Order of resolution:
 #                    (1) --num-gpus flag, (2) NUM_GPUS env var, (3) 1.
 #
@@ -226,7 +229,12 @@ fi
 # available. Our launch.py (symlinked into Pointcept) reads this env var.
 DIST_BACKEND="${DIST_BACKEND:-gloo}"
 
-export QWEN3_5_4B_PATH UTONIA_PRETRAINED_CKPT DATASET_ROOT DIST_BACKEND
+# Distributed init timeout in minutes (default 60). Gloo on slow fabrics
+# / large datasets can need much more. Bump if you see `gloo::EnforceNotMet`
+# or hangs around dataloader start. Override via env var.
+DIST_TIMEOUT_MIN="${DIST_TIMEOUT_MIN:-120}"
+
+export QWEN3_5_4B_PATH UTONIA_PRETRAINED_CKPT DATASET_ROOT DIST_BACKEND DIST_TIMEOUT_MIN
 
 # ---- 5. Pick config ---------------------------------------------------------
 case "${VARIANT}" in
@@ -273,6 +281,7 @@ echo "  UTONIA_PRETRAINED... : ${UTONIA_PRETRAINED_CKPT:-<unset>}"
 echo "  POINTCEPT_LOCAL      : ${POINTCEPT_LOCAL}"
 echo "  DATASET_ROOT         : ${DATASET_ROOT}"
 echo "  DIST_BACKEND         : ${DIST_BACKEND}"
+echo "  DIST_TIMEOUT_MIN     : ${DIST_TIMEOUT_MIN}"
 echo "=========================================================="
 echo
 

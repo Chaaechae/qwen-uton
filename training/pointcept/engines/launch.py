@@ -29,7 +29,14 @@ from pointcept.utils import comm
 
 __all__ = ["DEFAULT_TIMEOUT", "launch"]
 
-DEFAULT_TIMEOUT = timedelta(minutes=60)
+
+def _resolve_timeout():
+    # Default 60 min like upstream. Gloo clusters with slow data loading
+    # sometimes need more; override via DIST_TIMEOUT_MIN (in minutes).
+    return timedelta(minutes=int(os.environ.get("DIST_TIMEOUT_MIN", "60")))
+
+
+DEFAULT_TIMEOUT = _resolve_timeout()
 
 
 def _find_free_port():

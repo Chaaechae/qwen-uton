@@ -886,12 +886,10 @@ class UtoniaQwen3_5Distill(PointModel):
                 result_dict["loss"].append(result_ssl_loss * self.enc2d_loss_weight)
         result_dict["loss"] = sum(result_dict["loss"])
 
-        if get_world_size() > 1:
-            # Gloo backend doesn't support ReduceOp.AVG; do SUM + manual divide
-            # so this stays correct under both NCCL and Gloo.
-            ws = get_world_size()
-            for loss in result_dict.values():
-                if torch.is_tensor(loss):
-                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
-                    loss.div_(ws)
+        # Note: loss averaging across ranks is intentionally omitted.
+        # DDP already syncs gradients in backward; this in-place all_reduce
+        # of CUDA tensors that are part of the autograd graph is risky
+        # under gloo backend (PyTorch version-check on the loss tensor can
+        # fire as `gloo::EnforceNotMet`). Per-rank loss values in logs are
+        # acceptable.
         return result_dict
