@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Single-shot launcher for Utonia × Qwen3.5 distillation training.
+#
+# Usage:
+#   bash training/run_train.sh                       # defaults to variant B
+#   bash training/run_train.sh A                     # align-only
+#   bash training/run_train.sh B                     # align + EMA-fixed SSL
+#   bash training/run_train.sh B save_path=exp/foo   # extra train.py --options
+#
+# Required env vars (overridable):
+#   QWEN3_5_4B_PATH         e.g. /data/hf/Qwen3.5-4B   (or HF repo id)
+#   UTONIA_PRETRAINED_CKPT  e.g. /data/ckpt/utonia.pth (strongly recommended)
+#
+# Optional env vars:
+#   DATASET_ROOT  (default /group-volume/chaewon.yun/dataset)
+#   NUM_GPUS      (default 1)
+#
+# What this script does, in order:
+#   1. Initialize the Pointcept submodule if it isn't yet.
+#   2. Re-run install_into_pointcept.sh to symlink our model files + configs.
+#   3. Symlink ${DATASET_ROOT}/data into Pointcept (Pointcept resolves splits.json
+#      paths relative to its own cwd).
+#   4. Set PYTHONPATH=./ so `python tools/train.py` can find `pointcept`.
+#   5. Launch tools/train.py with the chosen config.
+
+set -eo pipefail
+
+VARIANT="${1:-B}"
+shift || true
+EXTRA_OPTS="$*"
+
+UTONIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PCEPT_ROOT="${UTONIA_ROOT}/third_party/Pointcept"
+
+# ---- 1. Submodule -----------------------------------------------------------
+if [[ ! -d "${PCEPT_ROOT}/pointcept" ]]; then
+    echo "[setup] Pointcept submodule not initialized — fetching..."
+    git -C "${UTONIA_ROOT}" submodule update --init --recursive
+fi
+
+# ---- 2. Install symlinks ----------------------------------------------------
+echo "[setup] Installing Utonia model files + configs into Pointcept tree..."
+bash "${UTONIA_ROOT}/training/install_into_pointcept.sh" >/dev/null
+
+# ---- 3. Dataset symlink -----------------------------------------------------
+DATASET_ROOT="${DATASET_ROOT:-/group-volume/chaewon.yun/dataset}"
+if [[ ! -d "${DATASET_ROOT}/data" ]]; then
+    echo "[error] DATASET_ROOT=${DATASET_ROOT} has no data/ subdirectory." >&2
+    exit 1
+fi
+if [[ -L "${PCEPT_ROOT}/data" ]]; then
+    echo "[setup] Pointcept/data already symlinked to $(readlink "${PCEPT_ROOT}/data")"
+elif [[ -e "${PCEPT_ROOT}/data" ]]; then
+    echo "[error] ${PCEPT_ROOT}/data exists and is not a symlink; refusing to overwrite." >&2
+    exit 1
+else
+    ln -sfn "${DATASET_ROOT}/data" "${PCEPT_ROOT}/data"
+    echo "[setup] Linked ${PCEPT_ROOT}/data -> ${DATASET_ROOT}/data"
+fi
+
+# ---- 4. Env vars ------------------------------------------------------------
+if [[ -z "${QWEN3_5_4B_PATH:-}" ]]; then
+    echo "[error] QWEN3_5_4B_PATH must be set (local path to Qwen3.5-4B, or HF repo id)." >&2
+    exit 1
+fi
+if [[ -z "${UTONIA_PRETRAINED_CKPT:-}" ]]; then
+    echo "[warn] UTONIA_PRETRAINED_CKPT not set — both student and teacher PTv3"
+    echo "       will start from random init. Strongly recommended to set this to utonia.pth."
+fi
+export QWEN3_5_4B_PATH
+export UTONIA_PRETRAINED_CKPT="${UTONIA_PRETRAINED_CKPT:-}"
+export DATASET_ROOT
+
+# ---- 5. Pick config ---------------------------------------------------------
+case "${VARIANT}" in
+    A|a)
+        CONFIG="configs/utonia/distill-utonia-v1m3-A-scannet-only-qwen3_5-4b.py"
+        DEFAULT_SAVE="exp/utonia_q35_align_only"
+        ;;
+    B|b)
+        CONFIG="configs/utonia/distill-utonia-v1m3-B-scannet-only-qwen3_5-4b.py"
+        DEFAULT_SAVE="exp/utonia_q35_align_ssl"
+        ;;
+    *)
+        echo "[error] Unknown variant '${VARIANT}'. Expected 'A' or 'B'." >&2
+        exit 1
+        ;;
+esac
+
+# ---- 6. Default save_path if user didn't override ---------------------------
+if [[ "${EXTRA_OPTS}" != *save_path* ]]; then
+    EXTRA_OPTS="save_path=${DEFAULT_SAVE} ${EXTRA_OPTS}"
+fi
+
+NUM_GPUS="${NUM_GPUS:-1}"
+
+# ---- 7. Launch --------------------------------------------------------------
+cd "${PCEPT_ROOT}"
+export PYTHONPATH=./
+
+echo
+echo "=========================================================="
+echo "  Utonia × Qwen3.5  —  variant ${VARIANT^^}"
+echo "----------------------------------------------------------"
+echo "  cwd                  : $(pwd)"
+echo "  config               : ${CONFIG}"
+echo "  num_gpus             : ${NUM_GPUS}"
+echo "  --options            : ${EXTRA_OPTS}"
+echo "  QWEN3_5_4B_PATH      : ${QWEN3_5_4B_PATH}"
+echo "  UTONIA_PRETRAINED... : ${UTONIA_PRETRAINED_CKPT:-<unset>}"
+echo "  DATASET_ROOT         : ${DATASET_ROOT}"
+echo "=========================================================="
+echo
+
+# shellcheck disable=SC2086
+python tools/train.py \
+    --config-file "${CONFIG}" \
+    --num-gpus "${NUM_GPUS}" \
+    --options ${EXTRA_OPTS}
