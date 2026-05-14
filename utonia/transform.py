@@ -29,9 +29,15 @@ import copy
 from collections.abc import Sequence, Mapping
 
 import numpy.core  # noqa: F401
+# numpy.core was renamed to numpy._core in numpy 2.x. The loop below aliases
+# the legacy names → new names ONLY where the new name isn't already taken.
+# On numpy 2.x, numpy._core is the real module — overwriting it sends scipy
+# (and other packages that touch numpy internals) into an import recursion.
 for _name in list(sys.modules):
     if _name == "numpy.core" or _name.startswith("numpy.core."):
-        sys.modules[_name.replace("numpy.core", "numpy._core", 1)] = sys.modules[_name]
+        _new = _name.replace("numpy.core", "numpy._core", 1)
+        if _new not in sys.modules:
+            sys.modules[_new] = sys.modules[_name]
 
 import scipy
 import scipy.ndimage
