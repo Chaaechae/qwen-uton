@@ -32,6 +32,26 @@ EXTRA_OPTS="$*"
 UTONIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PCEPT_ROOT="${UTONIA_ROOT}/third_party/Pointcept"
 
+# ---- 0. Conda env ------------------------------------------------------------
+# Activate the conda environment that has torch / spconv / pointops / flash-attn
+# / transformers installed for Pointcept. Override via env vars:
+#   CONDA_SH      path to conda.sh        (default ~/anaconda3/etc/profile.d/conda.sh)
+#   CONDA_ENV     env name or path        (default ~/anaconda3/envs/pointcept)
+# Set SKIP_CONDA=1 to skip activation entirely (e.g. when running inside an
+# already-activated env or a container).
+if [[ "${SKIP_CONDA:-0}" != "1" ]]; then
+    CONDA_SH="${CONDA_SH:-$HOME/anaconda3/etc/profile.d/conda.sh}"
+    CONDA_ENV="${CONDA_ENV:-$HOME/anaconda3/envs/pointcept}"
+    if [[ ! -f "${CONDA_SH}" ]]; then
+        echo "[error] conda.sh not found at ${CONDA_SH}. Set CONDA_SH or SKIP_CONDA=1." >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "${CONDA_SH}"
+    conda activate "${CONDA_ENV}"
+    echo "[setup] Activated conda env: ${CONDA_ENV} ($(python --version 2>&1))"
+fi
+
 # ---- 1. Submodule -----------------------------------------------------------
 if [[ ! -d "${PCEPT_ROOT}/pointcept" ]]; then
     echo "[setup] Pointcept submodule not initialized — fetching..."
