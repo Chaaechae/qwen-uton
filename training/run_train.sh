@@ -140,9 +140,14 @@ fi
 if [[ ! -d "${PCEPT_ROOT}/pointcept" ]]; then
     if [[ -d "${POINTCEPT_LOCAL}/pointcept" || -d "${POINTCEPT_LOCAL}/.git" ]]; then
         echo "[setup] Initializing Pointcept submodule from local mirror: ${POINTCEPT_LOCAL}"
+        # Since git 2.38.1 (CVE-2022-39253) submodule clones from a local
+        # file path are blocked by default — even when the path obviously
+        # exists. Re-enable file:// protocol for this one-shot operation.
         git -C "${UTONIA_ROOT}" submodule init -- third_party/Pointcept
         git -C "${UTONIA_ROOT}" config "submodule.third_party/Pointcept.url" "${POINTCEPT_LOCAL}"
-        git -C "${UTONIA_ROOT}" submodule update --recursive third_party/Pointcept
+        git -C "${UTONIA_ROOT}" \
+            -c protocol.file.allow=always \
+            submodule update --recursive third_party/Pointcept
     else
         echo "[warn] Local Pointcept mirror not found at ${POINTCEPT_LOCAL};"
         echo "       falling back to GitHub clone..."
