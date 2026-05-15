@@ -59,7 +59,22 @@ except ImportError:
     HAS_FLASH = False
 
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Hard-fail early if CUDA isn't available. PTv3 + spconv only run on GPU
+# (CPU-build of spconv raises a cryptic "CPU ONLY build" RuntimeError far
+# downstream); checking up front gives a clearer error and pinpoints
+# whether the issue is environment / node / package selection.
+if not torch.cuda.is_available():
+    raise SystemExit(
+        "[compare_pca] CUDA is not available in this Python environment.\n"
+        "  PTv3 + spconv require a GPU. Likely causes:\n"
+        "    - Running on a non-GPU node (check nvidia-smi)\n"
+        "    - Conda env without CUDA-enabled torch / spconv-cuXXX\n"
+        "  Use demo/run_compare_pca.sh (auto-activates the training env)\n"
+        "  or activate ~/anaconda3/envs/pointcept manually."
+    )
+DEVICE = "cuda"
+print(f"[setup] CUDA: {torch.cuda.get_device_name(0)} "
+      f"({torch.cuda.device_count()} device(s), torch={torch.__version__})")
 
 
 # Default architecture for our v1m3 trained checkpoints. Matches what we use
