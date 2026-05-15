@@ -45,7 +45,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pointcept.engines.defaults import default_config_parser
-from pointcept.datasets import build_dataset
+from pointcept.datasets import build_dataset, point_collate_fn
 from pointcept.models import build_model
 from pointcept.models.utils import offset2batch, bincount2offset
 from pointcept.models.utils.structure import Point
@@ -243,7 +243,12 @@ def main():
 
     for i, idx in enumerate(indices):
         try:
-            sample = ds[int(idx)]
+            raw = ds[int(idx)]
+            # Run through Pointcept's collate (batch_size=1) so plain Python
+            # scalars like `grid_size: 0.01` become indexable tensors —
+            # otherwise model.forward's `batch["grid_size"][0]` raises
+            # "'float' object is not subscriptable".
+            sample = point_collate_fn([raw], mix_prob=0)
         except Exception as e:
             print(f"[{i+1}/{n}] idx={idx} DATA ERROR: "
                   f"{type(e).__name__}: {str(e)[:120]}")
