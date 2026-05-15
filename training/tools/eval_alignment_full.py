@@ -404,6 +404,17 @@ def main():
         base_f3_raw_cat = torch.cat(base_f3_raw_acc, dim=0)
         cka_baseline_raw = _linear_cka(base_f3_raw_cat, f2_cat)
 
+    # Additional measurement: BATCH-centered cosine (subtract the mean
+    # feature across all collected samples before computing cosine). This
+    # strips the anisotropic DC component that makes raw cosines uniformly
+    # ~0.95+ on ViT-flavoured features. The gap (pos - neg) under batch-
+    # centered cosine is a more honest discrimination metric.
+    f3_bc = f3_proj_cat - f3_proj_cat.mean(dim=0, keepdim=True)
+    f2_bc = f2_cat - f2_cat.mean(dim=0, keepdim=True)
+    pos_bc = F.cosine_similarity(f3_bc, f2_bc, dim=-1).numpy()
+    perm_bc = torch.randperm(f2_bc.shape[0])
+    neg_bc = F.cosine_similarity(f3_bc, f2_bc[perm_bc], dim=-1).numpy()
+
     summary = dict(
         config=args.config_file,
         weight=args.weight,
@@ -435,6 +446,11 @@ def main():
         cka_aligned_proj_vs_qwen=cka_aligned_proj,
         cka_aligned_backbone_vs_qwen=cka_aligned_raw,
         cka_baseline_backbone_vs_qwen=cka_baseline_raw,
+
+        # Batch-centered cosine (more honest under anisotropic features)
+        pos_bc_mean=float(pos_bc.mean()),
+        neg_bc_mean=float(neg_bc.mean()),
+        discrim_gap_bc=float(pos_bc.mean() - neg_bc.mean()),
     )
 
     # ---- write outputs --------------------------------------------------
