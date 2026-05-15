@@ -52,6 +52,11 @@ link "${UTONIA_ROOT}/training/pointcept/datasets/skip_on_error_dataset.py" \
 link "${UTONIA_ROOT}/training/tools/eval_alignment.py" \
      "${PCEPT_ROOT}/tools/eval_alignment.py"
 
+# Comprehensive alignment eval — adds within-scene retrieval (R@K, MRR)
+# and linear CKA on top of the simpler eval_alignment.py.
+link "${UTONIA_ROOT}/training/tools/eval_alignment_full.py" \
+     "${PCEPT_ROOT}/tools/eval_alignment_full.py"
+
 # Recipes.
 for cfg in "${UTONIA_ROOT}/training/configs/utonia/"distill-utonia-v1m3-*.py; do
     [[ -e "$cfg" ]] || continue
