@@ -72,7 +72,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pointcept.engines.defaults import default_config_parser
-from pointcept.datasets import build_dataset, point_collate_fn
+from pointcept.datasets import build_dataset
 from pointcept.models import build_model
 from pointcept.models.utils import offset2batch, bincount2offset
 from pointcept.models.utils.structure import Point
@@ -200,7 +200,11 @@ def _extract_pairs(model, batch, device):
         f2 = f2 - f2.mean(dim=-1, keepdim=True)
         f3_proj = f3_proj - f3_proj.mean(dim=-1, keepdim=True)
 
-    return f3_proj, f2, f3_raw
+    # Cast to float32 for downstream matmul / cosine / CKA. Under AMP the
+    # Qwen ViT and patch_proj outputs are bfloat16 / float32 mixed, which
+    # makes matmul (`f3n @ f2n.T` in _retrieval_metrics, `X.T @ Y` in
+    # _linear_cka) raise "expected scalar type Float but found BFloat16".
+    return f3_proj.float(), f2.float(), f3_raw.float()
 
 
 # ---------------------------------------------------------------------------
@@ -299,11 +303,7 @@ def main():
     for i, idx in enumerate(indices):
         try:
             raw = ds[int(idx)]
-            # Run through Pointcept's collate (batch_size=1) so plain Python
-            # scalars like `grid_size: 0.01` become indexable tensors —
-            # otherwise model.forward's `batch["grid_size"][0]` raises
-            # "'float' object is not subscriptable".
-            sample = point_collate_fn([raw], mix_prob=0)
+            sample = _coerce_sample_for_model(raw)
         except Exception as e:
             print(f"[{i+1}/{n}] idx={idx} DATA ERROR: "
                   f"{type(e).__name__}: {str(e)[:120]}")
@@ -478,6 +478,28 @@ def main():
     for k, v in summary.items():
         print(f"  {k}: {v}")
     print(f"\nWrote:\n  {summary_path}\n  {csv_path}\n  {fig_path}")
+
+
+def _coerce_sample_for_model(raw):
+    """
+    Mimic what DataLoader's collate would do for a single sample so model.forward
+    can index things like `batch["grid_size"][0]`. The transform pipeline's
+    `Update(keys_dict={"grid_size": 0.01})` runs AFTER ToTensor, so grid_size
+    arrives as a plain Python float — promote it (and any other 0-D scalars)
+    to a 1-element tensor. Everything else is passed through unchanged.
+    """
+    sample = dict(raw)
+    for k in list(sample.keys()):
+        v = sample[k]
+        if isinstance(v, bool):
+            sample[k] = torch.tensor([v], dtype=torch.bool)
+        elif isinstance(v, int):
+            sample[k] = torch.tensor([v], dtype=torch.long)
+        elif isinstance(v, float):
+            sample[k] = torch.tensor([v], dtype=torch.float32)
+        elif isinstance(v, np.ndarray) and v.ndim == 0:
+            sample[k] = torch.tensor([v.item()])
+    return sample
 
 
 def _load_into_model(model, weight_path, label):

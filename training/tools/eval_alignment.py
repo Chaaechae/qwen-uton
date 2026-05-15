@@ -45,7 +45,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from pointcept.engines.defaults import default_config_parser
-from pointcept.datasets import build_dataset, point_collate_fn
+from pointcept.datasets import build_dataset
 from pointcept.models import build_model
 from pointcept.models.utils import offset2batch, bincount2offset
 from pointcept.models.utils.structure import Point
@@ -170,6 +170,11 @@ def _eval_one_sample(model, data_dict, device, generator):
         feature_index_unique = torch.unique(feature_index)
         f2 = feature2d[feature_index_unique]
         f3 = feature3d_pixel[feature_index_unique]
+
+        # Cast to float32 — AMP-bfloat16 Qwen output vs float32 patch_proj
+        # output otherwise fails the cosine matmul with a dtype mismatch.
+        f2 = f2.float()
+        f3 = f3.float()
 
         if getattr(model, "enc2d_cos_shift", False):
             f2 = f2 - f2.mean(dim=-1, keepdim=True)
