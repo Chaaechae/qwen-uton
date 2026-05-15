@@ -44,12 +44,18 @@
 set -eo pipefail
 
 # ---- Flag parsing -----------------------------------------------------------
-# Pull out `--utonia-root <path>`, `--pointcept-local <path>`, `--num-gpus <N>`
-# (each also accepts `=`-form) before treating the remaining args as
-# `[VARIANT] [extra train.py --options ...]`.
+# Walks through ALL args (not just the leading ones) so flags may appear
+# either before or after the positional VARIANT:
+#   bash run_train.sh --num-gpus 8 B-full          ← both work
+#   bash run_train.sh B-full --num-gpus=8          ← both work
+# Flags recognized:  --utonia-root, --pointcept-local, --num-gpus, --help.
+# Anything not starting with `-` becomes a positional; the first positional
+# is VARIANT and the rest accumulate into EXTRA_OPTS (forwarded as
+# `train.py --options KEY=VAL ...`).
 UTONIA_ROOT_ARG=""
 POINTCEPT_LOCAL_ARG=""
 NUM_GPUS_ARG=""
+POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --utonia-root)
@@ -78,6 +84,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --)
             shift
+            POSITIONAL+=("$@")
             break
             ;;
         -h|--help)
@@ -89,11 +96,14 @@ while [[ $# -gt 0 ]]; do
             exit 1
             ;;
         *)
-            break
+            POSITIONAL+=("$1")
+            shift
             ;;
     esac
 done
 
+# Replay positionals so VARIANT / EXTRA_OPTS see them in order.
+set -- "${POSITIONAL[@]}"
 VARIANT="${1:-B}"
 shift || true
 EXTRA_OPTS="$*"
