@@ -237,6 +237,12 @@ DIST_TIMEOUT_MIN="${DIST_TIMEOUT_MIN:-120}"
 export QWEN3_5_4B_PATH UTONIA_PRETRAINED_CKPT DATASET_ROOT DIST_BACKEND DIST_TIMEOUT_MIN
 
 # ---- 5. Pick config ---------------------------------------------------------
+# Built-in shortcuts A / B map to fixed files + save_paths. Anything else is
+# treated as a free-form variant name: we look for a config matching
+#   configs/utonia/distill-utonia-v1m3-${VARIANT}-*qwen3_5-4b.py
+# under the Pointcept tree, falling back to an error if nothing matches.
+# This lets users drop in a new config (e.g. "B-full") without editing
+# this case block.
 case "${VARIANT}" in
     A|a)
         CONFIG="configs/utonia/distill-utonia-v1m3-A-scannet-only-qwen3_5-4b.py"
@@ -247,8 +253,18 @@ case "${VARIANT}" in
         DEFAULT_SAVE="exp/utonia_q35_align_ssl"
         ;;
     *)
-        echo "[error] Unknown variant '${VARIANT}'. Expected 'A' or 'B'." >&2
-        exit 1
+        # Try to auto-discover a config matching this variant tag.
+        _GLOB=("${PCEPT_ROOT}"/configs/utonia/distill-utonia-v1m3-"${VARIANT}"-*qwen3_5-4b.py)
+        if [[ -f "${_GLOB[0]}" ]]; then
+            CONFIG="configs/utonia/$(basename "${_GLOB[0]}")"
+            DEFAULT_SAVE="exp/utonia_q35_${VARIANT,,}"
+            echo "[setup] Resolved variant '${VARIANT}' -> ${CONFIG}"
+        else
+            echo "[error] Unknown variant '${VARIANT}'." >&2
+            echo "        Expected 'A' / 'B' or a config matching:" >&2
+            echo "          configs/utonia/distill-utonia-v1m3-${VARIANT}-*qwen3_5-4b.py" >&2
+            exit 1
+        fi
         ;;
 esac
 
