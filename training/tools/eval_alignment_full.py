@@ -479,12 +479,18 @@ def _load_into_model(model, weight_path, label):
     """Best-effort load of a checkpoint (Pointcept training fmt or HF fmt)."""
     print(f"[setup/{label}] loading: {weight_path}")
     ckpt = torch.load(weight_path, map_location="cpu", weights_only=False)
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        sd = ckpt["state_dict"]
-    elif isinstance(ckpt, dict) and "config" in ckpt:
-        # Published utonia.pth format — keys are raw PTv3 (`embedding.*`,
-        # `enc.*`, ...). Prefix to match `student.backbone.*`.
+    # ORDER MATTERS: published utonia.pth has BOTH "config" and "state_dict"
+    # at the top level (the HF format), so we must check for "config" FIRST.
+    # Otherwise the raw PTv3 keys go through unprefixed and miss the model's
+    # `student.backbone.` namespace entirely.
+    if isinstance(ckpt, dict) and "config" in ckpt and "state_dict" in ckpt:
+        # Published utonia HF format. Keys are raw PTv3 — wrap with the
+        # student.backbone. prefix so they land on student.backbone.*.
         sd = {f"student.backbone.{k}": v for k, v in ckpt["state_dict"].items()}
+    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+        # Pointcept training format (state_dict keys already have
+        # `module.student.backbone.*` etc.).
+        sd = ckpt["state_dict"]
     else:
         sd = ckpt
     sd = {(k[len("module."):] if k.startswith("module.") else k): v
