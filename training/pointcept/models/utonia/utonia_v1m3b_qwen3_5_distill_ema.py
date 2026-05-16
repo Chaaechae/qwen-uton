@@ -133,6 +133,8 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         student_pretrained_path=None,
         enc2d_upcast_level=4,
         enc2d_cos_shift=True,
+        enc2d_loss_type="cosine",
+        infonce_temperature=0.07,
         ema_teacher_backbone=True,
     ):
         super().__init__()
@@ -248,6 +250,13 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             p.requires_grad = False
 
         self.enc2d_cos_shift = enc2d_cos_shift
+        if enc2d_loss_type not in ("cosine", "infonce"):
+            raise ValueError(
+                f"enc2d_loss_type must be 'cosine' or 'infonce', got "
+                f"{enc2d_loss_type!r}."
+            )
+        self.enc2d_loss_type = enc2d_loss_type
+        self.infonce_temperature = infonce_temperature
 
     def load_enc2d(self, model_name, model_weight):
         if "qwen3_5" in model_name.lower() or "qwen3.5" in model_name.lower():
@@ -730,8 +739,28 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                 if self.enc2d_cos_shift:
                     feature2d_sel = feature2d_sel - feature2d_sel.mean(dim=-1, keepdim=True)
                     feature3d_sel = feature3d_sel - feature3d_sel.mean(dim=-1, keepdim=True)
-                cos = nn.CosineSimilarity(dim=1, eps=1e-6)
-                loss = (1 - cos(feature2d_sel, feature3d_sel)).mean() * 10
+
+                if self.enc2d_loss_type == "cosine":
+                    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+                    loss = (1 - cos(feature2d_sel, feature3d_sel)).mean() * 10
+                elif self.enc2d_loss_type == "infonce":
+                    # Symmetric (CLIP-style) InfoNCE — pulls the correct
+                    # (point, patch) pair together while pushing all other
+                    # pairs apart. Robust to the trivial mean-direction
+                    # solution that cosine-only loss collapses into.
+                    f3n = F.normalize(feature3d_sel.float(), dim=-1)
+                    f2n = F.normalize(feature2d_sel.float(), dim=-1)
+                    logits = (f3n @ f2n.T) / self.infonce_temperature
+                    labels = torch.arange(logits.shape[0], device=logits.device)
+                    loss = 0.5 * (
+                        F.cross_entropy(logits, labels)
+                        + F.cross_entropy(logits.T, labels)
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown enc2d_loss_type={self.enc2d_loss_type!r}; "
+                        f"expected 'cosine' or 'infonce'."
+                    )
                 result_dict["enc2d_loss"] = loss
                 result_dict["loss"].append(loss * self.enc2d_loss_weight)
             elif (
