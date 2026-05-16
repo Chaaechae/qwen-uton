@@ -755,28 +755,62 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
                     loss = (1 - cos(feature2d_sel, feature3d_sel)).mean() * 10
                 elif self.enc2d_loss_type == "infonce":
-                    # Symmetric (CLIP-style) InfoNCE — pulls the correct
-                    # (point, patch) pair together while pushing all other
-                    # pairs apart. Robust to the trivial mean-direction
-                    # solution that cosine-only loss collapses into.
+                    # Per-scene symmetric (CLIP-style) InfoNCE — pulls the
+                    # correct (point, patch) pair together while pushing
+                    # other-patch-in-the-SAME-scene apart. Cross-scene
+                    # contrastive would push K ~ 20-30k which is intractable
+                    # (initial CE ≈ log K ≈ 10 and gradient becomes very
+                    # weak); per-scene reduces K to ~1-3k and uses the most
+                    # semantically meaningful negatives (other patches of
+                    # the same room).
                     #
-                    # For Qwen-style anisotropic teacher features (all
-                    # patches sit close to one shared direction, pairwise
-                    # cos ~0.9) we BATCH-CENTER first so InfoNCE can see
-                    # the inter-sample variation. Without this, after
-                    # F.normalize the logits row-variance is tiny and the
-                    # softmax saturates to uniform → CE ≈ log K → no
-                    # discriminative gradient.
-                    f2c = feature2d_sel.float() - feature2d_sel.float().mean(dim=0, keepdim=True)
-                    f3c = feature3d_sel.float() - feature3d_sel.float().mean(dim=0, keepdim=True)
-                    f3n = F.normalize(f3c, dim=-1)
-                    f2n = F.normalize(f2c, dim=-1)
-                    logits = (f3n @ f2n.T) / self.infonce_temperature
-                    labels = torch.arange(logits.shape[0], device=logits.device)
-                    loss = 0.5 * (
-                        F.cross_entropy(logits, labels)
-                        + F.cross_entropy(logits.T, labels)
+                    # Each `feature_index_unique` value already encodes the
+                    # global flattened patch id `(global_img * H*W + row*W
+                    # + col)` and `global_img` increments monotonically
+                    # across scenes thanks to `batch_img_num`. So we can
+                    # recover the scene id of each surviving patch by
+                    # floor-dividing the patch id by H*W and bucketing by
+                    # the per-image batch index (`batch_img_num`).
+                    #
+                    # We BATCH-CENTER on top of normalize so the shared
+                    # Qwen DC direction doesn't dominate the dot products.
+                    HW = self.patch_h * self.patch_w
+                    img_id = feature_index // HW
+                    # Which batch element does each image (= each patch's
+                    # owning scene) belong to. offset_img_num[i] is the
+                    # cumulative # of images BEFORE batch element i, so
+                    # bucketize gives the scene index.
+                    scene_id = torch.bucketize(
+                        img_id.long(),
+                        offset_img_num[1:].contiguous(),
+                        right=True,
                     )
+                    losses = []
+                    for s in range(bincount_img_num.numel()):
+                        sel = (scene_id == s)
+                        if sel.sum() < 2:
+                            continue
+                        f2s = feature2d_sel[sel].float()
+                        f3s = feature3d_sel[sel].float()
+                        f2c = f2s - f2s.mean(dim=0, keepdim=True)
+                        f3c = f3s - f3s.mean(dim=0, keepdim=True)
+                        f3n = F.normalize(f3c, dim=-1)
+                        f2n = F.normalize(f2c, dim=-1)
+                        logits = (f3n @ f2n.T) / self.infonce_temperature
+                        labels = torch.arange(
+                            logits.shape[0], device=logits.device
+                        )
+                        l = 0.5 * (
+                            F.cross_entropy(logits, labels)
+                            + F.cross_entropy(logits.T, labels)
+                        )
+                        losses.append(l)
+                    if losses:
+                        loss = torch.stack(losses).mean()
+                    else:
+                        # Degenerate batch (every scene has <2 valid pairs);
+                        # contribute a zero loss without breaking the graph.
+                        loss = feature3d_sel.sum() * 0.0
                 else:
                     raise ValueError(
                         f"Unknown enc2d_loss_type={self.enc2d_loss_type!r}; "
