@@ -159,7 +159,9 @@ model = dict(
     # the cosine-pull. Anti-collapse — penalizes the mean-direction trivial
     # solution that v1m3-B converged to.
     enc2d_loss_type="infonce",
-    infonce_temperature=0.07,
+    # Lower than CLIP's default 0.07. Qwen-Qwen pairwise cos is ~0.9 so
+    # logits need sharper scaling to expose discriminative differences.
+    infonce_temperature=0.03,
     ema_teacher_backbone=True,
     student_pretrained_path=UTONIA_STUDENT_CKPT,
     teacher_pretrained_path=UTONIA_TEACHER_CKPT,

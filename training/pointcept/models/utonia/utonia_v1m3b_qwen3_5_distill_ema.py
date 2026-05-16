@@ -134,7 +134,11 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         enc2d_upcast_level=4,
         enc2d_cos_shift=True,
         enc2d_loss_type="cosine",
-        infonce_temperature=0.07,
+        # For Qwen ViT (highly anisotropic features, mean pairwise cos ~0.9)
+        # the standard CLIP τ=0.07 is too large — logits row-variance is tiny
+        # and softmax saturates to uniform → no gradient. τ=0.03 sharpens the
+        # softmax enough to expose inter-patch differences for InfoNCE.
+        infonce_temperature=0.03,
         ema_teacher_backbone=True,
     ):
         super().__init__()
@@ -736,7 +740,14 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                 feature2d_sel = feature2d[feature_index]
                 feature3d_sel = feature3d_pixel[feature_index]
 
-                if self.enc2d_cos_shift:
+                # `enc2d_cos_shift` (per-row mean subtraction) is helpful for
+                # the cosine-pull loss because it widens the spread of
+                # cos(.,.) before the (1-cos) penalty. For InfoNCE, F.normalize
+                # already takes care of scale and additional per-row centering
+                # tends to collapse one effective dimension and reintroduce
+                # anisotropy in a different form — so it is bypassed in
+                # InfoNCE mode by default.
+                if self.enc2d_cos_shift and self.enc2d_loss_type != "infonce":
                     feature2d_sel = feature2d_sel - feature2d_sel.mean(dim=-1, keepdim=True)
                     feature3d_sel = feature3d_sel - feature3d_sel.mean(dim=-1, keepdim=True)
 
@@ -748,8 +759,18 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                     # (point, patch) pair together while pushing all other
                     # pairs apart. Robust to the trivial mean-direction
                     # solution that cosine-only loss collapses into.
-                    f3n = F.normalize(feature3d_sel.float(), dim=-1)
-                    f2n = F.normalize(feature2d_sel.float(), dim=-1)
+                    #
+                    # For Qwen-style anisotropic teacher features (all
+                    # patches sit close to one shared direction, pairwise
+                    # cos ~0.9) we BATCH-CENTER first so InfoNCE can see
+                    # the inter-sample variation. Without this, after
+                    # F.normalize the logits row-variance is tiny and the
+                    # softmax saturates to uniform → CE ≈ log K → no
+                    # discriminative gradient.
+                    f2c = feature2d_sel.float() - feature2d_sel.float().mean(dim=0, keepdim=True)
+                    f3c = feature3d_sel.float() - feature3d_sel.float().mean(dim=0, keepdim=True)
+                    f3n = F.normalize(f3c, dim=-1)
+                    f2n = F.normalize(f2c, dim=-1)
                     logits = (f3n @ f2n.T) / self.infonce_temperature
                     labels = torch.arange(logits.shape[0], device=logits.device)
                     loss = 0.5 * (
