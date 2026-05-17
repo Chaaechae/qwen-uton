@@ -139,6 +139,19 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         # and softmax saturates to uniform → no gradient. τ=0.03 sharpens the
         # softmax enough to expose inter-patch differences for InfoNCE.
         infonce_temperature=0.03,
+        # For `infonce_batch`: K (= unique patches in batch) is typically
+        # ~10k-30k, so initial loss saturates at log(K) ≈ 9-10 and the
+        # per-negative gradient is diluted by 1/K → no learning. Setting
+        # this to e.g. 1024 randomly subsamples that many negatives per
+        # anchor row so log(K) ≈ 7 and each negative carries ~20x more
+        # gradient mass. None disables subsampling.
+        infonce_batch_subsample=None,
+        # patch_proj capacity. None → single nn.Linear(in→out). int →
+        # Linear(in→h) → GELU → LayerNorm → Linear(h→out) → LayerNorm MLP.
+        # A single linear (1.36M params) is often insufficient to undo
+        # Qwen ViT's strong anisotropy / DC component; the MLP version
+        # gives the head room to learn a non-trivial mapping.
+        patch_proj_hidden_channels=None,
         ema_teacher_backbone=True,
     ):
         super().__init__()
@@ -207,7 +220,18 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             self.enc2d_model = self.load_enc2d(image_weight_name, image_weight_path)
             self.enc2d_model.requires_grad_(False)
             self._num_channels = enc2d_head_in_channels
-            self.patch_proj = nn.Linear(backbone_out_channels, self._num_channels)
+            if patch_proj_hidden_channels is None:
+                self.patch_proj = nn.Linear(
+                    backbone_out_channels, self._num_channels
+                )
+            else:
+                self.patch_proj = nn.Sequential(
+                    nn.Linear(backbone_out_channels, patch_proj_hidden_channels),
+                    nn.GELU(),
+                    nn.LayerNorm(patch_proj_hidden_channels),
+                    nn.Linear(patch_proj_hidden_channels, self._num_channels),
+                    nn.LayerNorm(self._num_channels),
+                )
 
         head_t = partial(
             OnlineCluster,
@@ -262,6 +286,7 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             )
         self.enc2d_loss_type = enc2d_loss_type
         self.infonce_temperature = infonce_temperature
+        self.infonce_batch_subsample = infonce_batch_subsample
 
     def load_enc2d(self, model_name, model_weight):
         if "qwen3_5" in model_name.lower() or "qwen3.5" in model_name.lower():
@@ -838,18 +863,11 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                     # scene. K = all unique patches in this batch
                     # (typically ~10-30k across all GPUs / scenes / views).
                     #
-                    # Use when per-scene `infonce` stalls because within-
-                    # scene negatives are too semantically similar (same
-                    # indoor surfaces). Cross-scene negatives are easier
-                    # (different rooms / objects) so the softmax has more
-                    # spread → gradient actually flows. Trade-off: large K
-                    # means initial CE ≈ log K ≈ 9-10 which looks scary
-                    # but moves consistently if alignment is learnable.
-                    #
-                    # Higher `infonce_temperature` (e.g. 0.5, 1.0) often
-                    # works better than the 0.07 / 0.03 used for small-K
-                    # because softer softmax over large K still gives
-                    # meaningful gradient.
+                    # When K is very large the initial loss saturates at
+                    # log(K) ≈ 10 and per-negative gradient ≈ 1/K → no
+                    # learning. `infonce_batch_subsample=N` keeps the
+                    # positive on the diagonal and samples N-1 random
+                    # other rows as negatives, restoring usable signal.
                     f2c = feature2d_sel.float() - feature2d_sel.float().mean(
                         dim=0, keepdim=True
                     )
@@ -858,13 +876,21 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                     )
                     f3n = F.normalize(f3c, dim=-1)
                     f2n = F.normalize(f2c, dim=-1)
-                    logits = (f3n @ f2n.T) / self.infonce_temperature
-                    labels = torch.arange(
-                        logits.shape[0], device=logits.device
-                    )
+                    K_full = f3n.shape[0]
+                    sub = self.infonce_batch_subsample
+                    if sub is not None and sub < K_full:
+                        # Subsample sub rows; restrict the contrastive game
+                        # to the sub×sub minibatch. K' = sub so initial loss
+                        # ≈ log(sub) (e.g. log(1024)≈6.9 vs log(22k)≈10) and
+                        # the gradient per negative grows by ~K_full/sub.
+                        idx = torch.randperm(K_full, device=f3n.device)[:sub]
+                        f3n = f3n[idx]
+                        f2n = f2n[idx]
+                    sim = (f3n @ f2n.T) / self.infonce_temperature
+                    labels = torch.arange(sim.shape[0], device=sim.device)
                     loss = 0.5 * (
-                        F.cross_entropy(logits, labels)
-                        + F.cross_entropy(logits.T, labels)
+                        F.cross_entropy(sim, labels)
+                        + F.cross_entropy(sim.T, labels)
                     )
                 else:
                     raise ValueError(
