@@ -186,19 +186,29 @@ def _probe_all_layers(model, batch, device, log):
             rows.append((f"block[{i}]", eff, d99))
 
     # Try common post-block norm / merger paths to see if the missing
-    # piece restores rank.
-    final_outputs = []
-    candidate_paths = [
-        "merger.ln_q",       # Qwen2.5-VL pattern
-        "merger.norm",       # variant
-        "norm",              # naive ViT
-        "final_layernorm",   # HF naming
-        "post_layernorm",    # CLIP pattern
-        "ln_post",           # CLIP pattern alt
+    # piece restores rank. We expand into the merger's children too:
+    # for Qwen3.5 the merger has `norm` + `mlp` (and possibly more),
+    # so trying merger.norm AND each sub-module individually shows
+    # which step recovers usable rank.
+    base_paths = [
+        "merger.ln_q",
+        "merger.norm",
+        "merger.norm1",
+        "merger.norm2",
+        "norm",
+        "final_layernorm",
+        "post_layernorm",
+        "ln_post",
     ]
+    # Auto-discover every direct child of `merger` if present.
+    if hasattr(enc2d, "merger"):
+        for child_name, _ in enc2d.merger.named_children():
+            p = f"merger.{child_name}"
+            if p not in base_paths:
+                base_paths.append(p)
     log(f"\n[probe] trying candidate post-block normalizations / mergers:")
     found_any = False
-    for path in candidate_paths:
+    for path in base_paths:
         obj = enc2d
         ok = True
         for part in path.split("."):
@@ -206,17 +216,44 @@ def _probe_all_layers(model, batch, device, log):
                 ok = False; break
             obj = getattr(obj, part)
         if not ok:
-            log(f"  - {path:>20s}  (not present)")
+            log(f"  - {path:>32s}  (not present)")
             continue
         try:
             normed = obj(hidden)
         except Exception as e:
-            log(f"  ! {path:>20s}  call failed: {type(e).__name__}: {str(e)[:80]}")
+            log(f"  ! {path:>32s}  call failed: "
+                f"{type(e).__name__}: {str(e)[:80]}")
+            continue
+        # Only meaningful if the output is still per-patch (same N).
+        if normed.shape[0] != hidden.shape[0]:
+            log(f"  ! {path:>32s}  output N changed "
+                f"({hidden.shape[0]} -> {normed.shape[0]}) — skipping rank "
+                f"(spatial merger reduces resolution)")
             continue
         eff, d99 = _rank_of(f"after {path}", normed)
         rows.append((f"after {path}", eff, d99))
-        final_outputs.append((path, normed))
         found_any = True
+    # Also try a 2-step pipeline: norm then any non-pooling Linear.
+    if hasattr(enc2d, "merger") and hasattr(enc2d.merger, "norm"):
+        try:
+            h_normed = enc2d.merger.norm(hidden)
+        except Exception:
+            h_normed = None
+        if h_normed is not None and hasattr(enc2d.merger, "mlp"):
+            mlp = enc2d.merger.mlp
+            # Try mlp[0] only (first Linear, no spatial collapse).
+            inner = None
+            try:
+                if isinstance(mlp, nn.Sequential) and len(mlp) > 0:
+                    inner = mlp[0](h_normed)
+                else:
+                    inner = mlp(h_normed)
+            except Exception as e:
+                log(f"  ! merger.norm -> mlp[0] failed: "
+                    f"{type(e).__name__}: {str(e)[:80]}")
+            if inner is not None and inner.shape[0] == hidden.shape[0]:
+                eff, d99 = _rank_of("merger.norm -> mlp[0]", inner)
+                rows.append(("merger.norm->mlp[0]", eff, d99))
 
     # Last-ditch: apply a freshly-init LayerNorm to see if even a
     # generic post-norm would have helped.

@@ -410,6 +410,24 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             )
             if i == idx:
                 break
+
+        # Apply Qwen's post-block normalization if the model exposes it.
+        # Without this the raw pre-norm residual stream is DC-dominated
+        # and patches collapse to ~rank 1; with `merger.norm` (Qwen3.5's
+        # final RMSNorm) we recover rank ≥ 12 on the same batch. This
+        # is the single missing piece v1m3-A..F were all training
+        # against. Falls through silently if neither attribute exists,
+        # so the change is backward compatible.
+        if hasattr(self.enc2d_model, "merger") and hasattr(
+            self.enc2d_model.merger, "norm"
+        ):
+            hidden = self.enc2d_model.merger.norm(hidden)
+        elif hasattr(self.enc2d_model, "merger") and hasattr(
+            self.enc2d_model.merger, "ln_q"
+        ):
+            hidden = self.enc2d_model.merger.ln_q(hidden)
+        elif hasattr(self.enc2d_model, "norm"):
+            hidden = self.enc2d_model.norm(hidden)
         return hidden.view(B, h * w, -1)
 
     def before_train(self):
