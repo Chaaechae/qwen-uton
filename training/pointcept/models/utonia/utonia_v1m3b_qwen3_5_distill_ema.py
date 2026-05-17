@@ -254,10 +254,10 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             p.requires_grad = False
 
         self.enc2d_cos_shift = enc2d_cos_shift
-        if enc2d_loss_type not in ("cosine", "infonce"):
+        if enc2d_loss_type not in ("cosine", "cosine_bc", "infonce"):
             raise ValueError(
-                f"enc2d_loss_type must be 'cosine' or 'infonce', got "
-                f"{enc2d_loss_type!r}."
+                f"enc2d_loss_type must be 'cosine', 'cosine_bc', or 'infonce', "
+                f"got {enc2d_loss_type!r}."
             )
         self.enc2d_loss_type = enc2d_loss_type
         self.infonce_temperature = infonce_temperature
@@ -747,13 +747,30 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                 # tends to collapse one effective dimension and reintroduce
                 # anisotropy in a different form — so it is bypassed in
                 # InfoNCE mode by default.
-                if self.enc2d_cos_shift and self.enc2d_loss_type != "infonce":
+                if self.enc2d_cos_shift and self.enc2d_loss_type == "cosine":
                     feature2d_sel = feature2d_sel - feature2d_sel.mean(dim=-1, keepdim=True)
                     feature3d_sel = feature3d_sel - feature3d_sel.mean(dim=-1, keepdim=True)
 
                 if self.enc2d_loss_type == "cosine":
                     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
                     loss = (1 - cos(feature2d_sel, feature3d_sel)).mean() * 10
+                elif self.enc2d_loss_type == "cosine_bc":
+                    # Batch-centered cosine pull. Subtracts the shared
+                    # anisotropic DC direction (Qwen patches' batch mean)
+                    # before computing cosine, so the "project everything
+                    # toward μ_qwen" trivial cheat that the plain cosine
+                    # pull collapses into becomes a zero vector after
+                    # centering (worst-case cosine = 0 instead of ~0.97).
+                    # Keeps cosine's simple training dynamics without
+                    # InfoNCE's K / temperature sensitivity.
+                    f2c = feature2d_sel.float() - feature2d_sel.float().mean(
+                        dim=0, keepdim=True
+                    )
+                    f3c = feature3d_sel.float() - feature3d_sel.float().mean(
+                        dim=0, keepdim=True
+                    )
+                    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+                    loss = (1 - cos(f2c, f3c)).mean() * 10
                 elif self.enc2d_loss_type == "infonce":
                     # Per-scene symmetric (CLIP-style) InfoNCE — pulls the
                     # correct (point, patch) pair together while pushing
