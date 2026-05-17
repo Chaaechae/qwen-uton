@@ -152,6 +152,23 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         # Qwen ViT's strong anisotropy / DC component; the MLP version
         # gives the head room to learn a non-trivial mapping.
         patch_proj_hidden_channels=None,
+        # Bidirectional alignment: when set, BOTH sides project into a
+        # learned `common_dim` space. patch_proj output becomes
+        # common_dim (instead of enc2d_head_in_channels), and a new
+        # `qwen_proj: Linear(enc2d_head_in_channels → common_dim) + LN`
+        # is added to the 2D side. The InfoNCE / cosine loss is then
+        # computed in this shared common space.
+        #
+        # Why: when the teacher's discriminative subspace is small
+        # (Qwen ViT patches have pairwise cos ~0.95 — all info lives
+        # in a ~50-d cone within 1024-d), fitting f3 directly to that
+        # cone fails to generalize across scenes. A learned 2-tower
+        # projection lets the model FIND a common alignable subspace
+        # rather than being constrained to Qwen's native one (the
+        # CLIP / SimCLR / Sonata pattern).
+        #
+        # None keeps the legacy single-tower behavior (f3 → Qwen 1024-d).
+        common_dim=None,
         ema_teacher_backbone=True,
     ):
         super().__init__()
@@ -220,17 +237,31 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             self.enc2d_model = self.load_enc2d(image_weight_name, image_weight_path)
             self.enc2d_model.requires_grad_(False)
             self._num_channels = enc2d_head_in_channels
+            self.common_dim = common_dim
+            # Output of patch_proj: common_dim if bidirectional (two-tower),
+            # otherwise enc2d_head_in_channels (legacy single-tower).
+            patch_proj_out = (
+                common_dim if common_dim is not None else self._num_channels
+            )
             if patch_proj_hidden_channels is None:
                 self.patch_proj = nn.Linear(
-                    backbone_out_channels, self._num_channels
+                    backbone_out_channels, patch_proj_out
                 )
             else:
                 self.patch_proj = nn.Sequential(
                     nn.Linear(backbone_out_channels, patch_proj_hidden_channels),
                     nn.GELU(),
                     nn.LayerNorm(patch_proj_hidden_channels),
-                    nn.Linear(patch_proj_hidden_channels, self._num_channels),
-                    nn.LayerNorm(self._num_channels),
+                    nn.Linear(patch_proj_hidden_channels, patch_proj_out),
+                    nn.LayerNorm(patch_proj_out),
+                )
+            if common_dim is not None:
+                # Trainable Qwen-side projection into the common space.
+                # Plain Linear + LN — no need for non-linearity here since
+                # Qwen patches are already a learned nonlinear embedding.
+                self.qwen_proj = nn.Sequential(
+                    nn.Linear(self._num_channels, common_dim, bias=False),
+                    nn.LayerNorm(common_dim),
                 )
 
         head_t = partial(
@@ -765,6 +796,11 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                 feature_index = torch.unique(feature_index)
                 feature2d_sel = feature2d[feature_index]
                 feature3d_sel = feature3d_pixel[feature_index]
+                # Two-tower: project Qwen patches into the same learned
+                # common space. Done AFTER index-selection so we only pay
+                # for the patches that actually contribute to the loss.
+                if getattr(self, "common_dim", None) is not None:
+                    feature2d_sel = self.qwen_proj(feature2d_sel)
 
                 # `enc2d_cos_shift` (per-row mean subtraction) is helpful for
                 # the cosine-pull loss because it widens the spread of

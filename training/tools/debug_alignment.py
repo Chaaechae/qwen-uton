@@ -211,6 +211,44 @@ def _stats(name, x):
     )
 
 
+def _pca_summary(name, X):
+    """
+    PCA of the centered feature matrix. Returns (text summary,
+    cumulative variance ratio tensor, effective rank).
+
+    Effective rank (participation ratio) = (Σ σ²)² / Σ σ⁴ — a
+    smooth scalar that says how many singular directions
+    meaningfully contribute. Much more informative than just
+    counting non-zero singulars.
+    """
+    X = X.float().detach().cpu()
+    X = X - X.mean(0, keepdim=True)
+    # SVD on the (K, D) centered matrix — singular values give us
+    # the principal-component scales directly.
+    s = torch.linalg.svdvals(X)
+    var = s ** 2
+    cum = torch.cumsum(var, dim=0) / var.sum()
+
+    def _dim_for(threshold):
+        idx = int((cum < threshold).sum().item()) + 1
+        return min(idx, cum.numel())
+
+    d50 = _dim_for(0.50)
+    d90 = _dim_for(0.90)
+    d95 = _dim_for(0.95)
+    d99 = _dim_for(0.99)
+    eff_rank = float((var.sum() ** 2) / (var * var).sum().clamp_min(1e-30))
+    top_sigma_ratio = float(s[0] / s.mean().clamp_min(1e-30))
+    summary = (
+        f"{name}: D={X.shape[1]}, K={X.shape[0]}\n"
+        f"  dims for [50/90/95/99]% variance: "
+        f"{d50}/{d90}/{d95}/{d99}\n"
+        f"  effective rank (participation ratio): {eff_rank:.1f}\n"
+        f"  top σ / mean σ: {top_sigma_ratio:.1f}  (1.0 = uniform)"
+    )
+    return summary, cum, eff_rank
+
+
 def _compute_enc2d_loss(model, f3_proj_sel, f2_sel):
     """
     Re-implement the enc2d loss inline so we can drive the overfit
@@ -344,8 +382,13 @@ def main():
         f"subsample={getattr(model, 'infonce_batch_subsample', None)}  "
         f"cos_shift={getattr(model, 'enc2d_cos_shift', None)}")
 
-    # Print patch_proj structure to confirm Linear vs MLP.
+    # Print patch_proj / qwen_proj structure to confirm Linear vs MLP
+    # and detect two-tower (v1m3-G+) mode.
     log(f"[setup] patch_proj = {model.patch_proj}")
+    has_qwen_proj = getattr(model, "common_dim", None) is not None
+    if has_qwen_proj:
+        log(f"[setup] qwen_proj  = {model.qwen_proj}")
+        log(f"[setup] common_dim = {model.common_dim} (two-tower mode)")
 
     # ---- Load single sample ----
     log(f"\n[batch] loading scene idx={args.scene_idx}")
@@ -376,19 +419,66 @@ def main():
     f3_raw_sel = idx_state["feature3d_raw_full"][idx_state["feature_index_unique"]].float()
     with torch.no_grad():
         f3_proj_sel = model.patch_proj(f3_raw_sel).float()
+        f2_proj_sel = (
+            model.qwen_proj(f2_sel).float() if has_qwen_proj else None
+        )
 
     log(f"\n[feature stats]")
-    log(f"  {_stats('f2_qwen   (1024d)', f2_sel)}")
-    log(f"  {_stats('f3_raw    (1332d)', f3_raw_sel)}")
-    log(f"  {_stats('f3_proj   (1024d)', f3_proj_sel)}")
+    log(f"  {_stats(f'f2_qwen   ({f2_sel.shape[1]}d)', f2_sel)}")
+    log(f"  {_stats(f'f3_raw    ({f3_raw_sel.shape[1]}d)', f3_raw_sel)}")
+    log(f"  {_stats(f'f3_proj   ({f3_proj_sel.shape[1]}d)', f3_proj_sel)}")
+    if f2_proj_sel is not None:
+        log(f"  {_stats(f'f2_proj   ({f2_proj_sel.shape[1]}d)', f2_proj_sel)}")
+
+    # ---- (2b): PCA — how concentrated is the variance? ----
+    # If most variance lives in a tiny subspace (small "effective rank")
+    # then patch_proj must hit a narrow target — exactly the H3 failure
+    # mode v1m3-G's two-tower projection is designed to dodge.
+    log(f"\n[PCA] effective dimensionality of each feature space")
+    pca_targets = [
+        ("f2_qwen (raw Qwen patches)", f2_sel),
+        ("f3_raw  (PTv3 output)     ", f3_raw_sel),
+        ("f3_proj (patch_proj out)  ", f3_proj_sel),
+    ]
+    if f2_proj_sel is not None:
+        pca_targets.append(("f2_proj (qwen_proj out)   ", f2_proj_sel))
+    cum_curves = []
+    for name, X in pca_targets:
+        summary, cum, _ = _pca_summary(name, X)
+        log(f"  {summary}")
+        cum_curves.append((name, cum))
+
+    # Cumulative variance plot.
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for name, cum in cum_curves:
+        ax.plot(np.arange(1, cum.numel() + 1), cum.numpy(), label=name.strip())
+    ax.set_xscale("log")
+    ax.set_xlabel("# principal components (log)")
+    ax.set_ylabel("cumulative variance ratio")
+    ax.axhline(0.9, ls="--", color="gray", alpha=0.4)
+    ax.axhline(0.99, ls=":", color="gray", alpha=0.4)
+    ax.set_title("Cumulative variance — narrow curves = narrow signal subspace")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    pca_path = os.path.join(args.out_dir, "pca_cumulative_variance.png")
+    plt.savefig(pca_path, dpi=120)
+    plt.close()
+    log(f"  curve -> {pca_path}")
 
     # ---- (3): gradient flow check ----
     log(f"\n[gradient flow] one-step backward, enc2d_loss only")
     model.patch_proj.requires_grad_(True)
+    if has_qwen_proj:
+        model.qwen_proj.requires_grad_(True)
     model.zero_grad(set_to_none=True)
-    # Recompute f3_proj WITH grad on patch_proj.
+    # Recompute f3_proj WITH grad. For two-tower also drive grad
+    # through qwen_proj.
     f3_proj_grad = model.patch_proj(f3_raw_sel.detach())
-    loss = _compute_enc2d_loss(model, f3_proj_grad, f2_sel.detach())
+    f2_for_loss = (
+        model.qwen_proj(f2_sel.detach()) if has_qwen_proj else f2_sel.detach()
+    )
+    loss = _compute_enc2d_loss(model, f3_proj_grad, f2_for_loss)
     loss.backward()
     log(f"  loss(0) = {loss.item():.4f}")
     for name, p in model.patch_proj.named_parameters():
@@ -397,30 +487,46 @@ def main():
         ratio = gn / (wn + 1e-12)
         log(f"  patch_proj.{name:15s}  |w|={wn:.3e}  |g|={gn:.3e}  "
             f"|g|/|w|={ratio:.3e}")
+    if has_qwen_proj:
+        for name, p in model.qwen_proj.named_parameters():
+            wn = p.detach().norm().item()
+            gn = p.grad.norm().item() if p.grad is not None else 0.0
+            ratio = gn / (wn + 1e-12)
+            log(f"  qwen_proj.{name:15s}  |w|={wn:.3e}  |g|={gn:.3e}  "
+                f"|g|/|w|={ratio:.3e}")
 
     # ---- (4): single-batch overfit ----
+    head_label = "patch_proj + qwen_proj" if has_qwen_proj else "patch_proj"
     log(f"\n[overfit] cached forward — running {args.overfit_steps} steps "
-        f"on patch_proj alone (Adam lr={args.overfit_lr})")
-    # Fresh-init patch_proj for an honest overfit test? Optional. Keeping
-    # the trained weights to see whether the *current* state can still
-    # descend on a single batch.
-    opt = torch.optim.Adam(model.patch_proj.parameters(), lr=args.overfit_lr)
+        f"on {head_label} alone (Adam lr={args.overfit_lr})")
+    # Keep the trained head weights so we measure the *current* state's
+    # ability to keep descending on a fixed batch (i.e. is there still
+    # learnable signal left given the trained init?).
+    trainable_params = list(model.patch_proj.parameters())
+    if has_qwen_proj:
+        trainable_params += list(model.qwen_proj.parameters())
+    opt = torch.optim.Adam(trainable_params, lr=args.overfit_lr)
     f3_raw_cached = f3_raw_sel.detach()
     f2_cached = f2_sel.detach()
     history = []
     for step in range(args.overfit_steps + 1):
         opt.zero_grad(set_to_none=True)
         f3_proj_step = model.patch_proj(f3_raw_cached)
-        l = _compute_enc2d_loss(model, f3_proj_step, f2_cached)
+        f2_step = (
+            model.qwen_proj(f2_cached) if has_qwen_proj else f2_cached
+        )
+        l = _compute_enc2d_loss(model, f3_proj_step, f2_step)
         l.backward()
         opt.step()
         if step % max(1, args.overfit_steps // 10) == 0 or step == args.overfit_steps:
-            # Also compute discriminative gap (pos vs random neg) for ground truth.
             with torch.no_grad():
                 f3_proj_eval = model.patch_proj(f3_raw_cached).float()
-                f2 = f2_cached.float()
+                f2_eval = (
+                    model.qwen_proj(f2_cached).float() if has_qwen_proj
+                    else f2_cached.float()
+                )
                 f3c = f3_proj_eval - f3_proj_eval.mean(dim=0, keepdim=True)
-                f2c = f2 - f2.mean(dim=0, keepdim=True)
+                f2c = f2_eval - f2_eval.mean(dim=0, keepdim=True)
                 f3n = F.normalize(f3c, dim=-1)
                 f2n = F.normalize(f2c, dim=-1)
                 pos = (f3n * f2n).sum(dim=-1).mean().item()
