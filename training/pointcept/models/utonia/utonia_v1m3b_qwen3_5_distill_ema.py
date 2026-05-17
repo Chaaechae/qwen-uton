@@ -254,9 +254,10 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             p.requires_grad = False
 
         self.enc2d_cos_shift = enc2d_cos_shift
-        if enc2d_loss_type not in ("cosine", "cosine_bc", "infonce"):
+        if enc2d_loss_type not in ("cosine", "cosine_bc", "infonce", "infonce_batch"):
             raise ValueError(
-                f"enc2d_loss_type must be 'cosine', 'cosine_bc', or 'infonce', "
+                f"enc2d_loss_type must be one of "
+                f"'cosine' / 'cosine_bc' / 'infonce' / 'infonce_batch', "
                 f"got {enc2d_loss_type!r}."
             )
         self.enc2d_loss_type = enc2d_loss_type
@@ -747,6 +748,9 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                 # tends to collapse one effective dimension and reintroduce
                 # anisotropy in a different form — so it is bypassed in
                 # InfoNCE mode by default.
+                # Per-row mean subtraction is only helpful for the plain
+                # cosine pull; for batch-centered or InfoNCE variants the
+                # batch-mean / F.normalize / softmax handles scale already.
                 if self.enc2d_cos_shift and self.enc2d_loss_type == "cosine":
                     feature2d_sel = feature2d_sel - feature2d_sel.mean(dim=-1, keepdim=True)
                     feature3d_sel = feature3d_sel - feature3d_sel.mean(dim=-1, keepdim=True)
@@ -828,10 +832,45 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                         # Degenerate batch (every scene has <2 valid pairs);
                         # contribute a zero loss without breaking the graph.
                         loss = feature3d_sel.sum() * 0.0
+                elif self.enc2d_loss_type == "infonce_batch":
+                    # Cross-scene (batch-wide) symmetric InfoNCE — same as
+                    # the per-scene `infonce` mode but without splitting by
+                    # scene. K = all unique patches in this batch
+                    # (typically ~10-30k across all GPUs / scenes / views).
+                    #
+                    # Use when per-scene `infonce` stalls because within-
+                    # scene negatives are too semantically similar (same
+                    # indoor surfaces). Cross-scene negatives are easier
+                    # (different rooms / objects) so the softmax has more
+                    # spread → gradient actually flows. Trade-off: large K
+                    # means initial CE ≈ log K ≈ 9-10 which looks scary
+                    # but moves consistently if alignment is learnable.
+                    #
+                    # Higher `infonce_temperature` (e.g. 0.5, 1.0) often
+                    # works better than the 0.07 / 0.03 used for small-K
+                    # because softer softmax over large K still gives
+                    # meaningful gradient.
+                    f2c = feature2d_sel.float() - feature2d_sel.float().mean(
+                        dim=0, keepdim=True
+                    )
+                    f3c = feature3d_sel.float() - feature3d_sel.float().mean(
+                        dim=0, keepdim=True
+                    )
+                    f3n = F.normalize(f3c, dim=-1)
+                    f2n = F.normalize(f2c, dim=-1)
+                    logits = (f3n @ f2n.T) / self.infonce_temperature
+                    labels = torch.arange(
+                        logits.shape[0], device=logits.device
+                    )
+                    loss = 0.5 * (
+                        F.cross_entropy(logits, labels)
+                        + F.cross_entropy(logits.T, labels)
+                    )
                 else:
                     raise ValueError(
                         f"Unknown enc2d_loss_type={self.enc2d_loss_type!r}; "
-                        f"expected 'cosine' or 'infonce'."
+                        f"expected 'cosine', 'cosine_bc', 'infonce', "
+                        f"or 'infonce_batch'."
                     )
                 result_dict["enc2d_loss"] = loss
                 result_dict["loss"].append(loss * self.enc2d_loss_weight)
