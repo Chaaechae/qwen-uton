@@ -185,6 +185,12 @@ model = dict(
     # qwen_proj: Linear(1024→512, bias=False) → LN learns the
     # discriminative subspace of Qwen patches. CLIP/SimCLR pattern.
     common_dim=512,
+    # Which Qwen ViT block to read patch features from. Debug probe
+    # on Qwen3.5 last block (-1) measured effective rank ≈ 1.0 (full
+    # token-uniformity collapse), so -1 is unusable. Start at -2 and
+    # confirm via `python tools/debug_alignment.py --probe-all-layers`
+    # which intermediate layer has the highest rank.
+    enc2d_layer_idx=-2,
     ema_teacher_backbone=True,
     student_pretrained_path=UTONIA_STUDENT_CKPT,
     teacher_pretrained_path=UTONIA_TEACHER_CKPT,

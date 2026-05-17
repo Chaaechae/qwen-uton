@@ -169,6 +169,17 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         #
         # None keeps the legacy single-tower behavior (f3 → Qwen 1024-d).
         common_dim=None,
+        # Which ViT block to read patch features from. Deep ViTs suffer
+        # from "token uniformity" — the last block's hidden state has
+        # all patches collapsed onto roughly one direction (effective
+        # rank ≈ 1), which makes per-patch alignment information-free.
+        # LLaVA / Sonata / many distillation papers explicitly use a
+        # second-to-last (or shallower) layer for this reason.
+        #   -1  : last block (legacy, rank-collapsed for Qwen3.5)
+        #   -2  : second-to-last block (recommended start)
+        #   -k  : k-th-from-last
+        #   int : explicit positive index
+        enc2d_layer_idx=-1,
         ema_teacher_backbone=True,
     ):
         super().__init__()
@@ -318,6 +329,7 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         self.enc2d_loss_type = enc2d_loss_type
         self.infonce_temperature = infonce_temperature
         self.infonce_batch_subsample = infonce_batch_subsample
+        self.enc2d_layer_idx = enc2d_layer_idx
 
     def load_enc2d(self, model_name, model_weight):
         if "qwen3_5" in model_name.lower() or "qwen3.5" in model_name.lower():
@@ -378,12 +390,26 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
-        for blk in self.enc2d_model.blocks:
+        # Optionally stop early (or read from any intermediate block) to
+        # dodge the deep-ViT token-uniformity collapse. `enc2d_layer_idx`
+        # accepts negative indices (-1 = last, -2 = second-to-last) or
+        # explicit positive indices. Defaults to -1 for backward
+        # compatibility, but Qwen3.5's last block was measured to have
+        # effective rank 1.0 across patches — debug_alignment will tell
+        # you whether your chosen index actually has usable rank.
+        n_blocks = len(self.enc2d_model.blocks)
+        idx = self.enc2d_layer_idx
+        if idx < 0:
+            idx = n_blocks + idx
+        idx = max(0, min(idx, n_blocks - 1))
+        for i, blk in enumerate(self.enc2d_model.blocks):
             hidden = blk(
                 hidden,
                 cu_seqlens=cu_seqlens,
                 position_embeddings=position_embeddings,
             )
+            if i == idx:
+                break
         return hidden.view(B, h * w, -1)
 
     def before_train(self):

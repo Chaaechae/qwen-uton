@@ -85,7 +85,109 @@ def parse_args():
     p.add_argument("--overfit-steps", type=int, default=100)
     p.add_argument("--overfit-lr", type=float, default=4e-3)
     p.add_argument("--device", default="cuda")
+    p.add_argument(
+        "--probe-all-layers", action="store_true",
+        help="Run a single forward through Qwen ViT and report PCA "
+             "effective rank at every block. Use this to pick "
+             "`enc2d_layer_idx` when the last block has collapsed.",
+    )
     return p.parse_args()
+
+
+@torch.inference_mode()
+def _probe_all_layers(model, batch, device, log):
+    """
+    Run Qwen ViT once over the batch's images, capturing the hidden
+    state after every block. For each block, compute PCA effective
+    rank + dims-for-99% on the (B*h*w, D) features.
+
+    Deep ViTs often show "token uniformity collapse" — features pile
+    up onto a single direction in the last few layers. This probe
+    pinpoints how shallow we need to go to recover usable patch
+    discriminability.
+    """
+    imgs = batch["images"]
+    if imgs.shape[0] == 0:
+        log("[probe] no images in batch — skipping")
+        return
+
+    enc2d = model.enc2d_model
+    B, C, H_pix, W_pix = imgs.shape
+    T = enc2d.config.temporal_patch_size
+    P = enc2d.config.patch_size
+    h, w = H_pix // P, W_pix // P
+
+    x_t = imgs.unsqueeze(1).repeat(1, T, 1, 1, 1)
+    patches = x_t.view(B, T, C, h, P, w, P)
+    patches = patches.permute(0, 3, 5, 1, 2, 4, 6).contiguous()
+    patches = patches.view(B * h * w, T * C * P * P)
+
+    grid_thw = torch.tensor(
+        [[1, h, w]] * B, device=device, dtype=torch.long
+    )
+    hidden = enc2d.patch_embed(patches)
+    rotary_pos_emb = enc2d.rot_pos_emb(grid_thw)
+    emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+    position_embeddings = (emb.cos(), emb.sin())
+    cu_seqlens = torch.repeat_interleave(
+        grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+    ).cumsum(dim=0, dtype=torch.int32)
+    cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+
+    log(f"\n[probe] {len(enc2d.blocks)} ViT blocks — measuring PCA rank "
+        f"per block over (B*h*w={B*h*w}, D)")
+    rows = []
+    # Also log the input to block 0 (patch_embed output).
+    name = "patch_embed"
+    _, _, eff = _pca_summary(name, hidden.view(-1, hidden.shape[-1]).float())
+    cum_full = torch.cumsum(
+        torch.linalg.svdvals(
+            (hidden.view(-1, hidden.shape[-1]).float() -
+             hidden.view(-1, hidden.shape[-1]).float().mean(0)).cpu()
+        ) ** 2, dim=0
+    )
+    cum_full = cum_full / cum_full[-1]
+    d99 = int((cum_full < 0.99).sum().item()) + 1
+    log(f"  {name:>20s}  D={hidden.shape[-1]:4d}  eff_rank={eff:6.2f}  "
+        f"d99={d99:4d}")
+    rows.append((name, eff, d99))
+
+    for i, blk in enumerate(enc2d.blocks):
+        hidden = blk(
+            hidden,
+            cu_seqlens=cu_seqlens,
+            position_embeddings=position_embeddings,
+        )
+        X = hidden.view(-1, hidden.shape[-1]).float().detach().cpu()
+        Xc = X - X.mean(0, keepdim=True)
+        s = torch.linalg.svdvals(Xc)
+        var = s ** 2
+        cum = torch.cumsum(var, dim=0) / var.sum().clamp_min(1e-30)
+        d99 = int((cum < 0.99).sum().item()) + 1
+        eff = float((var.sum() ** 2) / (var * var).sum().clamp_min(1e-30))
+        tag = f"block[{i}]"
+        log(f"  {tag:>20s}  D={X.shape[-1]:4d}  eff_rank={eff:6.2f}  "
+            f"d99={d99:4d}")
+        rows.append((tag, eff, d99))
+
+    # Plot effective rank curve.
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    xs = list(range(len(rows)))
+    ax[0].plot(xs, [r[1] for r in rows], marker="o")
+    ax[0].set_xlabel("block index (-1 = patch_embed)")
+    ax[0].set_ylabel("effective rank (participation ratio)")
+    ax[0].set_title("Where does Qwen ViT collapse?")
+    ax[0].grid(alpha=0.3)
+    ax[1].plot(xs, [r[2] for r in rows], marker="o", color="tab:orange")
+    ax[1].set_xlabel("block index")
+    ax[1].set_ylabel("dims for 99% variance")
+    ax[1].set_title("Cumulative-variance threshold")
+    ax[1].grid(alpha=0.3)
+    plt.tight_layout()
+    out = os.path.join(model._probe_out_dir, "qwen_layer_rank.png")
+    plt.savefig(out, dpi=120)
+    plt.close()
+    log(f"  plot -> {out}")
 
 
 def _build_indices(model, batch, device):
@@ -398,6 +500,11 @@ def main():
         k: (v.to(args.device) if isinstance(v, torch.Tensor) else v)
         for k, v in sample.items()
     }
+
+    # ---- Optional: layer-by-layer Qwen ViT probe ----
+    if args.probe_all_layers:
+        model._probe_out_dir = args.out_dir
+        _probe_all_layers(model, batch, args.device, log)
 
     # ---- (1) + (2): K stats and feature stats ----
     with torch.no_grad():
