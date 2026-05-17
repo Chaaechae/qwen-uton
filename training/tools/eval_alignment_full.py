@@ -411,9 +411,28 @@ def main():
     # centered cosine is a more honest discrimination metric.
     f3_bc = f3_proj_cat - f3_proj_cat.mean(dim=0, keepdim=True)
     f2_bc = f2_cat - f2_cat.mean(dim=0, keepdim=True)
-    pos_bc = F.cosine_similarity(f3_bc, f2_bc, dim=-1).numpy()
+    # Report per-row magnitudes so degenerate / near-zero features (which
+    # cause F.cosine_similarity to return values outside [-1,1] due to
+    # divide-by-eps) are visible up front.
+    f3_bc_norm = f3_bc.float().norm(dim=-1)
+    f2_bc_norm = f2_bc.float().norm(dim=-1)
+    n_tiny_f3 = int((f3_bc_norm < 1e-6).sum().item())
+    n_tiny_f2 = int((f2_bc_norm < 1e-6).sum().item())
+    print(f"[bc] f3_bc norm: median={f3_bc_norm.median().item():.4f}, "
+          f"min={f3_bc_norm.min().item():.4e}, tiny(<1e-6)={n_tiny_f3}/{f3_bc.shape[0]}")
+    print(f"[bc] f2_bc norm: median={f2_bc_norm.median().item():.4f}, "
+          f"min={f2_bc_norm.min().item():.4e}, tiny(<1e-6)={n_tiny_f2}/{f2_bc.shape[0]}")
+
+    # Robust cosine: explicit normalize with safer eps, then dot. Clip to
+    # [-1,1] so any residual numerical drift can't push the mean outside
+    # the legal range (F.cosine_similarity's default eps=1e-8 lets very
+    # small denominators amplify numerator noise — we've seen mean=-4.97
+    # in practice when patch_proj output shrank to near-zero magnitude).
+    f3n_bc = F.normalize(f3_bc.float(), dim=-1, eps=1e-4)
+    f2n_bc = F.normalize(f2_bc.float(), dim=-1, eps=1e-4)
+    pos_bc = (f3n_bc * f2n_bc).sum(dim=-1).clamp(-1.0, 1.0).numpy()
     perm_bc = torch.randperm(f2_bc.shape[0])
-    neg_bc = F.cosine_similarity(f3_bc, f2_bc[perm_bc], dim=-1).numpy()
+    neg_bc = (f3n_bc * f2n_bc[perm_bc]).sum(dim=-1).clamp(-1.0, 1.0).numpy()
 
     summary = dict(
         config=args.config_file,
