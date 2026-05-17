@@ -105,6 +105,12 @@ def _probe_all_layers(model, batch, device, log):
     up onto a single direction in the last few layers. This probe
     pinpoints how shallow we need to go to recover usable patch
     discriminability.
+
+    Also tries to apply any final norm / merger that the visual model
+    exposes; in standard pre-norm ViT the residual stream is highly
+    DC-dominated and the final layernorm is what produces usable
+    per-patch features.  If the user reports "all blocks rank < 5",
+    that's almost always because this post-norm step is missing.
     """
     imgs = batch["images"]
     if imgs.shape[0] == 0:
@@ -112,6 +118,17 @@ def _probe_all_layers(model, batch, device, log):
         return
 
     enc2d = model.enc2d_model
+
+    # Quick architectural sanity check: list the top-level submodules
+    # so we can see what post-block norm / merger is available.
+    log(f"\n[probe] enc2d_model top-level modules:")
+    for n, m in enc2d.named_children():
+        sub = list(m.named_children())
+        if sub:
+            log(f"  {n}: {type(m).__name__}  children={[c[0] for c in sub]}")
+        else:
+            log(f"  {n}: {type(m).__name__}")
+
     B, C, H_pix, W_pix = imgs.shape
     T = enc2d.config.temporal_patch_size
     P = enc2d.config.patch_size
@@ -134,23 +151,24 @@ def _probe_all_layers(model, batch, device, log):
     ).cumsum(dim=0, dtype=torch.int32)
     cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
 
+    def _rank_of(name, X):
+        Xf = X.view(-1, X.shape[-1]).float().detach().cpu()
+        Xc = Xf - Xf.mean(0, keepdim=True)
+        s = torch.linalg.svdvals(Xc)
+        var = s ** 2
+        cum = torch.cumsum(var, dim=0) / var.sum().clamp_min(1e-30)
+        d99 = int((cum < 0.99).sum().item()) + 1
+        eff = float((var.sum() ** 2) / (var * var).sum().clamp_min(1e-30))
+        norm_mean = Xf.norm(dim=-1).mean().item()
+        log(f"  {name:>32s}  D={X.shape[-1]:4d}  eff_rank={eff:7.2f}  "
+            f"d99={d99:4d}  ||x||_mean={norm_mean:8.3f}")
+        return eff, d99
+
     log(f"\n[probe] {len(enc2d.blocks)} ViT blocks — measuring PCA rank "
-        f"per block over (B*h*w={B*h*w}, D)")
+        f"per block over (N={B*h*w}, D)")
     rows = []
-    # Also log the input to block 0 (patch_embed output).
-    name = "patch_embed"
-    _, _, eff = _pca_summary(name, hidden.view(-1, hidden.shape[-1]).float())
-    cum_full = torch.cumsum(
-        torch.linalg.svdvals(
-            (hidden.view(-1, hidden.shape[-1]).float() -
-             hidden.view(-1, hidden.shape[-1]).float().mean(0)).cpu()
-        ) ** 2, dim=0
-    )
-    cum_full = cum_full / cum_full[-1]
-    d99 = int((cum_full < 0.99).sum().item()) + 1
-    log(f"  {name:>20s}  D={hidden.shape[-1]:4d}  eff_rank={eff:6.2f}  "
-        f"d99={d99:4d}")
-    rows.append((name, eff, d99))
+    eff, d99 = _rank_of("patch_embed", hidden)
+    rows.append(("patch_embed", eff, d99))
 
     for i, blk in enumerate(enc2d.blocks):
         hidden = blk(
@@ -158,28 +176,67 @@ def _probe_all_layers(model, batch, device, log):
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
         )
-        X = hidden.view(-1, hidden.shape[-1]).float().detach().cpu()
-        Xc = X - X.mean(0, keepdim=True)
-        s = torch.linalg.svdvals(Xc)
-        var = s ** 2
-        cum = torch.cumsum(var, dim=0) / var.sum().clamp_min(1e-30)
-        d99 = int((cum < 0.99).sum().item()) + 1
-        eff = float((var.sum() ** 2) / (var * var).sum().clamp_min(1e-30))
-        tag = f"block[{i}]"
-        log(f"  {tag:>20s}  D={X.shape[-1]:4d}  eff_rank={eff:6.2f}  "
-            f"d99={d99:4d}")
-        rows.append((tag, eff, d99))
+        if i in {0, 1, 2, len(enc2d.blocks) // 4,
+                 len(enc2d.blocks) // 2,
+                 3 * len(enc2d.blocks) // 4,
+                 len(enc2d.blocks) - 3,
+                 len(enc2d.blocks) - 2,
+                 len(enc2d.blocks) - 1}:
+            eff, d99 = _rank_of(f"block[{i}]", hidden)
+            rows.append((f"block[{i}]", eff, d99))
+
+    # Try common post-block norm / merger paths to see if the missing
+    # piece restores rank.
+    final_outputs = []
+    candidate_paths = [
+        "merger.ln_q",       # Qwen2.5-VL pattern
+        "merger.norm",       # variant
+        "norm",              # naive ViT
+        "final_layernorm",   # HF naming
+        "post_layernorm",    # CLIP pattern
+        "ln_post",           # CLIP pattern alt
+    ]
+    log(f"\n[probe] trying candidate post-block normalizations / mergers:")
+    found_any = False
+    for path in candidate_paths:
+        obj = enc2d
+        ok = True
+        for part in path.split("."):
+            if not hasattr(obj, part):
+                ok = False; break
+            obj = getattr(obj, part)
+        if not ok:
+            log(f"  - {path:>20s}  (not present)")
+            continue
+        try:
+            normed = obj(hidden)
+        except Exception as e:
+            log(f"  ! {path:>20s}  call failed: {type(e).__name__}: {str(e)[:80]}")
+            continue
+        eff, d99 = _rank_of(f"after {path}", normed)
+        rows.append((f"after {path}", eff, d99))
+        final_outputs.append((path, normed))
+        found_any = True
+
+    # Last-ditch: apply a freshly-init LayerNorm to see if even a
+    # generic post-norm would have helped.
+    fresh_ln = nn.LayerNorm(hidden.shape[-1], elementwise_affine=False).to(
+        device, dtype=hidden.dtype
+    )
+    eff, d99 = _rank_of("fresh LayerNorm (no affine)", fresh_ln(hidden))
+    rows.append(("fresh_ln", eff, d99))
 
     # Plot effective rank curve.
-    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4))
     xs = list(range(len(rows)))
+    labels = [r[0] for r in rows]
     ax[0].plot(xs, [r[1] for r in rows], marker="o")
-    ax[0].set_xlabel("block index (-1 = patch_embed)")
+    ax[0].set_xticks(xs); ax[0].set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
     ax[0].set_ylabel("effective rank (participation ratio)")
-    ax[0].set_title("Where does Qwen ViT collapse?")
+    ax[0].set_title("Where does Qwen ViT collapse — and what un-collapses it?")
     ax[0].grid(alpha=0.3)
     ax[1].plot(xs, [r[2] for r in rows], marker="o", color="tab:orange")
-    ax[1].set_xlabel("block index")
+    ax[1].set_xticks(xs); ax[1].set_xticklabels(labels, rotation=60, ha="right", fontsize=7)
     ax[1].set_ylabel("dims for 99% variance")
     ax[1].set_title("Cumulative-variance threshold")
     ax[1].grid(alpha=0.3)
@@ -188,6 +245,9 @@ def _probe_all_layers(model, batch, device, log):
     plt.savefig(out, dpi=120)
     plt.close()
     log(f"  plot -> {out}")
+    if not found_any:
+        log("  [warn] no known post-block norm / merger module found; "
+            "Qwen3.5 visual may expose it under a different path.")
 
 
 def _build_indices(model, batch, device):
