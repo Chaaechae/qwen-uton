@@ -9,6 +9,19 @@ Video-3D-LLM의 3D positional encoding 대체로 사용**할 수 있게 만드�
 
 ## 1. 학습 setup
 
+문서 전반에서 사용하는 약어:
+
+| 약어 | 의미 | 차원 |
+|------|------|------|
+| **f2** / `f2_qwen` | feature **2D** = Qwen ViT patch token | 1024-d |
+| `f2_proj` | (G에서만) `qwen_proj` 후 공통공간 표현 | 512-d |
+| **f3** / `f3_raw` | feature **3D** = PTv3 backbone 출력 (patch_proj 전) | 1332-d |
+| `f3_proj` | `patch_proj` 후 표현 | 1024-d (F까지) / 512-d (G) |
+| `_bc` 접미사 | batch-centered (batch 평균 빼고 측정) |  |
+| `pos_bc` / `neg_bc` | 올바른/잘못된 pair의 batch-centered cosine | scalar |
+| `discrim_gap_bc` | `pos_bc − neg_bc` (정렬 품질 핵심 지표) | scalar |
+| `K` | batch당 unique한 (point, patch) pair 개수 | int |
+
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  2D teacher (frozen)                                         │
