@@ -593,28 +593,101 @@ def _coerce_sample_for_model(raw):
 
 
 def _load_into_model(model, weight_path, label):
-    """Best-effort load of a checkpoint (Pointcept training fmt or HF fmt)."""
+    """
+    Best-effort load of a checkpoint into a Utonia model regardless of
+    which format it was saved in.
+
+    Three formats we've seen in the wild:
+
+      A. Pointcept training-time `model_last.pth`:
+            ckpt = {"state_dict": {"module.student.backbone.X": ...,
+                                   "module.patch_proj.Y": ..., ...}}
+         Strip `module.` → already matches v1m1/v1m3b's namespace.
+
+      B. Published utonia HF release (`utonia.pth`):
+            ckpt = {"config": "...", "state_dict": {"module.X": ...}}
+         where X is the raw PT-v3 weight name (no `student.backbone.`
+         prefix).  Must strip `module.` AND prepend `student.backbone.`.
+
+      C. Same as B but without the `module.` prefix:
+            ckpt = {"config": "...", "state_dict": {"X": ...}}
+         Just prepend `student.backbone.`.
+
+    Earlier we only handled A and C; B mapped to nonsense keys
+    (`student.backbone.module.X`) so the published HF checkpoint
+    silently loaded *zero* weights → eval ran against a randomly
+    initialised backbone (CKA stuck at baseline ~0.31, retrieval at
+    chance, cosine outputs in the NaN territory).
+
+    Strategy: try each candidate key transform, keep the one that
+    matches the most parameters of the live model.  Print the
+    matched-key count and a handful of sample mapped/unmapped names
+    so format mismatches surface immediately instead of producing
+    silently meaningless metrics.
+    """
     print(f"[setup/{label}] loading: {weight_path}")
     ckpt = torch.load(weight_path, map_location="cpu", weights_only=False)
-    # ORDER MATTERS: published utonia.pth has BOTH "config" and "state_dict"
-    # at the top level (the HF format), so we must check for "config" FIRST.
-    # Otherwise the raw PTv3 keys go through unprefixed and miss the model's
-    # `student.backbone.` namespace entirely.
-    if isinstance(ckpt, dict) and "config" in ckpt and "state_dict" in ckpt:
-        # Published utonia HF format. Keys are raw PTv3 — wrap with the
-        # student.backbone. prefix so they land on student.backbone.*.
-        sd = {f"student.backbone.{k}": v for k, v in ckpt["state_dict"].items()}
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        # Pointcept training format (state_dict keys already have
-        # `module.student.backbone.*` etc.).
-        sd = ckpt["state_dict"]
+
+    # Resolve the raw state_dict regardless of outer wrapping.
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        raw = ckpt["state_dict"]
+    elif isinstance(ckpt, dict):
+        raw = ckpt
     else:
-        sd = ckpt
-    sd = {(k[len("module."):] if k.startswith("module.") else k): v
-          for k, v in sd.items()}
+        raise TypeError(f"unexpected checkpoint type {type(ckpt)}")
+
+    model_keys = set(model.state_dict().keys())
+
+    def _strip_module(d):
+        return {(k[len("module."):] if k.startswith("module.") else k): v
+                for k, v in d.items()}
+
+    candidates = []
+
+    # 1. Identity (covers format A directly).
+    candidates.append(("identity", dict(raw)))
+    # 2. Strip module. only.
+    candidates.append(("strip_module", _strip_module(raw)))
+    # 3. Strip module. + prepend student.backbone. (format B).
+    stripped = _strip_module(raw)
+    candidates.append((
+        "strip_module+student.backbone.",
+        {f"student.backbone.{k}": v for k, v in stripped.items()},
+    ))
+    # 4. Prepend student.backbone. without stripping (format C with no
+    #    module. prefix to start with).
+    candidates.append((
+        "student.backbone.",
+        {f"student.backbone.{k}": v for k, v in raw.items()},
+    ))
+
+    # Pick the transform that hits the most live-model keys.
+    best = None
+    for name, sd in candidates:
+        hits = sum(1 for k in sd.keys() if k in model_keys)
+        if best is None or hits > best[0]:
+            best = (hits, name, sd)
+    hits, chosen, sd = best
+
     info = model.load_state_dict(sd, strict=False)
-    print(f"[setup/{label}] missing={len(info.missing_keys)}, "
+    print(f"[setup/{label}] transform={chosen!r}  "
+          f"matched={hits}/{len(model_keys)} live-model keys  "
+          f"missing={len(info.missing_keys)} "
           f"unexpected={len(info.unexpected_keys)}")
+    # Surface a few sample names so format mismatches are obvious.
+    sample_unexp = list(info.unexpected_keys)[:3]
+    sample_miss = [k for k in info.missing_keys if "backbone" in k][:3]
+    if sample_unexp:
+        print(f"[setup/{label}]   sample unexpected: {sample_unexp}")
+    if sample_miss:
+        print(f"[setup/{label}]   sample missing (backbone): {sample_miss}")
+    if hits == 0:
+        raise RuntimeError(
+            f"[setup/{label}] no checkpoint keys matched the model — "
+            f"all four prefix strategies missed.  First 3 ckpt keys: "
+            f"{list(raw.keys())[:3]}; first 3 model keys: "
+            f"{list(model_keys)[:3]}"
+        )
 
 
 if __name__ == "__main__":
