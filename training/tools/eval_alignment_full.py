@@ -178,11 +178,17 @@ def _extract_pairs(model, batch, device):
         valid_index[1].unsqueeze(-1),
         correspondence[valid_index],
     ], dim=-1).long()
+    # If use_full_merger is on, ENC2D_forward returns 16×16 tokens, so
+    # correspondence values (still in 32×32 units) must be downsampled
+    # to the effective grid. Falls back to identity for legacy configs.
+    eph = getattr(model, "effective_patch_h", model.patch_h)
+    epw = getattr(model, "effective_patch_w", model.patch_w)
+    stride = getattr(model, "correspondence_stride", 1)
     feature_index = (
-        feature_index[:, 0] * model.patch_h * model.patch_w
-        + feature_index[:, 1] * model.patch_h * model.patch_w
-        + feature_index[:, 2] * model.patch_w
-        + feature_index[:, 3]
+        feature_index[:, 0] * eph * epw
+        + feature_index[:, 1] * eph * epw
+        + (feature_index[:, 2] // stride) * epw
+        + (feature_index[:, 3] // stride)
     )
     # Per-patch averaged 3D feature (raw, pre-projection).
     feature3d_pixel_raw = torch_scatter.scatter_mean(

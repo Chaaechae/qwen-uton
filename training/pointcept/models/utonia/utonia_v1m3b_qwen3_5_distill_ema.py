@@ -180,6 +180,19 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         #   -k  : k-th-from-last
         #   int : explicit positive index
         enc2d_layer_idx=-1,
+        # Apply Qwen's full merger (norm + 2x2 spatial merge + MLP →
+        # LLM hidden dim) instead of just merger.norm. With False
+        # (legacy / G), per-patch features at the original 32×32 grid
+        # are returned (rank ~12).  With True (H+):
+        #   - hidden is reordered row-major → 2×2 block-major
+        #   - full merger produces 16×16 tokens at LLM hidden dim
+        #     (Qwen3.5 → 2560) — same representation the LLM consumes
+        #   - the 32×32 correspondence is downsampled in the loss
+        #     path (`row//2, col//2`) so 4 source patches share one
+        #     target token (correct semantics — Qwen pools them
+        #     anyway).
+        # No re-extraction of correspondence needed.
+        use_full_merger=False,
         ema_teacher_backbone=True,
     ):
         super().__init__()
@@ -244,6 +257,19 @@ class UtoniaQwen3_5DistillEMA(PointModel):
         if self.enc2d_loss_weight > 0:
             self.patch_h = patch_h
             self.patch_w = patch_w
+            self.use_full_merger = use_full_merger
+            if use_full_merger:
+                # ENC2D_forward returns 16×16 tokens; correspondence
+                # values (still in 32×32 units) are downsampled by 2
+                # before the feature_index calc.
+                assert patch_h % 2 == 0 and patch_w % 2 == 0
+                self.effective_patch_h = patch_h // 2
+                self.effective_patch_w = patch_w // 2
+                self.correspondence_stride = 2
+            else:
+                self.effective_patch_h = patch_h
+                self.effective_patch_w = patch_w
+                self.correspondence_stride = 1
             self.image_weight_name = image_weight_name
             self.enc2d_model = self.load_enc2d(image_weight_name, image_weight_path)
             self.enc2d_model.requires_grad_(False)
@@ -411,13 +437,33 @@ class UtoniaQwen3_5DistillEMA(PointModel):
             if i == idx:
                 break
 
-        # Apply Qwen's post-block normalization if the model exposes it.
-        # Without this the raw pre-norm residual stream is DC-dominated
-        # and patches collapse to ~rank 1; with `merger.norm` (Qwen3.5's
-        # final RMSNorm) we recover rank ≥ 12 on the same batch. This
-        # is the single missing piece v1m3-A..F were all training
-        # against. Falls through silently if neither attribute exists,
-        # so the change is backward compatible.
+        # `use_full_merger` (v1m3-H+): apply Qwen's full merger
+        # (norm + 2×2 spatial merge + linear_fc1 + act_fn + linear_fc2)
+        # and return the 16×16 LLM-aligned tokens.  Our patch_embed
+        # produces row-major (row, col) flattened order, but the
+        # merger's internal `view(-1, 4*D)` expects 2×2 spatial blocks
+        # to be contiguous; reorder before calling.
+        if getattr(self, "use_full_merger", False) and hasattr(
+            self.enc2d_model, "merger"
+        ):
+            D = hidden.shape[-1]
+            # (B*h*w, D) → (B, h/2, w/2, 2, 2, D) → flat block-major
+            h_blk = (
+                hidden.view(B, h, w, D)
+                      .view(B, h // 2, 2, w // 2, 2, D)
+                      .permute(0, 1, 3, 2, 4, 5)
+                      .contiguous()
+                      .view(B * (h // 2) * (w // 2) * 4, D)
+            )
+            merged = self.enc2d_model.merger(h_blk)
+            return merged.view(B, (h // 2) * (w // 2), -1)
+
+        # Per-patch path (v1m3-G and earlier): apply ONLY the post-block
+        # normalization (merger.norm / merger.ln_q / model.norm) to
+        # un-collapse the pre-norm residual stream. Without this the
+        # raw block output is DC-dominated and patches collapse to
+        # ~rank 1, which is the single missing piece v1m3-A..F were
+        # all training against. Falls through silently if none exists.
         if hasattr(self.enc2d_model, "merger") and hasattr(
             self.enc2d_model.merger, "norm"
         ):
@@ -827,11 +873,19 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                     ],
                     dim=-1,
                 ).long()
+                # When use_full_merger is on, ENC2D_forward returns
+                # (h/2)×(w/2) tokens, so we flatten correspondence into
+                # the effective grid by dividing row/col by stride (=2).
+                # Legacy path (use_full_merger=False) has effective=patch
+                # and stride=1, reducing to the original calc.
+                eph = self.effective_patch_h
+                epw = self.effective_patch_w
+                stride = self.correspondence_stride
                 feature_index = (
-                    feature_index[:, 0] * self.patch_h * self.patch_w
-                    + feature_index[:, 1] * self.patch_h * self.patch_w
-                    + feature_index[:, 2] * self.patch_w
-                    + feature_index[:, 3]
+                    feature_index[:, 0] * eph * epw
+                    + feature_index[:, 1] * eph * epw
+                    + (feature_index[:, 2] // stride) * epw
+                    + (feature_index[:, 3] // stride)
                 )
                 feature3d_pixel = torch_scatter.scatter_mean(
                     feature3d_pixel, feature_index, dim=0, dim_size=feature2d.shape[0]
@@ -900,7 +954,7 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                     #
                     # We BATCH-CENTER on top of normalize so the shared
                     # Qwen DC direction doesn't dominate the dot products.
-                    HW = self.patch_h * self.patch_w
+                    HW = self.effective_patch_h * self.effective_patch_w
                     img_id = feature_index // HW
                     # Which batch element does each image (= each patch's
                     # owning scene) belong to. offset_img_num[i] is the

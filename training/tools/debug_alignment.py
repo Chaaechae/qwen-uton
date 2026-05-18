@@ -395,11 +395,14 @@ def _build_indices(model, batch, device):
         valid_index[1].unsqueeze(-1),
         correspondence[valid_index],
     ], dim=-1).long()
+    eph = getattr(model, "effective_patch_h", model.patch_h)
+    epw = getattr(model, "effective_patch_w", model.patch_w)
+    stride = getattr(model, "correspondence_stride", 1)
     feature_index = (
-        feature_index_all[:, 0] * model.patch_h * model.patch_w
-        + feature_index_all[:, 1] * model.patch_h * model.patch_w
-        + feature_index_all[:, 2] * model.patch_w
-        + feature_index_all[:, 3]
+        feature_index_all[:, 0] * eph * epw
+        + feature_index_all[:, 1] * eph * epw
+        + (feature_index_all[:, 2] // stride) * epw
+        + (feature_index_all[:, 3] // stride)
     )
     feature3d_raw_full = torch_scatter.scatter_mean(
         feature3d_pixel, feature_index, dim=0, dim_size=feature2d.shape[0]
