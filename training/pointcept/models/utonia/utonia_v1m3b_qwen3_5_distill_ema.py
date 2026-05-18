@@ -456,6 +456,20 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                       .view(B * (h // 2) * (w // 2) * 4, D)
             )
             merged = self.enc2d_model.merger(h_blk)
+            # Once-only shape print so we can verify the merger actually
+            # reduces the row count by 4 (spatial_merge_size**2). If the
+            # actual Qwen3.5 merger does not reduce as expected, the
+            # loss-path index math will silently disagree with feature2d
+            # and trigger the ScatterGatherKernel OOB assert.
+            if not getattr(self, "_logged_merger_shapes", False):
+                print(
+                    f"[utonia v1m3b] ENC2D_forward(use_full_merger=True): "
+                    f"B={B} h={h} w={w} D={D}  "
+                    f"h_blk.shape={tuple(h_blk.shape)}  "
+                    f"merger out.shape={tuple(merged.shape)}  "
+                    f"expected out=(B*{(h // 2) * (w // 2)}, *)"
+                )
+                self._logged_merger_shapes = True
             return merged.view(B, (h // 2) * (w // 2), -1)
 
         # Per-patch path (v1m3-G and earlier): apply ONLY the post-block
@@ -881,12 +895,58 @@ class UtoniaQwen3_5DistillEMA(PointModel):
                 eph = self.effective_patch_h
                 epw = self.effective_patch_w
                 stride = self.correspondence_stride
+                # Defensive clamp on the *spatial* axes. In G (stride=1)
+                # the per-patch values were unchecked but happened to lie
+                # in-bounds; in H the half-resolution grid is tighter, so
+                # we clamp explicitly before composing the flat index.
+                # We also preserve the original 4-column tensor for
+                # diagnostics in the OOB branch below.
+                batch_img_idx = feature_index[:, 0]
+                view_img_idx = feature_index[:, 1]
+                row_eff = (feature_index[:, 2] // stride).clamp_(0, eph - 1)
+                col_eff = (feature_index[:, 3] // stride).clamp_(0, epw - 1)
                 feature_index = (
-                    feature_index[:, 0] * eph * epw
-                    + feature_index[:, 1] * eph * epw
-                    + (feature_index[:, 2] // stride) * epw
-                    + (feature_index[:, 3] // stride)
+                    batch_img_idx * eph * epw
+                    + view_img_idx * eph * epw
+                    + row_eff * epw
+                    + col_eff
                 )
+                # Bound-check before the scatter. The silent CUDA assert
+                # that fires inside ScatterGatherKernel.cu is impossible
+                # to debug from a stack trace, so we synchronize, capture
+                # diagnostic stats, drop offending rows, and warn ONCE so
+                # training can proceed.
+                _N = feature2d.shape[0]
+                _bad = (feature_index < 0) | (feature_index >= _N)
+                if _bad.any():
+                    if not getattr(self, "_warned_oob", False):
+                        import warnings
+                        bad_mask = _bad
+                        max_bidx = int(batch_img_idx.max().item())
+                        max_vidx = int(view_img_idx.max().item())
+                        max_row = int(feature_index[bad_mask].max().item()) \
+                            if bad_mask.any() else -1
+                        warnings.warn(
+                            f"[utonia v1m3b] aligned-forward feature_index OOB: "
+                            f"{int(_bad.sum())}/{feature_index.numel()} rows "
+                            f"outside [0, {_N}); use_full_merger="
+                            f"{getattr(self, 'use_full_merger', False)} "
+                            f"eph/epw={eph}/{epw} stride={stride} "
+                            f"feature2d.shape={tuple(feature2d.shape)} "
+                            f"total_img_num={int(total_img_num)} "
+                            f"max(batch_img_num)={max_bidx} "
+                            f"max(view_img_idx)={max_vidx} "
+                            f"max(bad_flat_idx)={max_row}. "
+                            f"Dropping offending rows so training can "
+                            f"proceed; root cause is likely a "
+                            f"batch_img_num+valid_index[1] >= total_img_num "
+                            f"due to a correspondence-padding mismatch "
+                            f"with the use_full_merger path."
+                        )
+                        self._warned_oob = True
+                    _keep = ~_bad
+                    feature_index = feature_index[_keep]
+                    feature3d_pixel = feature3d_pixel[_keep]
                 feature3d_pixel = torch_scatter.scatter_mean(
                     feature3d_pixel, feature_index, dim=0, dim_size=feature2d.shape[0]
                 )
