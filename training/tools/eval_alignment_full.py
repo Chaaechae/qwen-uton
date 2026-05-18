@@ -184,12 +184,47 @@ def _extract_pairs(model, batch, device):
     eph = getattr(model, "effective_patch_h", model.patch_h)
     epw = getattr(model, "effective_patch_w", model.patch_w)
     stride = getattr(model, "correspondence_stride", 1)
+    # Clamp the spatial axes to the effective grid before composing the
+    # flat index — same guard as the training loss path.  In G this is
+    # a no-op (stride=1, eph=patch_h); in H the half-resolution grid is
+    # tight enough that any pool_corr float that lands at exactly patch_h
+    # would escape and trigger the CUDA OOB assert at scatter time.
+    batch_img_idx = feature_index[:, 0]
+    view_img_idx = feature_index[:, 1]
+    row_eff = (feature_index[:, 2] // stride).clamp_(0, eph - 1)
+    col_eff = (feature_index[:, 3] // stride).clamp_(0, epw - 1)
     feature_index = (
-        feature_index[:, 0] * eph * epw
-        + feature_index[:, 1] * eph * epw
-        + (feature_index[:, 2] // stride) * epw
-        + (feature_index[:, 3] // stride)
+        batch_img_idx * eph * epw
+        + view_img_idx * eph * epw
+        + row_eff * epw
+        + col_eff
     )
+    # Bound-check.  Eval runs single-sample (no batching), so we'd rather
+    # drop the offending rows and finish the scene than let the silent
+    # CUDA assert kill the whole eval loop.  Print diagnostic stats so
+    # the offending tensor shape mismatch is visible.
+    _N = feature2d.shape[0]
+    _bad = (feature_index < 0) | (feature_index >= _N)
+    if _bad.any():
+        n_bad = int(_bad.sum().item())
+        max_b = int(batch_img_idx.max().item())
+        max_v = int(view_img_idx.max().item())
+        max_ix = int(feature_index[_bad].max().item())
+        print(
+            f"  [eval_alignment_full] feature_index OOB in this scene: "
+            f"{n_bad}/{feature_index.numel()} rows outside [0, {_N}); "
+            f"eph/epw={eph}/{epw} stride={stride} "
+            f"feature2d.shape={tuple(feature2d.shape)} "
+            f"imgs.shape={tuple(imgs.shape)} "
+            f"img_num={int(bincount_img_num.sum())} "
+            f"max(batch_img_num)={max_b} max(view_img_idx)={max_v} "
+            f"max(bad_idx)={max_ix} — dropping offending rows."
+        )
+        _keep = ~_bad
+        feature_index = feature_index[_keep]
+        feature3d_pixel = feature3d_pixel[_keep]
+        if feature_index.numel() == 0:
+            return None, None, None
     # Per-patch averaged 3D feature (raw, pre-projection).
     feature3d_pixel_raw = torch_scatter.scatter_mean(
         feature3d_pixel, feature_index, dim=0, dim_size=feature2d.shape[0]

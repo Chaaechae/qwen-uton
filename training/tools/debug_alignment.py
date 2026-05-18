@@ -398,12 +398,29 @@ def _build_indices(model, batch, device):
     eph = getattr(model, "effective_patch_h", model.patch_h)
     epw = getattr(model, "effective_patch_w", model.patch_w)
     stride = getattr(model, "correspondence_stride", 1)
+    # Clamp to effective grid + bound-check, same as train + eval paths.
+    row_eff = (feature_index_all[:, 2] // stride).clamp_(0, eph - 1)
+    col_eff = (feature_index_all[:, 3] // stride).clamp_(0, epw - 1)
     feature_index = (
         feature_index_all[:, 0] * eph * epw
         + feature_index_all[:, 1] * eph * epw
-        + (feature_index_all[:, 2] // stride) * epw
-        + (feature_index_all[:, 3] // stride)
+        + row_eff * epw
+        + col_eff
     )
+    _N = feature2d.shape[0]
+    _bad = (feature_index < 0) | (feature_index >= _N)
+    if _bad.any():
+        print(
+            f"  [debug_alignment] feature_index OOB: "
+            f"{int(_bad.sum())}/{feature_index.numel()} outside [0, {_N}); "
+            f"eph/epw={eph}/{epw} stride={stride} "
+            f"feature2d.shape={tuple(feature2d.shape)} "
+            f"— dropping offending rows."
+        )
+        _keep = ~_bad
+        feature_index = feature_index[_keep]
+        feature3d_pixel = feature3d_pixel[_keep]
+        feature_index_all = feature_index_all[_keep]
     feature3d_raw_full = torch_scatter.scatter_mean(
         feature3d_pixel, feature_index, dim=0, dim_size=feature2d.shape[0]
     )
