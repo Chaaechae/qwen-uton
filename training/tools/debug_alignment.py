@@ -255,6 +255,40 @@ def _probe_all_layers(model, batch, device, log):
                 eff, d99 = _rank_of("merger.norm -> mlp[0]", inner)
                 rows.append(("merger.norm->mlp[0]", eff, d99))
 
+    # Full merger with proper 2×2 block-major reordering.
+    # Our ENC2D_forward flattens patches in row-major order
+    # (row 0 cols 0..w, row 1 cols 0..w, ...), but Qwen merger's
+    # internal `view(-1, 4*D)` expects 2×2 spatial blocks to be
+    # contiguous in the flat dim. So we permute first, then call
+    # merger to get the LLM-aligned 16×16 tokens (rank should be
+    # much higher than the per-patch merger.norm output if Qwen's
+    # discriminative information lives at the merged scale).
+    if hasattr(enc2d, "merger"):
+        try:
+            B_eff = hidden.shape[0] // (h * w)
+            D = hidden.shape[-1]
+            assert h % 2 == 0 and w % 2 == 0, \
+                f"merger expects even h,w, got {h}x{w}"
+            # (N=B*h*w, D) -> (B, h/2, 2, w/2, 2, D) -> block-major
+            h_blk = (
+                hidden.view(B_eff, h, w, D)
+                      .view(B_eff, h // 2, 2, w // 2, 2, D)
+                      .permute(0, 1, 3, 2, 4, 5)  # (B, h/2, w/2, 2, 2, D)
+                      .contiguous()
+                      .view(B_eff * (h // 2) * (w // 2) * 4, D)
+            )
+            merged = enc2d.merger(h_blk)
+            log(f"\n[probe] full merger (with 2x2 block-major reorder):")
+            log(f"  input  : (N={hidden.shape[0]}, D={D})  row-major 32×32")
+            log(f"  reorder: (N={h_blk.shape[0]}, D={D})  block-major")
+            log(f"  output : (N={merged.shape[0]}, D={merged.shape[-1]}) "
+                f"= 16×16 tokens in LLM dim")
+            eff, d99 = _rank_of("full merger (16×16)", merged)
+            rows.append(("full_merger_16x16", eff, d99))
+        except Exception as e:
+            log(f"\n[probe] full merger attempt failed: "
+                f"{type(e).__name__}: {str(e)[:120]}")
+
     # Last-ditch: apply a freshly-init LayerNorm to see if even a
     # generic post-norm would have helped.
     fresh_ln = nn.LayerNorm(hidden.shape[-1], elementwise_affine=False).to(
