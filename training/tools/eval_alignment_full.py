@@ -200,10 +200,15 @@ def _extract_pairs(model, batch, device):
     # that lifts Qwen patches into the same common space as patch_proj
     # output. Apply it so that f2 and f3_proj live in the same dim
     # (matmul / cosine / CKA all expect matching last-dim).
+    #
+    # Qwen ViT is loaded in bf16 but qwen_proj is float32 (built by
+    # the model constructor with default dtype). Training has AMP
+    # autocast to bridge those, eval doesn't — cast f2 to float32
+    # before the matmul or this errors out.
     if getattr(model, "common_dim", None) is not None and hasattr(
         model, "qwen_proj"
     ):
-        f2 = model.qwen_proj(f2)
+        f2 = model.qwen_proj(f2.float())
 
     if getattr(model, "enc2d_cos_shift", False):
         f2 = f2 - f2.mean(dim=-1, keepdim=True)
