@@ -58,11 +58,19 @@ Inputs
 
 Outputs
 -------
-  <out>/attn_2d.png       Input image + heatmap overlay (matplotlib).
-  <out>/scene_rgb.ply     Original colors (for orientation).
+  <out>/attn_2d.png       Static 2D matplotlib overlay (input image
+                          side-by-side with attention heatmap).
+  <out>/scene_rgb.ply     Original-color point cloud (for orientation).
   <out>/scene_heatmap.ply Per-point similarity heatmap (jet colormap).
   <out>/scene_top.ply     Top-K most similar points isolated (K = 1024
                           default; --top-k to change).
+  <out>/viz.html          ★ Single interactive Plotly page:
+                          LEFT  — input image with attention overlay.
+                          RIGHT — 3D point cloud, orbit/zoom/rotate,
+                                  hover shows (x, y, z, similarity).
+                          Browser-renderable, no extra deps; subsamples
+                          to --plot-max-points (default 80000) when the
+                          cloud is large.
 
 Usage
 -----
@@ -352,6 +360,124 @@ def save_2d_overlay(image_pil, attn_grid, out_path):
 
 
 # ---------------------------------------------------------------------------
+# Interactive Plotly HTML: 2D image + attention overlay on the left,
+# 3D point cloud heatmap on the right (orbit/zoom/rotate).
+# ---------------------------------------------------------------------------
+def save_plotly_combined(
+    image_pil, attn_grid, coord, color_rgb, sim_3d, query_text, out_path,
+    max_points=80000, point_size=2,
+):
+    """
+    image_pil  : PIL.Image input image
+    attn_grid  : (h, w) torch tensor — 2D attention from Qwen
+    coord      : (N, 3) numpy point cloud xyz
+    color_rgb  : (N, 3) numpy uint8 original colors (for context view)
+    sim_3d     : (N,) numpy per-point similarity score to query
+    query_text : the NL query string (for the figure title)
+    out_path   : output .html path
+
+    Renders ONE html with two side-by-side subplots:
+       LEFT  — 2D image with jet-colored attention overlay
+       RIGHT — 3D scatter, marker color = jet(sim_norm)
+    Browsers struggle past ~200k 3D points; subsample if N > max_points.
+    """
+    import numpy as np
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.cm as cm
+
+    # ---------- 2D side: bake the attention overlay into one RGB image ----
+    img = np.asarray(image_pil.convert("RGB")).astype(np.float32) / 255.0  # (H, W, 3)
+    H, W, _ = img.shape
+
+    a = attn_grid.cpu().float().numpy()
+    a = (a - a.min()) / max(a.max() - a.min(), 1e-9)
+    # Upsample to image resolution via numpy (bilinear via torch).
+    import torch.nn.functional as F
+    a_up = F.interpolate(
+        torch.from_numpy(a)[None, None],
+        size=(H, W), mode="bilinear", align_corners=False,
+    )[0, 0].numpy()
+    jet = cm.get_cmap("jet")(a_up)[..., :3]  # (H, W, 3) in [0, 1]
+    # 60% image + 40% heatmap blend.
+    overlay = (0.45 * img + 0.55 * jet)
+    overlay = (np.clip(overlay, 0, 1) * 255).astype(np.uint8)
+
+    # ---------- 3D side: subsample for browser performance ----------------
+    n = coord.shape[0]
+    if n > max_points:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(n, size=max_points, replace=False)
+        coord_s = coord[idx]
+        sim_s   = sim_3d[idx]
+    else:
+        coord_s = coord
+        sim_s   = sim_3d
+
+    # Percentile-stretch for visibility (otherwise tail outliers compress
+    # the useful range into a thin band of color).
+    lo, hi = np.percentile(sim_s, [5, 99])
+    sim_norm = np.clip((sim_s - lo) / max(hi - lo, 1e-9), 0, 1)
+
+    # ---------- Build subplots --------------------------------------------
+    fig = make_subplots(
+        rows=1, cols=2,
+        specs=[[{"type": "image"}, {"type": "scene"}]],
+        column_widths=[0.4, 0.6],
+        subplot_titles=(f"2D attention  (query='{query_text}')",
+                        "3D point cloud — heatmap"),
+        horizontal_spacing=0.04,
+    )
+
+    fig.add_trace(go.Image(z=overlay), row=1, col=1)
+
+    # 3D scatter with jet colorbar.
+    fig.add_trace(
+        go.Scatter3d(
+            x=coord_s[:, 0], y=coord_s[:, 1], z=coord_s[:, 2],
+            mode="markers",
+            marker=dict(
+                size=point_size,
+                color=sim_norm,
+                colorscale="Jet",
+                cmin=0.0, cmax=1.0,
+                showscale=True,
+                colorbar=dict(
+                    title=dict(text="sim(query, 3D)",
+                               side="right"),
+                    thickness=14, len=0.7, x=1.02,
+                ),
+                opacity=0.95,
+            ),
+            hovertemplate=(
+                "x: %{x:.2f}<br>y: %{y:.2f}<br>z: %{z:.2f}"
+                "<br>sim: %{marker.color:.3f}<extra></extra>"
+            ),
+            name="points",
+        ),
+        row=1, col=2,
+    )
+
+    fig.update_layout(
+        title=f"Text-query 3D localization — '{query_text}'",
+        height=720, width=1500,
+        scene=dict(
+            aspectmode="data",
+            xaxis=dict(showbackground=False, showticklabels=False, title=""),
+            yaxis=dict(showbackground=False, showticklabels=False, title=""),
+            zaxis=dict(showbackground=False, showticklabels=False, title=""),
+            camera=dict(eye=dict(x=1.3, y=-1.3, z=0.8)),
+        ),
+    )
+    fig.update_xaxes(showticklabels=False, row=1, col=1)
+    fig.update_yaxes(showticklabels=False, row=1, col=1)
+
+    fig.write_html(out_path, include_plotlyjs="cdn")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def parse_args():
@@ -367,6 +493,11 @@ def parse_args():
                    help="Softmax temperature for 2D attention map.")
     p.add_argument("--top-k", type=int, default=1024,
                    help="# of top-scored points to isolate in scene_top.ply")
+    p.add_argument("--plot-max-points", type=int, default=80000,
+                   help="Subsample cap for the Plotly 3D scatter "
+                        "(browser perf gets bad past ~150k).")
+    p.add_argument("--plot-point-size", type=int, default=2,
+                   help="Marker size for Plotly 3D scatter.")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -472,6 +603,23 @@ def main():
     write_ply(os.path.join(args.out_dir, "scene_top.ply"),
               coord[idx_top], np.array([[230, 30, 30]] * k, dtype=np.uint8))
     print(f"[save] {args.out_dir}/scene_top.ply  (top {k} pts)")
+
+    # (d) interactive Plotly HTML — 2D overlay + 3D heatmap together
+    html_path = os.path.join(args.out_dir, "viz.html")
+    save_plotly_combined(
+        image_pil=image_pil,
+        attn_grid=attn_2d.view(h_grid, w_grid),
+        coord=coord,
+        color_rgb=color,
+        sim_3d=sim_3d,
+        query_text=args.query,
+        out_path=html_path,
+        max_points=args.plot_max_points,
+        point_size=args.plot_point_size,
+    )
+    print(f"[save] {html_path}  "
+          "(open in browser — left: 2D attention, right: 3D heatmap, "
+          "drag to rotate)")
 
     print("\n[done]")
 
