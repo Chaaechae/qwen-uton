@@ -8,34 +8,82 @@ frozen Qwen ViT feature manifold.
 
 Metrics computed
 ================
-For ~50 held-out val scenes, runs the alignment branch of the v1m3 model
-and aggregates:
+Three complementary signals, each answering a different question
+about how well Utonia's 3D backbone has been pulled toward Qwen's
+visual feature space.  All three use the SAME pre-computed
+correspondence (offline ray-cast: "3D point P_i projects to 2D patch
+patch_i") — correspondence is not measured; it's the *ground truth
+label* against which the LEARNED feature alignment is evaluated.
 
-  (1) Cosine distribution
-        pos_cos : cosine sim between projected 3D point feature and the
-                  Qwen patch feature it correctly maps to.
-        neg_cos : same, but against a within-scene shuffled patch.
-        Reports mean/std/median/p05/p95 + density histogram PNG.
+  (1) Cosine distribution — PAIR DISCRIMINABILITY
+        Question: "do learned features make correctly-paired
+        (3D point, 2D patch) look more alike than random pairs?"
 
-  (2) Within-scene patch retrieval
-        For each scene, build the K×K cosine sim matrix between the K
-        projected 3D features and the K Qwen patch features (K = number
-        of valid patches in that scene). The "true match" for row i is
-        column i. Compute the rank of the true match within each row.
-            R@1 / R@5 / R@10 : fraction of rows whose true match is in
-                               the top K candidates.
-            MRR              : mean of 1 / rank of the true match.
-            mean_rank        : average rank (1 = perfect).
-        Discriminative alignment → high R@K, MRR near 1, mean_rank low.
+        pos_cos : cosine sim between projected 3D point feature and
+                  the Qwen patch feature it correspondence-pairs with.
+        neg_cos : same, but against a within-scene shuffled patch
+                  (negative sample).
 
-  (3) Linear CKA
-        Centered Kernel Alignment between the matrix of all 3D features
-        (across scenes) and the matrix of all Qwen patch features.
-        Single scalar in [0, 1] — dimension-agnostic, so it can compare
-        a 1332-d backbone output to 1024-d Qwen patch features without
-        a learned projector. With --baseline-weight, also computes the
-        same CKA for an unaligned baseline checkpoint (typically
-        utonia.pth) for a clean before/after comparison.
+        Also reports BATCH-CENTERED variants (pos_bc, neg_bc) — the
+        more honest version that strips Qwen's anisotropic DC offset.
+        The gap (pos_bc - neg_bc) is the actual discrimination signal.
+
+  (2) Within-scene patch retrieval — FINE-GRAINED LOCALIZATION
+        Question: "can the 3D feature exactly identify WHICH of the K
+        patches in this scene it should match?"
+
+        For each scene, build the K×K cosine sim matrix between the
+        K projected 3D features and the K Qwen patch features (K =
+        valid patches in the scene). True match for row i is column
+        i (the correspondence-paired patch). Rank of the true match:
+            R@1 / R@5 / R@10 : fraction of points whose correct patch
+                               is ranked top-1 / top-5 / top-10.
+            MRR              : mean reciprocal rank.
+            mean_rank        : average rank (1 = perfect localization).
+
+        High R@K = the model picks the correct patch among many
+        candidates of the same scene.  R@10 >> R@1 means "correct
+        region but adjacent patches confound" (spatial smoothness).
+
+  (3) Linear CKA — DISTRIBUTIONAL / STRUCTURAL ALIGNMENT
+        Question: "does the OVERALL geometry of the 3D feature cloud
+        match the overall geometry of Qwen's patch feature cloud?"
+
+        Centered Kernel Alignment between all 3D features (across
+        scenes) and all Qwen patch features.  Scalar in [0, 1] —
+        DIMENSION-AGNOSTIC, so 1332-d backbone vs 2560-d Qwen patches
+        can be compared directly with no learned projector.
+
+        Three CKA values reported:
+          cka_aligned_proj      : patch_proj(3D)  vs Qwen 2D
+          cka_aligned_backbone  : raw  backbone(3D) vs Qwen 2D
+                                  (← the "fair" comparison; doesn't
+                                   depend on whether patch_proj is
+                                   loaded or randomly initialized)
+          cka_baseline_backbone : same but for --baseline-weight,
+                                  e.g. utonia.pth (pre-Qwen-alignment
+                                  reference) — usually ~0.30 floor.
+
+How the three signals interact
+==============================
+        | pos_bc | retrieval R@1 | CKA aligned |
+--------+--------+---------------+-------------+
+Healthy |  high  |     high      |    high     |
+Trained |   ↑    |      ↑↑       |     ↑       |  ← what we want
+Smooth  |  high  |    low R@1    |    high     |  ← Qwen merger
+        |        |    high R@10  |             |    smoothness
+Trivial |   ↓    |    chance     |     ↓       |  ← representation
+collapse|        |               |             |    collapse
+--------+--------+---------------+-------------+
+
+Calibration on this codebase (Qwen3.5-4B teacher, ScanNet):
+  cka_baseline (random PT-v3 vs Qwen)          ≈ 0.30
+  cka_aligned_backbone (H, 5 epoch, scannet)   ≈ 0.42
+  cka_aligned_proj    (H)                       ≈ 0.48
+  pos_bc (H)                                    ≈ 0.53
+  neg_bc (H)                                    ≈ 0.001 (no DC bias)
+  R@1 / R@5 / R@10 (H)                          ≈ 0.06 / 0.20 / 0.31
+  R@K chance (K≈200-256)                        ≈ 0.004 / 0.02 / 0.04
 
 Usage (cluster, B variant)
 ==========================
@@ -269,14 +317,45 @@ def _retrieval_metrics(f3, f2):
     """
     f3, f2 : (K, D) — paired features. True match for row i is column i.
     Returns dict with R@1, R@5, R@10, MRR, mean_rank.
+
+    What this measures — INTRA-SCENE FINE-GRAINED ALIGNMENT
+    -------------------------------------------------------
+    For each 3D point in a scene, look at *all K Qwen patches in the
+    same scene* and rank them by cosine similarity to the 3D feature.
+    The "correct" patch is the one the 3D point correspondence-pairs
+    with (via the offline ray-cast projection saved in
+    correspondence/<id>.npy).
+
+      Query     : f3[i]  (3D point feature, post patch_proj)
+      Candidates: f2[0], ..., f2[K-1]  (all 2D patch features in scene)
+      Correct   : f2[i]  (the patch this 3D point projects to)
+      rank_i    : how many candidates have similarity ≥ similarity to
+                  the correct patch (1 = perfect match)
+
+    Interpretation:
+      R@1  high  → model picks the EXACT correct patch top-1
+      R@5  high  → correct patch is in top-5 nearest
+      R@10 high  → correct patch in top-10
+      MRR  → averaged 1/rank: smooth fine-grained discriminability
+
+    Chance baseline (K candidates, random ordering):
+      R@1  ≈ 1/K        R@5 ≈ 5/K        R@10 ≈ 10/K
+      MRR  ≈ ln(K)/K    mean_rank ≈ K/2
+
+    Failure modes:
+      All R@K near chance  → no within-scene alignment learned
+      R@10 >> R@1          → correct REGION found but spatially-smooth
+                             features can't disambiguate adjacent
+                             patches (Qwen merger smoothness)
+      All R@K = 0          → ALL features ≈ identical (collapse)
     """
     K = f3.shape[0]
     if K < 2:
         return None  # no negatives possible
     f3n = F.normalize(f3, dim=-1)
     f2n = F.normalize(f2, dim=-1)
-    sim = f3n @ f2n.T  # (K, K)
-    # rank of true match in each row
+    sim = f3n @ f2n.T  # (K, K) — cosine sim of every 3D-2D feature pair
+    # rank of true match in each row (diagonal entry)
     diag = sim.diag().unsqueeze(1)  # (K, 1)
     rank = (sim >= diag).sum(dim=1)  # how many entries ≥ diagonal (tie-permissive)
     rank = rank.clamp(min=1)
@@ -299,12 +378,44 @@ def _linear_cka(X, Y):
     X : (N, dx) on CPU/GPU torch tensor, finite, can be different dim from Y.
     Y : (N, dy)
     Returns float in [0, 1]. Mean-centers along N first.
+
+    What this measures — DISTRIBUTIONAL / STRUCTURAL ALIGNMENT
+    ----------------------------------------------------------
+    CKA = Centered Kernel Alignment. Compares the *inter-point
+    relational structure* of X-space and Y-space:
+
+        CKA(X, Y) = ‖X̃ᵀ Ỹ‖_F² / (‖X̃ᵀ X̃‖_F · ‖Ỹᵀ Ỹ‖_F)
+                  ∈ [0, 1]
+
+    where X̃ = X - mean(X), Ỹ = Y - mean(Y).
+
+    Intuition: X̃ᵀ X̃ is the N×N inter-point similarity pattern in
+    X-space, Ỹᵀ Ỹ is the same in Y-space.  CKA asks "do these two
+    similarity patterns match?" — i.e., "if point i is close to point
+    j in X-space, is it also close in Y-space?"
+
+    Key properties:
+      - DIMENSION-AGNOSTIC: works between 1332-d and 2560-d
+      - INVARIANT to orthogonal rotation and global scaling
+      - 1.0  = perfect representational alignment
+      - 0.0  = no shared structure (independent / random)
+
+    Calibration in this codebase:
+      cka_baseline (untrained PT-v3 vs Qwen)       ≈ 0.30  (natural floor)
+      cka_aligned_backbone (H training, ~5 epoch)  ≈ 0.42
+      cka_aligned_proj (post patch_proj)           ≈ 0.48
+      Anything < 0.30 → features below natural baseline, likely collapsed
+
+    Note: CKA does NOT measure individual pair correctness — it
+    measures whether the OVERALL distribution shapes match.  A high
+    CKA + low R@1 means "scene-level structure matches but specific
+    pairs swap"; a low CKA + high R@1 is unusual but possible.
     """
     X = X - X.mean(dim=0, keepdim=True)
     Y = Y - Y.mean(dim=0, keepdim=True)
-    XtY = X.T @ Y                  # (dx, dy)
-    XtX = X.T @ X                  # (dx, dx)
-    YtY = Y.T @ Y                  # (dy, dy)
+    XtY = X.T @ Y                  # (dx, dy)  cross-modal "kernel"
+    XtX = X.T @ X                  # (dx, dx)  within-X relational kernel
+    YtY = Y.T @ Y                  # (dy, dy)  within-Y relational kernel
     num = (XtY ** 2).sum()
     den = torch.sqrt((XtX ** 2).sum() * (YtY ** 2).sum())
     return float(num / (den + 1e-12))
@@ -459,11 +570,43 @@ def main():
         base_f3_raw_cat = torch.cat(base_f3_raw_acc, dim=0)
         cka_baseline_raw = _linear_cka(base_f3_raw_cat, f2_cat)
 
-    # Additional measurement: BATCH-centered cosine (subtract the mean
-    # feature across all collected samples before computing cosine). This
-    # strips the anisotropic DC component that makes raw cosines uniformly
-    # ~0.95+ on ViT-flavoured features. The gap (pos - neg) under batch-
-    # centered cosine is a more honest discrimination metric.
+    # ----------------------------------------------------------------
+    # BATCH-CENTERED COSINE (pos_bc / neg_bc / discrim_gap_bc)
+    # ----------------------------------------------------------------
+    # What this measures — CORRESPONDENCE-LEVEL PAIR DISCRIMINATION
+    #
+    # For each correctly-paired (3D point, 2D patch) — paired meaning
+    # the correspondence file says "3D point P_i projects to 2D patch
+    # patch_i" — we ask: is f3(P_i) cosine-similar to f2(patch_i)?
+    # And is it dissimilar to f2(random other patch)?
+    #
+    #     pos_bc[i] = cos( f3̃(P_i), f2̃(patch_i) )      ← paired
+    #     neg_bc[i] = cos( f3̃(P_i), f2̃(patch_σ(i)) )   ← shuffled
+    #
+    # where f̃ = f - mean(f) ("batch-centered") strips the anisotropic
+    # DC component.  Raw ViT cosines sit at ~0.95+ for ALL pairs
+    # (Qwen-style anisotropy: every feature points roughly the same
+    # direction) — batch-centering reveals the *informative* residual.
+    #
+    # Discriminative alignment expectation:
+    #   pos_bc > 0  : paired features look alike (signal)
+    #   neg_bc ≈ 0  : random pairs look unrelated (no anisotropic bias)
+    #   discrim_gap = pos_bc - neg_bc  → how separated paired vs random
+    #
+    # Calibration in this codebase:
+    #   H (5 epoch, scannet only):  pos_bc=0.53, neg_bc=0.001 (gap 0.5)
+    #   Pre-alignment baseline:     pos_bc≈0,    neg_bc≈0  (gap 0)
+    #   Collapsed features:         pos_bc≈0,    neg_bc≈0  (gap 0,
+    #                                                       but ALL norms tiny)
+    #
+    # Distinction from CKA:
+    #   pos_bc/neg_bc test INDIVIDUAL pair correctness (each correspondence
+    #     is its own observation)
+    #   CKA tests OVERALL distribution structure (all pairs collectively)
+    #   Both can disagree: high CKA + low pos_bc means "structure matches
+    #     but pairs are swapped"; high pos_bc + low CKA means "pairs OK
+    #     but each scene's feature distribution is too unique" (rare).
+    # ----------------------------------------------------------------
     f3_bc = f3_proj_cat - f3_proj_cat.mean(dim=0, keepdim=True)
     f2_bc = f2_cat - f2_cat.mean(dim=0, keepdim=True)
     # Report per-row magnitudes so degenerate / near-zero features (which
