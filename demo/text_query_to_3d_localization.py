@@ -576,13 +576,36 @@ def main():
     print("[3D]  running Utonia backbone ...")
     feat_3d = utonia_point_features(h["backbone"], coord, color, normal, device)
     print(f"[3D]  per-point feat: {tuple(feat_3d.shape)}")
+
+    # NaN/Inf sanity right after the backbone — catch a broken (collapsed)
+    # checkpoint before it crashes the downstream cublas matmul. cublas
+    # CUBLAS_STATUS_EXECUTION_FAILED in the sgemv at sim_3d=pcn@qcn is
+    # almost always upstream NaN propagating here.
+    if not torch.isfinite(feat_3d).all():
+        n_bad = (~torch.isfinite(feat_3d)).any(dim=-1).sum().item()
+        print(f"[warn] feat_3d has {n_bad}/{feat_3d.shape[0]} non-finite rows "
+              "(checkpoint may be collapsed). Replacing with zeros.")
+        feat_3d = torch.nan_to_num(feat_3d, nan=0.0, posinf=0.0, neginf=0.0)
+
     with torch.inference_mode():
         point_common = h["patch_proj"](feat_3d.float())  # (N, 512)
 
+    if not torch.isfinite(point_common).all():
+        n_bad = (~torch.isfinite(point_common)).any(dim=-1).sum().item()
+        print(f"[warn] point_common (post patch_proj) has {n_bad} non-finite "
+              "rows. Replacing with zeros.")
+        point_common = torch.nan_to_num(point_common, nan=0.0, posinf=0.0, neginf=0.0)
+    if not torch.isfinite(query_common).all():
+        print("[warn] query_common has non-finite values. Replacing.")
+        query_common = torch.nan_to_num(query_common, nan=0.0, posinf=0.0, neginf=0.0)
+
     # --- Cosine sim 3D points vs query in common space -------------------
-    pcn = F.normalize(point_common, dim=-1)
-    qcn = F.normalize(query_common, dim=-1)
+    # Safer eps so all-zero rows produce zero vectors (cos=0) rather than
+    # NaN that would tank the cublasSgemv at sim = pcn @ qcn.
+    pcn = F.normalize(point_common.float(), dim=-1, eps=1e-6)
+    qcn = F.normalize(query_common.float(), dim=-1, eps=1e-6)
     sim_3d = (pcn @ qcn).cpu().numpy()  # (N,)
+    sim_3d = np.nan_to_num(sim_3d, nan=0.0, posinf=0.0, neginf=0.0)
     print(f"[3D]  sim range: [{sim_3d.min():.3f}, {sim_3d.max():.3f}], "
           f"mean={sim_3d.mean():.3f}")
 
