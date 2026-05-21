@@ -158,8 +158,20 @@ def build_h_modules(h_ckpt, device):
         mlp_ratio=4, qkv_bias=True, qk_scale=None,
         attn_drop=0.0, proj_drop=0.0, drop_path=0.0,
         shuffle_orders=True, pre_norm=True, enable_rpe=False,
-        enable_flash=True, upcast_attention=False, upcast_softmax=False,
-        enc_mode=True, traceable=False, mask_token=False,
+        # H training used flash + AMP-bf16.  At inference under plain
+        # fp32 we've observed device-side asserts deep inside the
+        # flash_attn varlen path (likely a cu_seqlens-shape edge case
+        # when the cloud isn't pre-cropped to image-view size).
+        # Vanilla SerializedAttention with fp32 is just as correct,
+        # only ~2x slower — fine for a one-shot demo.
+        enable_flash=False,
+        upcast_attention=False, upcast_softmax=False,
+        enc_mode=True, traceable=False,
+        # mask_token has a learned parameter in H's training save
+        # (mask_token=True at training).  Keep it on so its weight
+        # slot exists and load_state_dict finds it, but it's not used
+        # at inference (no masking).
+        mask_token=True,
         rope_base=10, shift_coords=None,
         jitter_coords=None, rescale_coords=None,
     )
