@@ -5,41 +5,43 @@ Idea
 ----
 H trained Utonia so that the 3D backbone (post patch_proj) and Qwen's
 2D vision tokens (post qwen_proj) live in the SAME 512-d common space.
-That lets us route a NL query like "냉장고" / "refrigerator" through
-Qwen's vision-language path and land it in 3D space with no per-scene
-fine-tuning:
+But to route a *text query* into that space we need a separate text→2D
+grounding step, because Qwen3.5-VL is end-to-end LM-trained, NOT
+contrastively trained à la CLIP — so cosine(text_embed, vision_patch)
+is meaningless and produces a near-uniform map ("이미지 전체적으로
+빨간 것들이 퍼져있어").
 
-  text query  ─────► Qwen tokenizer + embed_tokens ─► query_text  (2560-d)
-                                                          │
-  scene image ─────► Qwen ViT (+ merger)             ─► patch_2d   (256, 2560)
-                              │
-                              ▼
-            softmax(cos(query_text, patch_2d) / τ)  ─► attn_2d   (256,)
-                              │
-                              ▼
-              Σ attn_i · patch_2d_i                 ─► query_grounded (2560-d)
-                              │
-                              ▼              ┌─────  qwen_proj  ─► query_common (512)
-                                              │                            │
-  scene point cloud ─► Utonia backbone     ─► point_3d (N, 1332)            │
-                                                          │                │
-                                                          ▼                │
-                                                  patch_proj          ─► point_common (N, 512)
-                                                                           │
-                                                                           ▼
-                                          cosine(point_common, query_common)
-                                                          │
-                                                          ▼
-                                          3D heatmap (PLY) + top-K points
+Solution: use SigLIP (which IS contrastive) for the text→2D step, and
+use H + Qwen ViT only for the 2D→3D bridge.  Pipeline:
 
-Why the "grounded" step (image-attention weighted average)
------------------------------------------------------------
-The raw text embedding from Qwen's LLM (`embed_tokens(token_id)`) lives
-in the LLM token space — its statistical distribution differs from the
-post-merger image patch distribution that H trained `qwen_proj` on.
-By weighting the IMAGE-side patches with text-image cosine and
-averaging, we get a query vector that's in the SAME distribution as
-H's training-time 2D side — `qwen_proj` lands it cleanly in common.
+  text query ─► SigLIP text encoder ─┐
+                                     ├─► 2D heatmap on SigLIP grid
+  scene image ─► SigLIP vision tower─┘    (= clean object localization)
+                                     │
+                                     ▼ bilinear → Qwen 16x16 grid
+                                     │ threshold @ percentile → ROI mask
+                                     │
+  scene image ─► Qwen ViT + merger ─► patch_2d (16x16, 2560)
+                                     │
+                          avg(patch_2d[ROI mask])  (only object patches)
+                                     │
+                                     ▼
+                          query_grounded (2560-d, in Qwen's distribution)
+                                     │ qwen_proj  (H's trained 2560→512)
+                                     ▼
+                          query_common (512-d) ◄── H's common space
+                                                          ▲
+  scene point cloud ─► Utonia backbone ─► (N_s1, 1332)    │
+                                              │           │
+                                              ▼ patch_proj│
+                                          (N_s1, 512) ────┘
+                                              │
+                                              ▼ cosine
+                                          3D heatmap → broadcast to
+                                          original points via two
+                                          gather steps (stage-1→stage-0,
+                                          stage-0→input via GridSample
+                                          inverse).
 
 Inputs
 ------
@@ -212,6 +214,76 @@ def build_h_modules(h_ckpt, device):
     qwen_proj = qwen_proj.to(device).eval()
 
     return dict(backbone=backbone, patch_proj=patch_proj, qwen_proj=qwen_proj)
+
+
+# ---------------------------------------------------------------------------
+# SigLIP — CLIP-style contrastive text/image encoder.
+#
+# Qwen3.5-VL's vision tokens and text embed_tokens share dimensionality
+# but were NEVER trained to be cosine-similar to each other (Qwen is end-
+# to-end LM, not contrastive).  Trying cosine(text_embed, vision_patch)
+# produces a near-uniform map — the user observed exactly this ("이미지
+# 전체적으로 빨간 것들이 퍼져있어").  SigLIP IS trained contrastively,
+# so its text-image cosine cleanly localizes the query object.  We use
+# SigLIP only for the 2D grounding map; H + Qwen handle the 3D bridge.
+# ---------------------------------------------------------------------------
+def build_siglip(siglip_path, device):
+    print(f"[load] SigLIP: {siglip_path}")
+    from transformers import AutoModel, AutoProcessor
+    model = AutoModel.from_pretrained(siglip_path).to(device).eval()
+    processor = AutoProcessor.from_pretrained(siglip_path)
+    return dict(model=model, processor=processor)
+
+
+@torch.inference_mode()
+def siglip_grounding_map(siglip, image_pil, text_query, device):
+    """
+    Returns:
+        heatmap : (h_sig, w_sig) float tensor on `device`, in [0, 1]
+                  after min-max stretch.  h_sig × w_sig = SigLIP's
+                  native patch grid (e.g. 16×16 for siglip-base-patch16-256).
+        h_sig, w_sig : int
+
+    Uses SigLIP's per-patch token features (NOT the pooled output) cosine'd
+    against the text-encoded query.  This is the standard open-vocab
+    localization recipe.
+    """
+    model = siglip["model"]
+    processor = siglip["processor"]
+
+    # ---- Text side ----
+    text_inputs = processor(text=[text_query], return_tensors="pt",
+                            padding="max_length", truncation=True)
+    text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+    text_out = model.text_model(**text_inputs)
+    # SigLIP's pooled text feature is the input to the contrastive loss;
+    # it lives in the same space as image patch features projected by
+    # the vision tower's pre-final-projection layer.
+    text_feat = text_out.pooler_output if hasattr(text_out, "pooler_output") \
+                else text_out.last_hidden_state[:, 0]
+    text_feat = text_feat[0]  # (D,)
+
+    # ---- Image side: per-patch features (skip the final pooling) ----
+    img_inputs = processor(images=image_pil, return_tensors="pt")
+    img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
+    vision_out = model.vision_model(**img_inputs)
+    # last_hidden_state has shape (1, n_patches, D) — no CLS for SigLIP.
+    patch_feats = vision_out.last_hidden_state[0]  # (n_patches, D)
+    n_patches, D = patch_feats.shape
+    h_sig = w_sig = int(round(n_patches ** 0.5))
+    assert h_sig * w_sig == n_patches, \
+        f"SigLIP grid not square ({n_patches} patches); update if rectangular"
+
+    # ---- Cosine similarity per patch ----
+    text_n  = F.normalize(text_feat.float(), dim=-1, eps=1e-6)
+    patch_n = F.normalize(patch_feats.float(), dim=-1, eps=1e-6)
+    cos = (patch_n @ text_n).clamp(-1.0, 1.0)  # (n_patches,)
+
+    # Stretch [min, max] → [0, 1] for visualization-friendly range.
+    cos_min, cos_max = cos.min(), cos.max()
+    heatmap = (cos - cos_min) / (cos_max - cos_min).clamp_min(1e-9)
+    heatmap = heatmap.view(h_sig, w_sig)
+    return heatmap, h_sig, w_sig
 
 
 # ---------------------------------------------------------------------------
@@ -539,9 +611,20 @@ def parse_args():
                    help="Text query, e.g. 'refrigerator' or '냉장고'")
     p.add_argument("--h-ckpt",     required=True)
     p.add_argument("--qwen-path",  required=True)
+    p.add_argument("--siglip-path", default="google/siglip2-base-patch16-256",
+                   help="SigLIP model used for text→2D grounding.  Qwen3.5-VL "
+                        "is NOT a CLIP-style contrastive model — its text "
+                        "embed_tokens and vision patches share a dim but are "
+                        "NOT cosine-comparable, so we use SigLIP for the 2D "
+                        "side and Qwen only for the 3D-bridge query feature.")
     p.add_argument("--out-dir",    required=True)
+    p.add_argument("--siglip-thr-percentile", type=float, default=85.0,
+                   help="Percentile threshold (0..100) on the SigLIP 2D map "
+                        "to define which patches count as 'inside the object' "
+                        "for the grounded query.  Higher = stricter ROI.")
     p.add_argument("--temperature", type=float, default=0.07,
-                   help="Softmax temperature for 2D attention map.")
+                   help="Softmax temperature for legacy 2D attention map "
+                        "(unused when --siglip-path is set).")
     p.add_argument("--top-k", type=int, default=1024,
                    help="# of top-scored points to isolate in scene_top.ply")
     p.add_argument("--plot-max-points", type=int, default=80000,
@@ -581,6 +664,7 @@ def main():
     # --- Build models ------------------------------------------------------
     qwen = build_qwen(args.qwen_path, device)
     h = build_h_modules(args.h_ckpt, device)
+    siglip = build_siglip(args.siglip_path, device)
 
     # --- Image → Qwen 2D patches (post-merger, 2560-d) ---------------------
     image_tensor, image_pil = image_to_qwen_tensor(args.image_path, 512)
@@ -590,52 +674,55 @@ def main():
     print(f"[2D]  Qwen merged patches: {h_grid}x{w_grid} x {D2}")
     patch_2d_flat = patch_2d.reshape(-1, D2).float()  # (256, 2560)
 
-    # --- Text query → token embeddings → averaged 2560-d vector -----------
-    token_ids = qwen["tokenizer"](args.query, return_tensors="pt",
-                                   add_special_tokens=False).input_ids[0].to(device)
-    with torch.inference_mode():
-        text_embs = qwen["embed_tokens"](token_ids).float()  # (T, 2560)
-    text_query = text_embs.mean(dim=0)  # (2560,)
-    print(f"[text] query='{args.query}'  tokens={len(token_ids)}  "
-          f"emb.shape={tuple(text_embs.shape)}")
+    # --- SigLIP 2D grounding ---------------------------------------------
+    # The proper text→2D map.  SigLIP IS trained contrastively (cosine
+    # of text & image features is the loss), so this gives a clean
+    # localization of the query object in image-pixel space.
+    print(f"[siglip] computing text-image map for query='{args.query}' ...")
+    sig_heat, h_sig, w_sig = siglip_grounding_map(
+        siglip, image_pil, args.query, device,
+    )
+    print(f"[siglip] grid={h_sig}x{w_sig}  "
+          f"heat range=[{sig_heat.min().item():.3f}, "
+          f"{sig_heat.max().item():.3f}]")
 
-    # --- 2D attention: BATCH-CENTERED cosine(text_query, patch_2d) -------
-    # Raw cosine on Qwen post-merger tokens sits at ~0.95+ for EVERY
-    # pair because of the anisotropic DC offset that ViT-style features
-    # carry.  Subtracting the patch-batch mean from BOTH sides strips
-    # that DC component and exposes the informative residual — exactly
-    # the same trick used for pos_bc/neg_bc in eval_alignment_full.
-    # Also center text_query against the patch batch mean so query and
-    # candidates live in the same recentered space.
-    patch_mean = patch_2d_flat.mean(dim=0, keepdim=True)  # (1, 2560)
-    text_c  = text_query - patch_mean[0]                   # (2560,)
-    patch_c = patch_2d_flat - patch_mean                   # (256, 2560)
+    # Resample SigLIP heatmap onto Qwen's post-merger 16x16 grid so we
+    # can use it to weight Qwen patches.
+    qwen_heat = F.interpolate(
+        sig_heat[None, None],
+        size=(h_grid, w_grid), mode="bilinear", align_corners=False,
+    )[0, 0]  # (h_grid, w_grid)
 
-    text_n  = F.normalize(text_c,  dim=-1, eps=1e-6)
-    patch_n = F.normalize(patch_c, dim=-1, eps=1e-6)
-    cos_2d_bc = (patch_n @ text_n).clamp(-1.0, 1.0)        # (256,) in [-1,1]
+    # Threshold: only patches above the percentile contribute to the
+    # grounded query.  Avoids the "diluted everywhere" failure when we
+    # use a soft weighting over all 256 patches.
+    thr = torch.quantile(qwen_heat.flatten(), args.siglip_thr_percentile / 100)
+    mask = (qwen_heat >= thr).float()  # (h_grid, w_grid)
+    mask_flat = mask.flatten()         # (256,)
+    n_kept = int(mask_flat.sum().item())
+    print(f"[siglip] threshold @ p{args.siglip_thr_percentile:.0f} = "
+          f"{thr.item():.3f}; {n_kept}/{h_grid*w_grid} patches kept")
 
-    attn_2d = F.softmax(cos_2d_bc / args.temperature, dim=0)
-    print(f"[2D]  cos_bc range=[{cos_2d_bc.min().item():+.3f}, "
-          f"{cos_2d_bc.max().item():+.3f}]  "
-          f"attn max={attn_2d.max().item():.4f}, "
-          f"entropy={(-attn_2d * attn_2d.clamp_min(1e-9).log()).sum().item():.2f}")
-
-    # Show the centered-cosine map (more interpretable than softmax —
-    # actual similarity instead of a "where does mass concentrate").
-    # Stretch to [0, 1] for the jet overlay.
-    cm = cos_2d_bc.view(h_grid, w_grid)
-    cm_norm = (cm - cm.min()) / max((cm.max() - cm.min()).item(), 1e-9)
-    save_2d_overlay(image_pil, cm_norm,
+    # Visualization: jet heatmap of SigLIP map upsampled to image size.
+    save_2d_overlay(image_pil, qwen_heat,
                     os.path.join(args.out_dir, "attn_2d.png"))
     print(f"[save] {args.out_dir}/attn_2d.png")
 
-    # --- Grounded query feature: attention-weighted avg of 2D patches -----
-    # patch_2d_flat is already in the SAME distribution H's qwen_proj
-    # was trained against (post-merger 2560-d).  Averaging by attention
-    # picks the image-relevant subset → cleaner qwen_proj input than
-    # raw token embedding.
-    query_grounded = (attn_2d.unsqueeze(-1) * patch_2d_flat).sum(dim=0)  # (2560,)
+    # --- Grounded query feature: avg of Qwen patches INSIDE SigLIP ROI ---
+    # The Qwen patches `patch_2d_flat` live in H's qwen_proj training
+    # distribution; we just need to pick the spatially right subset.
+    # SigLIP-derived mask tells us which patches lie on the object —
+    # average ONLY those (uniform weight inside ROI, zero outside).
+    if n_kept == 0:
+        # All-low SigLIP map (shouldn't happen if query in vocab);
+        # fall back to all-patches average so the pipeline still runs.
+        print("[warn] SigLIP map empty after threshold — falling back to "
+              "uniform average over all patches.")
+        weights = torch.ones_like(mask_flat) / mask_flat.numel()
+    else:
+        weights = mask_flat / mask_flat.sum()
+    query_grounded = (weights.unsqueeze(-1) * patch_2d_flat).sum(dim=0)  # (2560,)
+
     with torch.inference_mode():
         query_common = h["qwen_proj"](query_grounded.unsqueeze(0).float())[0]  # (512,)
     print(f"[query] common.shape={tuple(query_common.shape)}, "
@@ -707,15 +794,14 @@ def main():
               coord[idx_top], np.array([[230, 30, 30]] * k, dtype=np.uint8))
     print(f"[save] {args.out_dir}/scene_top.ply  (top {k} pts)")
 
-    # (d) interactive Plotly HTML — 2D overlay + 3D heatmap together
-    # Pass the BATCH-CENTERED cosine map (cm_norm) instead of the softmax
-    # attention so the 2D side mirrors what's visible in attn_2d.png and
-    # is directly comparable in dynamic range to the 3D heatmap (both
-    # are similarity-style, not probability-style).
+    # (d) interactive Plotly HTML — 2D overlay + 3D heatmap together.
+    # Pass SigLIP's per-patch grounding map (already on Qwen's 16x16 grid
+    # and stretched to [0, 1]) so the 2D side shows a clean object-
+    # specific heat instead of a diffuse all-cells map.
     html_path = os.path.join(args.out_dir, "viz.html")
     save_plotly_combined(
         image_pil=image_pil,
-        attn_grid=cm_norm,
+        attn_grid=qwen_heat,
         coord=coord,
         color_rgb=color,
         sim_3d=sim_3d,
