@@ -302,7 +302,34 @@ def image_to_qwen_tensor(image_path, crop_size=512):
 # ---------------------------------------------------------------------------
 @torch.inference_mode()
 def utonia_point_features(backbone, coord, color, normal, device):
-    """coord/color/normal: numpy (N, 3).  Returns (N_valid, 1332) tensor."""
+    """coord/color/normal: numpy (N, 3).
+
+    Returns (feat_s1, inv_s1_to_s0, inv_grid):
+        feat_s1       : (N_s1, 1332) tensor at PT-v3 stage-1 resolution
+                        (= what H trained patch_proj against).
+        inv_s1_to_s0  : (N_s0,) long tensor — for each stage-0 (post-
+                        GridSample grid) point, the index of its
+                        owning stage-1 point.
+        inv_grid      : (N_input,) long tensor — for each ORIGINAL
+                        input point, the index of its owning stage-0
+                        grid point.
+
+    Why three return values
+    -----------------------
+    H's enc2d_upcast_level = 3, so the loss landed at stage-1 features
+    (N/8 points, 1332-d).  The OLD demo tried `grid_feat[inv_grid]`
+    to broadcast back to the original point cloud — but that indexes
+    a stage-1 tensor with a stage-0 inverse → all entries OOB →
+    silent CUDA assert that surfaces later as cublas/sgemv failure.
+
+    Correct path: compute patch_proj + similarity at stage-1 resolution,
+    then propagate down two levels via inv_s1_to_s0 then inv_grid:
+        sim_s1   (N_s1,)
+          ↓ sim_s1[inv_s1_to_s0]
+        sim_s0   (N_s0,)
+          ↓ sim_s0[inv_grid]
+        sim_orig (N_input,)
+    """
     sys.path.insert(0, "/home/user/qwen-uton")
     from utonia.structure import Point
     from utonia.transform import Compose
@@ -321,7 +348,7 @@ def utonia_point_features(backbone, coord, color, normal, device):
         "color": color.astype(np.uint8),
         "normal": normal.astype(np.float32),
     })
-    inv = pd["inverse"].clone()
+    inv_grid = pd["inverse"].clone()  # (N_input,) — maps original → grid
     for k in list(pd.keys()):
         if isinstance(pd[k], torch.Tensor):
             pd[k] = pd[k].to(device)
@@ -333,8 +360,13 @@ def utonia_point_features(backbone, coord, color, normal, device):
                                     dtype=torch.long, device=device)
     point = Point(pd)
     point = backbone(point)
-    # H's enc2d_upcast_level = 3 — pop pooling_parent 3 times so the
-    # output dim matches what patch_proj expects (1332-d).
+
+    # 3 upcasts from stage 4 (576) → stage 1 (1332-d, same level H
+    # trained patch_proj on).  After this loop `point` IS the stage-1
+    # Point, and it STILL carries its own pooling_parent (= stage 0)
+    # + pooling_inverse (= which stage-1 point each stage-0 point pools
+    # into).  We grab those WITHOUT popping (= without doing the 4th
+    # upcast that would change the feature dim from 1332 to 1386).
     for _ in range(3):
         if "pooling_parent" not in point.keys():
             break
@@ -342,8 +374,15 @@ def utonia_point_features(backbone, coord, color, normal, device):
         invp = point.pop("pooling_inverse")
         parent.feat = torch.cat([parent.feat, point.feat[invp]], dim=-1)
         point = parent
-    grid_feat = point.feat  # (N_grid, 1332)
-    return grid_feat[inv]  # (N_orig, 1332)
+
+    feat_s1 = point.feat  # (N_s1, 1332) at stage 1
+    # The remaining pooling_inverse on `point` maps stage-0 → stage-1.
+    inv_s1_to_s0 = (
+        point["pooling_inverse"].clone()
+        if "pooling_inverse" in point.keys() else
+        torch.arange(feat_s1.shape[0], device=device)
+    )
+    return feat_s1, inv_s1_to_s0.to(device), inv_grid.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -560,16 +599,34 @@ def main():
     print(f"[text] query='{args.query}'  tokens={len(token_ids)}  "
           f"emb.shape={tuple(text_embs.shape)}")
 
-    # --- 2D attention: cosine(text_query, patch_2d) → softmax -------------
-    text_n = F.normalize(text_query, dim=-1)
-    patch_n = F.normalize(patch_2d_flat, dim=-1)
-    cos_2d = patch_n @ text_n  # (256,)
-    attn_2d = F.softmax(cos_2d / args.temperature, dim=0)
-    print(f"[2D]  attn max={attn_2d.max().item():.4f}, "
-          f"min={attn_2d.min().item():.4e}, "
-          f"entropy={(-attn_2d * (attn_2d.clamp_min(1e-9)).log()).sum().item():.2f}")
-    save_2d_overlay(image_pil,
-                    attn_2d.view(h_grid, w_grid),
+    # --- 2D attention: BATCH-CENTERED cosine(text_query, patch_2d) -------
+    # Raw cosine on Qwen post-merger tokens sits at ~0.95+ for EVERY
+    # pair because of the anisotropic DC offset that ViT-style features
+    # carry.  Subtracting the patch-batch mean from BOTH sides strips
+    # that DC component and exposes the informative residual — exactly
+    # the same trick used for pos_bc/neg_bc in eval_alignment_full.
+    # Also center text_query against the patch batch mean so query and
+    # candidates live in the same recentered space.
+    patch_mean = patch_2d_flat.mean(dim=0, keepdim=True)  # (1, 2560)
+    text_c  = text_query - patch_mean[0]                   # (2560,)
+    patch_c = patch_2d_flat - patch_mean                   # (256, 2560)
+
+    text_n  = F.normalize(text_c,  dim=-1, eps=1e-6)
+    patch_n = F.normalize(patch_c, dim=-1, eps=1e-6)
+    cos_2d_bc = (patch_n @ text_n).clamp(-1.0, 1.0)        # (256,) in [-1,1]
+
+    attn_2d = F.softmax(cos_2d_bc / args.temperature, dim=0)
+    print(f"[2D]  cos_bc range=[{cos_2d_bc.min().item():+.3f}, "
+          f"{cos_2d_bc.max().item():+.3f}]  "
+          f"attn max={attn_2d.max().item():.4f}, "
+          f"entropy={(-attn_2d * attn_2d.clamp_min(1e-9).log()).sum().item():.2f}")
+
+    # Show the centered-cosine map (more interpretable than softmax —
+    # actual similarity instead of a "where does mass concentrate").
+    # Stretch to [0, 1] for the jet overlay.
+    cm = cos_2d_bc.view(h_grid, w_grid)
+    cm_norm = (cm - cm.min()) / max((cm.max() - cm.min()).item(), 1e-9)
+    save_2d_overlay(image_pil, cm_norm,
                     os.path.join(args.out_dir, "attn_2d.png"))
     print(f"[save] {args.out_dir}/attn_2d.png")
 
@@ -586,40 +643,51 @@ def main():
 
     # --- Scene → Utonia → patch_proj → 512-d common -----------------------
     print("[3D]  running Utonia backbone ...")
-    feat_3d = utonia_point_features(h["backbone"], coord, color, normal, device)
-    print(f"[3D]  per-point feat: {tuple(feat_3d.shape)}")
+    feat_s1, inv_s1_to_s0, inv_grid = utonia_point_features(
+        h["backbone"], coord, color, normal, device,
+    )
+    print(f"[3D]  stage-1 feat: {tuple(feat_s1.shape)}   "
+          f"(stage-0 N={inv_s1_to_s0.shape[0]}, orig N={inv_grid.shape[0]})")
 
-    # NaN/Inf sanity right after the backbone — catch a broken (collapsed)
-    # checkpoint before it crashes the downstream cublas matmul. cublas
-    # CUBLAS_STATUS_EXECUTION_FAILED in the sgemv at sim_3d=pcn@qcn is
-    # almost always upstream NaN propagating here.
-    if not torch.isfinite(feat_3d).all():
-        n_bad = (~torch.isfinite(feat_3d)).any(dim=-1).sum().item()
-        print(f"[warn] feat_3d has {n_bad}/{feat_3d.shape[0]} non-finite rows "
+    # NaN sanity at stage 1, BEFORE any further CUDA op — catches a
+    # collapsed checkpoint here rather than letting the bad values
+    # propagate into a cublas matmul that fails with a misleading
+    # CUBLAS_STATUS_EXECUTION_FAILED.
+    if not torch.isfinite(feat_s1).all():
+        n_bad = (~torch.isfinite(feat_s1)).any(dim=-1).sum().item()
+        print(f"[warn] feat_s1 has {n_bad}/{feat_s1.shape[0]} non-finite rows "
               "(checkpoint may be collapsed). Replacing with zeros.")
-        feat_3d = torch.nan_to_num(feat_3d, nan=0.0, posinf=0.0, neginf=0.0)
+        feat_s1 = torch.nan_to_num(feat_s1, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # patch_proj at stage 1 (where H trained it: 1332 → 512 common)
     with torch.inference_mode():
-        point_common = h["patch_proj"](feat_3d.float())  # (N, 512)
+        point_common_s1 = h["patch_proj"](feat_s1.float())  # (N_s1, 512)
 
-    if not torch.isfinite(point_common).all():
-        n_bad = (~torch.isfinite(point_common)).any(dim=-1).sum().item()
-        print(f"[warn] point_common (post patch_proj) has {n_bad} non-finite "
-              "rows. Replacing with zeros.")
-        point_common = torch.nan_to_num(point_common, nan=0.0, posinf=0.0, neginf=0.0)
+    if not torch.isfinite(point_common_s1).all():
+        n_bad = (~torch.isfinite(point_common_s1)).any(dim=-1).sum().item()
+        print(f"[warn] point_common_s1 has {n_bad} non-finite rows. "
+              "Replacing with zeros.")
+        point_common_s1 = torch.nan_to_num(point_common_s1, nan=0.0,
+                                            posinf=0.0, neginf=0.0)
     if not torch.isfinite(query_common).all():
         print("[warn] query_common has non-finite values. Replacing.")
-        query_common = torch.nan_to_num(query_common, nan=0.0, posinf=0.0, neginf=0.0)
+        query_common = torch.nan_to_num(query_common, nan=0.0,
+                                         posinf=0.0, neginf=0.0)
 
-    # --- Cosine sim 3D points vs query in common space -------------------
-    # Safer eps so all-zero rows produce zero vectors (cos=0) rather than
-    # NaN that would tank the cublasSgemv at sim = pcn @ qcn.
-    pcn = F.normalize(point_common.float(), dim=-1, eps=1e-6)
+    # --- Cosine sim at stage-1 resolution --------------------------------
+    pcn = F.normalize(point_common_s1.float(), dim=-1, eps=1e-6)
     qcn = F.normalize(query_common.float(), dim=-1, eps=1e-6)
-    sim_3d = (pcn @ qcn).cpu().numpy()  # (N,)
-    sim_3d = np.nan_to_num(sim_3d, nan=0.0, posinf=0.0, neginf=0.0)
+    sim_s1 = (pcn @ qcn)  # (N_s1,)
+    sim_s1 = torch.nan_to_num(sim_s1, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Broadcast stage-1 sim → stage-0 grid via the stage-0→stage-1
+    # pooling_inverse → original input points via the GridSample
+    # inverse.  At each step we just gather, so values stay in [-1, 1].
+    sim_s0 = sim_s1[inv_s1_to_s0]            # (N_s0,)
+    sim_orig = sim_s0[inv_grid].cpu().numpy() # (N_input,)
+    sim_3d = sim_orig
     print(f"[3D]  sim range: [{sim_3d.min():.3f}, {sim_3d.max():.3f}], "
-          f"mean={sim_3d.mean():.3f}")
+          f"mean={sim_3d.mean():.3f}, std={sim_3d.std():.3f}")
 
     # --- Render PLYs ------------------------------------------------------
     # (a) rgb for orientation
@@ -640,10 +708,14 @@ def main():
     print(f"[save] {args.out_dir}/scene_top.ply  (top {k} pts)")
 
     # (d) interactive Plotly HTML — 2D overlay + 3D heatmap together
+    # Pass the BATCH-CENTERED cosine map (cm_norm) instead of the softmax
+    # attention so the 2D side mirrors what's visible in attn_2d.png and
+    # is directly comparable in dynamic range to the 3D heatmap (both
+    # are similarity-style, not probability-style).
     html_path = os.path.join(args.out_dir, "viz.html")
     save_plotly_combined(
         image_pil=image_pil,
-        attn_grid=attn_2d.view(h_grid, w_grid),
+        attn_grid=cm_norm,
         coord=coord,
         color_rgb=color,
         sim_3d=sim_3d,
