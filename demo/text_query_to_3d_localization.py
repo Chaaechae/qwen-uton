@@ -95,6 +95,18 @@ Pose-based 2D→3D frustum filtering (optional, very effective)
                       the two and feature cosine only has to resolve
                       depth ambiguity within one ray bundle.
 
+--estimate-pose       Recover (K_guess, T_c2w) FROM THE IMAGE ITSELF
+                      via feature-PnP, no ScanNet pose required.  For
+                      each Qwen 2D patch, find top-K best-matching
+                      Utonia 3D points through the same H-aligned 512-d
+                      common space, then solvePnPRansac(2D centers, 3D
+                      world coords).  Lets you run the demo on
+                      arbitrary photos.  Quality of recovered pose =
+                      quality of H/I feature alignment — log prints
+                      RANSAC inlier ratio so you can judge.  Implies
+                      --use-pose.  Use --fov-deg to set the intrinsic
+                      FOV guess (default 70°, fits most phones).
+
 Outputs (suffixed by --ground-mode for side-by-side comparison)
 ---------------------------------------------------------------
   <out>/scene_rgb.ply                 Original-color point cloud (shared).
@@ -127,6 +139,12 @@ Usage
       ...same args... \\
       --ground-mode qwen-bbox \\
       --use-pose
+
+  # Arbitrary image (no ScanNet pose) — pose recovered via feature-PnP:
+  python demo/text_query_to_3d_localization.py \\
+      ...same args... \\
+      --ground-mode qwen-bbox \\
+      --estimate-pose --fov-deg 70
 """
 
 import argparse
@@ -759,13 +777,19 @@ def utonia_point_features(backbone, coord, color, normal, device):
         point = parent
 
     feat_s1 = point.feat  # (N_s1, 1332) at stage 1
+    coord_s1 = point.coord  # (N_s1, 3) world-frame stage-1 coords
     # The remaining pooling_inverse on `point` maps stage-0 → stage-1.
     inv_s1_to_s0 = (
         point["pooling_inverse"].clone()
         if "pooling_inverse" in point.keys() else
         torch.arange(feat_s1.shape[0], device=device)
     )
-    return feat_s1, inv_s1_to_s0.to(device), inv_grid.to(device)
+    return (
+        feat_s1,
+        inv_s1_to_s0.to(device),
+        inv_grid.to(device),
+        coord_s1.to(device),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +921,111 @@ def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15):
         in_frustum = in_frustum & depth_ok
 
     return in_frustum, n_in_frustum, n_depth_dropped
+
+
+# ---------------------------------------------------------------------------
+# Pose estimation via feature-PnP — the same H-aligned 512-d space that
+# powers the cosine localization is ALSO sufficient to recover the
+# camera pose when none is given.  For each Qwen 2D patch we find its
+# best-matching Utonia 3D point via the common space, build (3D world ↔
+# 2D pixel) correspondences, and solve PnP-RANSAC.  This turns arbitrary
+# images (phone photos, web images) into 3D-localizable inputs without
+# any external pose source.
+#
+# Caveats
+# -------
+# - Needs an intrinsic guess (K).  --fov-deg gives a default for a square
+#   image; 60-80° covers most phones / ScanNet's StructureSensor.
+# - Quality of recovered pose = quality of the H/I alignment.  If
+#   feature matches are noisy, RANSAC's inlier set will be small.
+#   Always print and check the inlier ratio.
+# - PnP solves the GEOMETRIC inverse problem.  It returns ONE pose;
+#   if features are too ambiguous (e.g. a symmetric room), the solver
+#   may converge to a mirrored/rotated solution.
+# ---------------------------------------------------------------------------
+def make_default_intrinsic(image_W, image_H, fov_deg=70.0):
+    """Build a centered pinhole K assuming horizontal-FOV = fov_deg.
+    f is computed from the LONGER side so wide aspect ratios don't
+    under-estimate focal length.
+    """
+    fov_rad = float(np.deg2rad(fov_deg))
+    f = max(image_W, image_H) / (2.0 * np.tan(fov_rad / 2.0))
+    K = np.array([
+        [f, 0.0, image_W / 2.0],
+        [0.0, f, image_H / 2.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    return K
+
+
+def patch_grid_pixel_centers(h_grid, w_grid, image_W, image_H):
+    """(h_grid * w_grid, 2) — pixel coords of each cell's center when an
+    image of size image_W × image_H is divided into a h_grid × w_grid
+    regular grid (row-major flatten matching qwen_vision_full_merger)."""
+    cell_w = image_W / w_grid
+    cell_h = image_H / h_grid
+    rs = np.arange(h_grid, dtype=np.float32) + 0.5
+    cs = np.arange(w_grid, dtype=np.float32) + 0.5
+    rr, cc = np.meshgrid(rs, cs, indexing="ij")
+    u = cc.flatten() * cell_w
+    v = rr.flatten() * cell_h
+    return np.stack([u, v], axis=-1).astype(np.float32)
+
+
+def estimate_pose_via_feature_pnp(
+    patch_features_512, patch_centers_uv, K_guess,
+    point_features_512, coord_3d,
+    top_k=3, ransac_reproj_err=8.0, max_iter=2000,
+):
+    """Feature-based PnP-RANSAC pose estimation.
+
+    patch_features_512 : (N_patches, 512) torch tensor (post-qwen_proj)
+    patch_centers_uv   : (N_patches, 2) np.float32 pixel coords of cell
+                         centers in the image
+    K_guess            : (3, 3) np.float32 intrinsic guess
+    point_features_512 : (N_pts, 512) torch tensor (post-patch_proj)
+    coord_3d           : (N_pts, 3) np.float32 world coords matching
+                         point_features_512 row-by-row
+    top_k              : number of 3D candidates per 2D patch fed to
+                         RANSAC (more = more outliers but more chances
+                         of a good correspondence surviving the random
+                         minimal-sample picks)
+
+    Returns (T_c2w_4x4, inliers, n_correspondences) or None on failure.
+    """
+    import cv2
+
+    p2 = F.normalize(patch_features_512.float(), dim=-1)  # (N_p, 512)
+    p3 = F.normalize(point_features_512.float(), dim=-1)  # (N, 512)
+    sim = p2 @ p3.T  # (N_p, N)
+    top_sims, top_idx = sim.topk(top_k, dim=-1)  # (N_p, k)
+
+    N_p = patch_centers_uv.shape[0]
+    obj_pts = []
+    img_pts = []
+    for i in range(N_p):
+        for j in range(top_k):
+            obj_pts.append(coord_3d[top_idx[i, j].item()])
+            img_pts.append(patch_centers_uv[i])
+    obj_pts = np.asarray(obj_pts, dtype=np.float32)
+    img_pts = np.asarray(img_pts, dtype=np.float32)
+
+    success, rvec, tvec, inliers = cv2.solvePnPRansac(
+        obj_pts, img_pts, K_guess, distCoeffs=None,
+        iterationsCount=max_iter,
+        reprojectionError=ransac_reproj_err,
+        confidence=0.999,
+        flags=cv2.SOLVEPNP_EPNP,
+    )
+    if not success or inliers is None or len(inliers) < 6:
+        return None
+
+    R, _ = cv2.Rodrigues(rvec)
+    T_w2c = np.eye(4, dtype=np.float32)
+    T_w2c[:3, :3] = R
+    T_w2c[:3, 3] = tvec.flatten()
+    T_c2w = np.linalg.inv(T_w2c)
+    return T_c2w, int(len(inliers)), int(N_p * top_k)
 
 
 def bbox_from_grid_mask(mask_2d, h_grid, w_grid):
@@ -1323,6 +1452,32 @@ def parse_args():
                    help="Override path to intrinsic_depth.txt.")
     p.add_argument("--depth-path", default=None,
                    help="Override path to <frame>.png depth map.")
+    p.add_argument(
+        "--estimate-pose", action="store_true", default=False,
+        help="Estimate camera pose from the image using feature-PnP "
+             "instead of loading from ScanNet sibling files.  For each "
+             "Qwen 2D patch, find its top-K best-matching Utonia 3D "
+             "points (via the same H-aligned 512-d common space we use "
+             "for cosine localization), build 2D↔3D correspondences, "
+             "solve PnP-RANSAC for (R, t).  Lets you run the demo on "
+             "ARBITRARY images (phone photos, web shots) — no ScanNet "
+             "pose required.  Implies --use-pose.  Needs cv2 (already "
+             "a project dep).")
+    p.add_argument(
+        "--fov-deg", type=float, default=70.0,
+        help="Approximate horizontal FOV in degrees for the intrinsic "
+             "guess used by --estimate-pose.  ScanNet's StructureSensor "
+             "≈58, most phone wide-angle ≈70-80, ultra-wide ≈100.")
+    p.add_argument(
+        "--pnp-top-k", type=int, default=3,
+        help="Per Qwen 2D patch, build correspondences with the top-K "
+             "3D points by feature cosine.  Higher = more outliers but "
+             "more chances of finding a good RANSAC inlier set.")
+    p.add_argument(
+        "--pnp-reproj-err", type=float, default=8.0,
+        help="RANSAC reprojection error threshold in pixels.  "
+             "Correspondences whose projected 3D point lands within "
+             "this distance of the 2D patch center count as inliers.")
     p.add_argument("--plot-max-points", type=int, default=80000,
                    help="Subsample cap for the Plotly 3D scatter "
                         "(browser perf gets bad past ~150k).")
@@ -1376,6 +1531,36 @@ def main():
     print(f"[2D]  Qwen merged patches: {h_grid}x{w_grid} x {D2}")
     patch_2d_flat = patch_2d.reshape(-1, D2).float()  # (256, 2560)
 
+    # --- Utonia 3D features (run NOW so pose estimation has them) --------
+    # Moved up from later in the flow: --estimate-pose needs both
+    # patch_common_all (Qwen patches → 512-d) and point_common_s1 +
+    # coord_s1 (3D points → 512-d, with coords) to run feature-PnP
+    # BEFORE frustum filtering.  Downstream cosine scoring just reuses
+    # the already-computed point_common_s1 — no extra work.
+    print("[3D]  running Utonia backbone ...")
+    feat_s1, inv_s1_to_s0, inv_grid, coord_s1 = utonia_point_features(
+        h["backbone"], coord, color, normal, device,
+    )
+    print(f"[3D]  stage-1 feat: {tuple(feat_s1.shape)}   "
+          f"(stage-0 N={inv_s1_to_s0.shape[0]}, orig N={inv_grid.shape[0]})")
+
+    if not torch.isfinite(feat_s1).all():
+        n_bad = (~torch.isfinite(feat_s1)).any(dim=-1).sum().item()
+        print(f"[warn] feat_s1 has {n_bad}/{feat_s1.shape[0]} non-finite rows; "
+              "replacing with zeros.")
+        feat_s1 = torch.nan_to_num(feat_s1, nan=0.0, posinf=0.0, neginf=0.0)
+
+    with torch.inference_mode():
+        point_common_s1 = h["patch_proj"](feat_s1.float())  # (N_s1, 512)
+        patch_common_all = h["qwen_proj"](patch_2d_flat)    # (256, 512)
+    if not torch.isfinite(point_common_s1).all():
+        n_bad = (~torch.isfinite(point_common_s1)).any(dim=-1).sum().item()
+        print(f"[warn] point_common_s1 has {n_bad} non-finite rows; "
+              "replacing with zeros.")
+        point_common_s1 = torch.nan_to_num(
+            point_common_s1, nan=0.0, posinf=0.0, neginf=0.0,
+        )
+
     # --- Build the 2D ROI mask from the chosen grounding source -----------
     # Two paths, same downstream:
     #   siglip   : external contrastive model gives a soft heatmap →
@@ -1424,15 +1609,16 @@ def main():
           f"  sum={mask_flat.sum().item():.2f}")
 
     # --- Optional: pose-based bbox-to-frustum geometric mask -------------
-    # If --use-pose, load camera + (optional) depth, project the 2D bbox
-    # into a 3D frustum, and prepare a hard mask.  The mask is applied to
-    # sim_3d *after* KNN smoothing so the smoothing step itself isn't
-    # contaminated by clamped values.
+    # Two pose sources:
+    #   --use-pose      : load (K, T) and depth from ScanNet sibling files
+    #   --estimate-pose : recover (K_guess, T) via feature-PnP using
+    #                     patch_common_all ↔ point_common_s1 + coord_s1.
+    #                     Sets depth=None (occlusion check skipped).
+    # The frustum_mask itself is applied to sim_3d *after* KNN smoothing
+    # so the smoothing step isn't contaminated by clamped values.
     frustum_mask = None
-    if args.use_pose:
-        # SigLIP mode produces a soft heatmap with no canonical bbox;
-        # derive one from the threshold mask so frustum filtering still
-        # works in that mode.
+    cam = None
+    if args.use_pose or args.estimate_pose:
         bbox_for_frustum = bbox_norm
         if bbox_for_frustum is None:
             bbox_for_frustum = bbox_from_grid_mask(mask, h_grid, w_grid)
@@ -1443,7 +1629,55 @@ def main():
 
         if bbox_for_frustum is None:
             print("[pose] no bbox available; skipping frustum filter.")
+        elif args.estimate_pose:
+            # --- feature-PnP pose recovery -----------------------------
+            img_W, img_H = image_pil.size
+            K_guess = make_default_intrinsic(img_W, img_H, args.fov_deg)
+            # Patch centers in image-pixel coords: the 16×16 grid spans
+            # the 512×512 resize that fed qwen_vision_full_merger.  Use
+            # 512×512 as the centers' image size (NOT img_W × img_H) so
+            # they match the geometry that produced patch_2d, then
+            # rescale K to that resolution.
+            K_for_pnp = make_default_intrinsic(512, 512, args.fov_deg)
+            patch_centers = patch_grid_pixel_centers(
+                h_grid, w_grid, image_W=512, image_H=512,
+            )
+            print(f"[pose-est] feature-PnP with fov={args.fov_deg:.1f}° "
+                  f"top-k={args.pnp_top_k} reproj_err={args.pnp_reproj_err}px")
+            try:
+                pnp_out = estimate_pose_via_feature_pnp(
+                    patch_common_all,
+                    patch_centers,
+                    K_for_pnp,
+                    point_common_s1,
+                    coord_s1.detach().cpu().numpy().astype(np.float32),
+                    top_k=args.pnp_top_k,
+                    ransac_reproj_err=args.pnp_reproj_err,
+                )
+            except Exception as e:
+                print(f"[pose-est] PnP raised: {e}")
+                pnp_out = None
+            if pnp_out is None:
+                print("[pose-est] PnP failed (too few inliers / bad "
+                      "features); continuing WITHOUT frustum filter.")
+            else:
+                T_c2w, n_inliers, n_pairs = pnp_out
+                print(f"[pose-est] success  "
+                      f"inliers={n_inliers}/{n_pairs} "
+                      f"({100*n_inliers/n_pairs:.1f}%)  "
+                      f"t=({T_c2w[0,3]:+.2f},{T_c2w[1,3]:+.2f},"
+                      f"{T_c2w[2,3]:+.2f})")
+                # Treat the 512-px K as our color intrinsic since the
+                # 2D bbox lives in normalized [0,1] anyway — the
+                # bbox_to_frustum_mask multiplies by H_color/W_color.
+                cam = dict(
+                    K_color=K_for_pnp, K_depth=K_for_pnp,
+                    T_c2w=T_c2w,
+                    H_color=512, W_color=512,
+                    depth=None, H_depth=None, W_depth=None,
+                )
         else:
+            # --- load from ScanNet siblings ----------------------------
             try:
                 cam = load_camera_for_image(
                     args.image_path,
@@ -1460,23 +1694,28 @@ def main():
                       f"image={cam['W_color']}x{cam['H_color']}  "
                       f"K_color[fx,fy]=({cam['K_color'][0,0]:.1f},"
                       f"{cam['K_color'][1,1]:.1f})  {depth_note}")
-                frustum_mask, n_geo, n_dropped = bbox_to_frustum_mask(
-                    coord, bbox_for_frustum, cam,
-                    depth_tol=args.depth_tol,
-                )
-                n_total = len(coord)
-                n_kept_pose = int(frustum_mask.sum())
-                if args.depth_tol > 0 and cam.get("depth") is not None:
-                    print(f"[pose] frustum: {n_geo}/{n_total} inside bbox, "
-                          f"{n_dropped} dropped by depth occlusion, "
-                          f"{n_kept_pose} kept "
-                          f"({100*n_kept_pose/n_total:.2f}% of scene)")
-                else:
-                    print(f"[pose] frustum: {n_kept_pose}/{n_total} inside "
-                          f"bbox ({100*n_kept_pose/n_total:.2f}% of scene)")
             except (FileNotFoundError, RuntimeError) as e:
                 print(f"[pose] failed: {e}")
                 print("[pose] continuing WITHOUT frustum filter.")
+
+        if cam is not None:
+            frustum_mask, n_geo, n_dropped = bbox_to_frustum_mask(
+                coord, bbox_for_frustum, cam,
+                depth_tol=args.depth_tol,
+            )
+            n_total = len(coord)
+            n_kept_pose = int(frustum_mask.sum())
+            if args.depth_tol > 0 and cam.get("depth") is not None:
+                print(f"[pose] frustum: {n_geo}/{n_total} inside bbox, "
+                      f"{n_dropped} dropped by depth occlusion, "
+                      f"{n_kept_pose} kept "
+                      f"({100*n_kept_pose/n_total:.2f}% of scene)")
+            else:
+                print(f"[pose] frustum: {n_kept_pose}/{n_total} inside "
+                      f"bbox ({100*n_kept_pose/n_total:.2f}% of scene)")
+            if n_kept_pose == 0:
+                print("[pose] EMPTY frustum — pose probably wrong; "
+                      "ignoring frustum filter.")
                 frustum_mask = None
 
     # Output filename suffix → both modes can coexist in one out-dir for
@@ -1551,34 +1790,8 @@ def main():
           + (f"  neg.norm={query_neg_common.norm().item():.3f}"
              if query_neg_common is not None else "  (no bg-subtract)"))
 
-    # --- Scene → Utonia → patch_proj → 512-d common -----------------------
-    print("[3D]  running Utonia backbone ...")
-    feat_s1, inv_s1_to_s0, inv_grid = utonia_point_features(
-        h["backbone"], coord, color, normal, device,
-    )
-    print(f"[3D]  stage-1 feat: {tuple(feat_s1.shape)}   "
-          f"(stage-0 N={inv_s1_to_s0.shape[0]}, orig N={inv_grid.shape[0]})")
-
-    # NaN sanity at stage 1, BEFORE any further CUDA op — catches a
-    # collapsed checkpoint here rather than letting the bad values
-    # propagate into a cublas matmul that fails with a misleading
-    # CUBLAS_STATUS_EXECUTION_FAILED.
-    if not torch.isfinite(feat_s1).all():
-        n_bad = (~torch.isfinite(feat_s1)).any(dim=-1).sum().item()
-        print(f"[warn] feat_s1 has {n_bad}/{feat_s1.shape[0]} non-finite rows "
-              "(checkpoint may be collapsed). Replacing with zeros.")
-        feat_s1 = torch.nan_to_num(feat_s1, nan=0.0, posinf=0.0, neginf=0.0)
-
-    # patch_proj at stage 1 (where H trained it: 1332 → 512 common)
-    with torch.inference_mode():
-        point_common_s1 = h["patch_proj"](feat_s1.float())  # (N_s1, 512)
-
-    if not torch.isfinite(point_common_s1).all():
-        n_bad = (~torch.isfinite(point_common_s1)).any(dim=-1).sum().item()
-        print(f"[warn] point_common_s1 has {n_bad} non-finite rows. "
-              "Replacing with zeros.")
-        point_common_s1 = torch.nan_to_num(point_common_s1, nan=0.0,
-                                            posinf=0.0, neginf=0.0)
+    # (feat_s1, coord_s1, point_common_s1 already computed earlier so
+    # pose estimation could use them.)
     if not torch.isfinite(query_common).all():
         print("[warn] query_common has non-finite values. Replacing.")
         query_common = torch.nan_to_num(query_common, nan=0.0,
