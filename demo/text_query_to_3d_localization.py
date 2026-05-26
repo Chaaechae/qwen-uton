@@ -1014,7 +1014,51 @@ def project_world_to_pixel(coord, K, T_c2w, invert_pose=False):
     return u, v, z
 
 
+def bbox_object_depth_range(cam, bbox_norm,
+                              q_lo=15.0, q_hi=85.0,
+                              margin_front=0.15, margin_back=0.60):
+    """Estimate the object's depth range from the depth map inside the bbox.
+
+    Why this exists
+    ---------------
+    A 2D bbox + camera pose makes a 3D frustum — a cone that has no
+    depth bound.  Points BEHIND or IN FRONT OF the object along the
+    same rays end up inside the frustum (e.g. floor visible at the
+    bottom of the bbox, or wall visible above the object).  Even the
+    per-pixel depth-occlusion test doesn't help here, because the
+    floor IS what's visible at those pixels — so its depth matches.
+
+    Fix: sample depth values INSIDE the bbox region of the depth map.
+    The robust [q_lo, q_hi] percentile gives the foreground surface's
+    depth range.  Extend by `margin_back` to allow the object to have
+    thickness, and by `margin_front` to absorb sensor noise.  Points
+    with camera-z outside this slab are then dropped.
+
+    Returns (z_min, z_max) in meters, or None if no depth available.
+    """
+    if cam.get("depth") is None:
+        return None
+    x1, y1, x2, y2 = bbox_norm
+    H_d, W_d = cam["H_depth"], cam["W_depth"]
+    u1 = max(0, int(x1 * W_d))
+    u2 = min(W_d, int(x2 * W_d))
+    v1 = max(0, int(y1 * H_d))
+    v2 = min(H_d, int(y2 * H_d))
+    if u2 <= u1 or v2 <= v1:
+        return None
+    depth_patch = cam["depth"][v1:v2, u1:u2]
+    valid = depth_patch > 0.1
+    if int(valid.sum()) < 16:
+        return None
+    valid_depths = depth_patch[valid]
+    z_lo = float(np.percentile(valid_depths, q_lo))
+    z_hi = float(np.percentile(valid_depths, q_hi))
+    return (z_lo - margin_front, z_hi + margin_back)
+
+
 def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15,
+                          depth_slab_back=0.60, depth_slab_front=0.15,
+                          use_depth_slab=True,
                           invert_pose=False, diag=True):
     """Mask (N,) of 3D points whose projection lands inside the 2D bbox
     (and matches the depth map if depth_tol > 0 and depth is available).
@@ -1108,10 +1152,13 @@ def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15,
     mask = in_bbox.copy()
     n_in_frustum = int(mask.sum())
     n_depth_dropped = 0
+    n_slab_dropped = 0
+    slab = None
 
     if depth_tol > 0 and cam.get("depth") is not None:
-        # Project to depth-image coords (may differ in resolution from
-        # color), sample depth, compare against camera-z.
+        # Per-pixel occlusion: project each scene point, sample depth at
+        # its (u, v), check |camera_z - depth_at_uv| <= tol.  Removes
+        # points hidden behind closer surfaces.
         ud, vd, _ = project_world_to_pixel(
             coord, cam["K_depth"], cam["T_c2w"], invert_pose=invert_pose,
         )
@@ -1125,8 +1172,38 @@ def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15,
         n_depth_dropped = int((mask & ~depth_ok).sum())
         mask = mask & depth_ok
 
+    if use_depth_slab and cam.get("depth") is not None:
+        # Depth-slab: estimate the object's depth band from the bbox
+        # region of the depth map, then keep only points whose
+        # camera_z falls inside that band.  This eliminates floor /
+        # background that the per-pixel occlusion test KEEPS (because
+        # those distant surfaces ARE what's visible at the bbox's
+        # boundary pixels, so their depth happens to match the map).
+        slab = bbox_object_depth_range(
+            cam, bbox_norm,
+            margin_front=depth_slab_front,
+            margin_back=depth_slab_back,
+        )
+        if slab is not None:
+            z_min, z_max = slab
+            in_slab = (z >= z_min) & (z <= z_max)
+            n_slab_dropped = int((mask & ~in_slab).sum())
+            mask = mask & in_slab
+            if diag:
+                print(f"[pose-diag] depth slab from bbox: "
+                      f"[{z_min:.2f}m, {z_max:.2f}m]  "
+                      f"({n_slab_dropped} extra dropped)")
+        elif diag:
+            print("[pose-diag] depth slab: bbox region has no valid "
+                  "depth pixels — slab disabled.")
+
     stages = dict(in_front=in_front, in_image=in_image, in_bbox=in_bbox)
-    return mask, n_in_frustum, n_depth_dropped, stages
+    diag_info = dict(
+        n_depth_dropped=n_depth_dropped,
+        n_slab_dropped=n_slab_dropped,
+        depth_slab=slab,
+    )
+    return mask, n_in_frustum, n_depth_dropped, stages, diag_info
 
 
 # ---------------------------------------------------------------------------
@@ -1659,6 +1736,30 @@ def parse_args():
     p.add_argument("--depth-path", default=None,
                    help="Override path to <frame>.png depth map.")
     p.add_argument(
+        "--depth-slab", dest="depth_slab",
+        action="store_true", default=True,
+        help="In addition to per-pixel occlusion, estimate the object's "
+             "depth band from the depth-map region inside the bbox and "
+             "keep only points whose camera-z falls within that band. "
+             "Fixes the 'frustum extends to the floor / wall' issue: "
+             "those distant surfaces ARE visible at bbox-edge pixels, so "
+             "the per-pixel occlusion test accepts them, but they have "
+             "very different depth from the actual object.  Default on; "
+             "needs depth map.  Disable with --no-depth-slab.")
+    p.add_argument(
+        "--no-depth-slab", dest="depth_slab", action="store_false",
+        help="Disable bbox-region depth-slab filtering (per-pixel "
+             "occlusion still runs if --depth-tol > 0).")
+    p.add_argument(
+        "--depth-slab-front", type=float, default=0.15,
+        help="Meters of tolerance IN FRONT of the bbox-estimated "
+             "foreground depth (absorbs depth sensor noise).")
+    p.add_argument(
+        "--depth-slab-back", type=float, default=0.60,
+        help="Meters of object thickness allowed BEHIND the bbox-"
+             "estimated foreground depth.  Larger objects (couch) "
+             "need bigger value; thin objects (poster) need smaller.")
+    p.add_argument(
         "--invert-pose", action="store_true", default=False,
         help="Interpret the pose .txt matrix as world-to-camera instead "
              "of camera-to-world.  Standard ScanNet is cam-to-world; "
@@ -1917,18 +2018,27 @@ def main():
                 print("[pose] continuing WITHOUT frustum filter.")
 
         if cam is not None:
-            frustum_mask, n_geo, n_dropped, stages = bbox_to_frustum_mask(
-                coord, bbox_for_frustum, cam,
-                depth_tol=args.depth_tol,
-                invert_pose=args.invert_pose,
-                diag=True,
-            )
+            frustum_mask, n_geo, n_dropped, stages, diag_info = \
+                bbox_to_frustum_mask(
+                    coord, bbox_for_frustum, cam,
+                    depth_tol=args.depth_tol,
+                    depth_slab_front=args.depth_slab_front,
+                    depth_slab_back=args.depth_slab_back,
+                    use_depth_slab=args.depth_slab,
+                    invert_pose=args.invert_pose,
+                    diag=True,
+                )
             n_total = len(coord)
             n_kept_pose = int(frustum_mask.sum())
             if args.depth_tol > 0 and cam.get("depth") is not None:
+                slab_note = ""
+                if diag_info.get("depth_slab") is not None:
+                    z_lo, z_hi = diag_info["depth_slab"]
+                    slab_note = (f", {diag_info['n_slab_dropped']} dropped by "
+                                 f"depth-slab[{z_lo:.2f}m,{z_hi:.2f}m]")
                 print(f"[pose] frustum: {n_geo}/{n_total} inside bbox, "
-                      f"{n_dropped} dropped by depth occlusion, "
-                      f"{n_kept_pose} kept "
+                      f"{n_dropped} dropped by per-pixel occlusion"
+                      f"{slab_note}, {n_kept_pose} kept "
                       f"({100*n_kept_pose/n_total:.2f}% of scene)")
             else:
                 print(f"[pose] frustum: {n_kept_pose}/{n_total} inside "
