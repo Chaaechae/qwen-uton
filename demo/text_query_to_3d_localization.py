@@ -1821,6 +1821,11 @@ def main():
     print(f"[mask] mode={args.ground_mode}  nonzero={n_kept}/{h_grid*w_grid}"
           f"  sum={mask_flat.sum().item():.2f}")
 
+    # Output filename suffix — defined here (before the pose block) so the
+    # scene_proj_diag PLY written from inside that block can use it too.
+    # Both ground modes coexist in one out-dir for side-by-side compare.
+    sfx = f"_{args.ground_mode}"
+
     # --- Optional: pose-based bbox-to-frustum geometric mask -------------
     # Two pose sources:
     #   --use-pose      : load (K, T) and depth from ScanNet sibling files
@@ -1958,10 +1963,6 @@ def main():
                           "(behind-camera) or blue (off-image), try "
                           "`--invert-pose` — your pose .txt may store "
                           "world→cam instead of cam→world.")
-
-    # Output filename suffix → both modes can coexist in one out-dir for
-    # direct side-by-side comparison.
-    sfx = f"_{args.ground_mode}"
 
     save_2d_overlay(
         image_pil, qwen_heat,
