@@ -743,6 +743,74 @@ def utonia_point_features(backbone, coord, color, normal, device):
 
 
 # ---------------------------------------------------------------------------
+# 3D score post-processing: KNN smoothing + spatial clustering.
+#
+# The H/I alignment makes a continuous feature manifold — raw cos-with-
+# query scores tend to spread response across visually similar regions
+# (e.g. fridge query lights up walls, other white surfaces).  These two
+# steps tighten the response WITHOUT retraining:
+#
+#   knn_smooth_scores         per-point average with k nearest neighbors;
+#                             kills isolated outlier hot specks, keeps
+#                             coherent blobs.
+#
+#   largest_connected_cluster among the top-X% scoring points, BFS over
+#                             a radius graph to find the largest
+#                             spatially connected component.  Isolates a
+#                             single object instance and drops scattered
+#                             look-alike responses elsewhere in the scene.
+# ---------------------------------------------------------------------------
+def knn_smooth_scores(coord, scores, k):
+    """Average each point's score with its k nearest neighbors.
+
+    coord  : (N, 3) float
+    scores : (N,) float
+    k      : int; k <= 1 → no-op pass-through.
+
+    scipy cKDTree is already a project dep (see demo/9_sem_seg_video.py),
+    so this introduces no new requirement.
+    """
+    if k <= 1:
+        return scores
+    from scipy.spatial import cKDTree
+    tree = cKDTree(coord)
+    _, idx = tree.query(coord, k=k)
+    return scores[idx].mean(axis=1)
+
+
+def largest_connected_cluster(coord, eps):
+    """Return indices of the largest eps-radius-connected component.
+
+    coord : (M, 3) float — typically the top-X% candidate subset.
+    eps   : float — link radius in coord units (meters for ScanNet
+            indoor scans).  Two points within eps are graph-connected.
+    """
+    if len(coord) == 0:
+        return np.zeros(0, dtype=np.int64)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(coord)
+    n = len(coord)
+    visited = np.zeros(n, dtype=bool)
+    best = []
+    for seed in range(n):
+        if visited[seed]:
+            continue
+        cluster = []
+        stack = [seed]
+        visited[seed] = True
+        while stack:
+            p = stack.pop()
+            cluster.append(p)
+            for nb in tree.query_ball_point(coord[p], eps):
+                if not visited[nb]:
+                    visited[nb] = True
+                    stack.append(nb)
+        if len(cluster) > len(best):
+            best = cluster
+    return np.array(best, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
 # Save the 2D attention as an overlay PNG.
 # ---------------------------------------------------------------------------
 def save_2d_overlay(image_pil, attn_grid, out_path, bbox_norm=None,
@@ -1028,6 +1096,28 @@ def parse_args():
              "is red' effect that percentile [5, 99] stretch produces "
              "when the cos distribution is narrow.  Use 100 to disable "
              "masking and color the full spectrum (old behavior).")
+    p.add_argument(
+        "--roi-erode", type=float, default=0.5,
+        help="Soft erosion threshold on the 2D ROI mask before building "
+             "q_pos.  Cells whose mask weight is below this are dropped "
+             "from the q_pos average — keeps the query closer to a "
+             "pure-object signal (less bbox-boundary contamination). "
+             "Higher = stricter (smaller effective ROI).  0.0 disables.")
+    p.add_argument(
+        "--smooth-knn", type=int, default=16,
+        help="K-nearest-neighbor smoothing of the per-point 3D score "
+             "(each point's score becomes the mean of its K NNs in 3D "
+             "space).  Removes isolated outlier responses while keeping "
+             "coherent object-shaped blobs.  Set to 0 or 1 to disable. "
+             "Cheap (one scipy cKDTree query).")
+    p.add_argument(
+        "--cluster-eps", type=float, default=0.05,
+        help="Spatial clustering radius in coord units (meters for "
+             "ScanNet).  Among the top-(--top-percentile)%% points, "
+             "find the largest eps-radius-connected component and save "
+             "it as scene_object_<mode>.ply — single-instance extraction "
+             "that drops scattered look-alike responses elsewhere in "
+             "the scene.  Set to 0 to disable clustering.")
     p.add_argument("--plot-max-points", type=int, default=80000,
                    help="Subsample cap for the Plotly 3D scatter "
                         "(browser perf gets bad past ~150k).")
@@ -1154,7 +1244,29 @@ def main():
         print("[warn] ROI mask empty — falling back to uniform pos query.")
         pos_weights = torch.ones_like(mask_flat) / mask_flat.numel()
     else:
-        pos_weights = mask_flat / mask_flat.sum()
+        # --roi-erode: drop cells with low partial coverage to build a
+        # purer q_pos.  Bbox-boundary cells often mix object + background
+        # pixels at the Qwen 32x32-px resolution, so the boundary patches
+        # carry a "half-object half-scene" feature that pulls q_pos toward
+        # generic-indoor and weakens the 3D contrast.  Higher threshold =
+        # tighter (smaller effective ROI but purer signal).
+        if args.roi_erode > 0:
+            eroded = torch.where(
+                mask_flat >= args.roi_erode,
+                mask_flat, torch.zeros_like(mask_flat),
+            )
+            kept = int((eroded > 0).sum().item())
+            raw = int((mask_flat > 0).sum().item())
+            if eroded.sum() > 0:
+                pos_weights = eroded / eroded.sum()
+                print(f"[roi] erode>={args.roi_erode}: "
+                      f"{kept}/{raw} cells kept for q_pos")
+            else:
+                pos_weights = mask_flat / mask_flat.sum()
+                print(f"[roi] erode>={args.roi_erode} removed all cells; "
+                      "falling back to raw mask.")
+        else:
+            pos_weights = mask_flat / mask_flat.sum()
     q_pos_2d = (pos_weights.unsqueeze(-1) * patch_2d_flat).sum(dim=0)  # (2560,)
 
     q_neg_2d = None
@@ -1247,6 +1359,19 @@ def main():
     print(f"[3D]  sim range: [{sim_3d.min():.3f}, {sim_3d.max():.3f}], "
           f"mean={sim_3d.mean():.3f}, std={sim_3d.std():.3f}")
 
+    # --- KNN spatial smoothing of per-point scores -----------------------
+    # Reduces "noisy hot specks" that come from individual points sitting
+    # on feature-manifold ambiguities (e.g. a chair leg pixel that happens
+    # to project cosine-close to a fridge edge).  Coherent object-shaped
+    # responses survive because every neighbor also scores high.
+    if args.smooth_knn > 1:
+        before_std = float(sim_3d.std())
+        sim_3d = knn_smooth_scores(coord, sim_3d, k=args.smooth_knn)
+        after_std = float(sim_3d.std())
+        print(f"[smooth] knn={args.smooth_knn}  "
+              f"std {before_std:.4f} → {after_std:.4f}  "
+              f"range=[{sim_3d.min():.3f}, {sim_3d.max():.3f}]")
+
     # --- Render PLYs ------------------------------------------------------
     # (a) rgb for orientation — shared across modes (overwrite OK).
     write_ply(os.path.join(args.out_dir, "scene_rgb.ply"), coord, color)
@@ -1292,6 +1417,36 @@ def main():
     write_ply(os.path.join(args.out_dir, f"scene_top{sfx}.ply"),
               coord[idx_top], np.array([[230, 30, 30]] * k, dtype=np.uint8))
     print(f"[save] {args.out_dir}/scene_top{sfx}.ply  (top {k} pts)")
+
+    # (c2) single-instance extraction via spatial clustering.
+    # Among the top-(top_percentile)% scoring points, find the largest
+    # connected component — drops scattered look-alike responses across
+    # the scene and isolates one object instance.
+    if args.cluster_eps > 0:
+        cluster_thr = float(np.percentile(sim_3d, 100.0 - args.top_percentile))
+        cand_idx = np.where(sim_3d >= cluster_thr)[0]
+        if len(cand_idx) >= 3:
+            local_cluster = largest_connected_cluster(
+                coord[cand_idx], eps=args.cluster_eps,
+            )
+            obj_idx = cand_idx[local_cluster]
+            obj_color = np.array(
+                [[30, 200, 30]] * len(obj_idx), dtype=np.uint8,
+            )
+            write_ply(
+                os.path.join(args.out_dir, f"scene_object{sfx}.ply"),
+                coord[obj_idx], obj_color,
+            )
+            print(f"[cluster] eps={args.cluster_eps}m  "
+                  f"top-{args.top_percentile:.0f}% candidates={len(cand_idx)}  "
+                  f"largest cluster={len(obj_idx)} pts "
+                  f"({100.0 * len(obj_idx) / max(len(cand_idx), 1):.1f}% of "
+                  "candidates)")
+            print(f"[save] {args.out_dir}/scene_object{sfx}.ply  "
+                  "(largest spatially connected cluster)")
+        else:
+            print(f"[cluster] only {len(cand_idx)} candidates above threshold; "
+                  "skipping.")
 
     # (d) interactive Plotly HTML — 2D overlay + 3D heatmap together.
     # The 2D heat is whichever ROI source we used; qwen-bbox additionally
