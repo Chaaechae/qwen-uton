@@ -813,67 +813,77 @@ def utonia_point_features(backbone, coord, color, normal, device):
 # single file with --pose-path / --intrinsic-color-path / etc.  If pose
 # is unknown entirely (arbitrary image not in ScanNet) use --estimate-pose.
 # ---------------------------------------------------------------------------
-def _load_matrix_with_fallback(path_or_base, name, exts=(".npy", ".txt")):
-    """Load a 2D array from a file at path_or_base.  If path_or_base lacks
-    a recognized extension, try each of `exts` in order.  Returns
-    (array, actual_path) or raises FileNotFoundError.
+def _load_matrix_first_of(candidate_paths, name):
+    """Try each candidate path in order, returning the first that loads.
+
+    Loader picked by extension:  .npy / .npz → np.load,  .txt → np.loadtxt.
+    Returns (array, actual_path) or raises FileNotFoundError listing all
+    tried paths so the user can diagnose layout mismatch from the log.
     """
-    candidates = []
-    root, ext = os.path.splitext(path_or_base)
-    if ext.lower() in (".npy", ".npz", ".txt"):
-        candidates.append(path_or_base)
-    else:
-        # path_or_base has no extension or has an unrecognized one.
-        for e in exts:
-            candidates.append(path_or_base + e if not ext else root + e)
-    for p in candidates:
+    tried = []
+    for p in candidate_paths:
+        tried.append(p)
         if not os.path.isfile(p):
             continue
         if p.endswith(".npy"):
-            arr = np.load(p).astype(np.float32)
-        elif p.endswith(".npz"):
+            return np.load(p).astype(np.float32), p
+        if p.endswith(".npz"):
             with np.load(p) as z:
-                # First array in archive.
-                arr = z[list(z.keys())[0]].astype(np.float32)
-        else:
-            arr = np.loadtxt(p).astype(np.float32)
-        return arr, p
+                return z[list(z.keys())[0]].astype(np.float32), p
+        return np.loadtxt(p).astype(np.float32), p
     raise FileNotFoundError(
-        f"{name} not found; tried: {candidates}"
+        f"{name} not found.  Tried:\n  " + "\n  ".join(tried)
     )
 
 
-def _load_depth_with_fallback(depth_path_base):
-    """Try .png (16-bit mm) → .npy.  Returns (depth_meters, actual_path)
-    or (None, None) if no file exists.
+def _candidate_paths_pose(scene_dir, frame):
+    """Per-frame pose file candidates, .npy first then .txt."""
+    return [
+        os.path.join(scene_dir, "pose", f"{frame}.npy"),
+        os.path.join(scene_dir, "pose", f"{frame}.txt"),
+        os.path.join(scene_dir, "poses", f"{frame}.npy"),
+        os.path.join(scene_dir, "poses", f"{frame}.txt"),
+    ]
+
+
+def _candidate_paths_intrinsic(scene_dir, kind):
+    """Intrinsic file candidates.  `kind` ∈ {'color', 'depth', 'shared'}.
+    'shared' covers layouts that store ONE intrinsic.npy used for both
+    color & depth (e.g. when color and depth share a rectified camera).
+    Order: specific-named → generic 'intrinsic' → at scene root.
     """
-    from PIL import Image
-    candidates = []
-    root, ext = os.path.splitext(depth_path_base)
-    if ext.lower() in (".png", ".npy", ".npz"):
-        candidates.append(depth_path_base)
+    by_dir = os.path.join(scene_dir, "intrinsic")
+    if kind == "shared":
+        roots = ["intrinsic"]
     else:
-        for e in (".png", ".npy"):
-            candidates.append(depth_path_base + e if not ext else root + e)
-    for p in candidates:
+        roots = [f"intrinsic_{kind}", "intrinsic"]
+    paths = []
+    for r in roots:
+        for ext in (".npy", ".txt"):
+            paths.append(os.path.join(by_dir, r + ext))
+            paths.append(os.path.join(scene_dir, r + ext))  # at scene root
+    return paths
+
+
+def _load_depth_first_of(candidate_paths):
+    """Depth fallback: .png (16-bit mm) → .npy.  Auto-detects mm vs m by
+    magnitude.  Returns (depth_meters, actual_path) or (None, None)."""
+    from PIL import Image
+    for p in candidate_paths:
         if not os.path.isfile(p):
             continue
         if p.endswith(".npy"):
             arr = np.load(p).astype(np.float32)
-            # If values look like millimeters (max > 100), scale.
-            if float(np.nanmax(arr)) > 100.0:
-                arr = arr / 1000.0
-            return arr, p
         elif p.endswith(".npz"):
             with np.load(p) as z:
                 arr = z[list(z.keys())[0]].astype(np.float32)
-            if float(np.nanmax(arr)) > 100.0:
-                arr = arr / 1000.0
-            return arr, p
         else:  # .png
-            d_img = np.array(Image.open(p))
-            # ScanNet depth is 16-bit mm. /1000 → meters.
-            return d_img.astype(np.float32) / 1000.0, p
+            arr = np.array(Image.open(p)).astype(np.float32)
+        # If values look like millimeters (max > 100m would be absurd
+        # for indoor; mm range goes to ~10000), rescale.
+        if np.isfinite(arr).any() and float(np.nanmax(arr)) > 100.0:
+            arr = arr / 1000.0
+        return arr, p
     return None, None
 
 
@@ -883,9 +893,9 @@ def load_camera_for_image(
 ):
     """Returns dict with K_color (3,3), K_depth (3,3), T_c2w (4,4),
     H_color/W_color, and (if available) depth (H_d, W_d, float32 meters).
-    Any path can be overridden; otherwise auto-detect from image_path.
-    Auto-detect tries .npy first then .txt for pose/intrinsic, .png then
-    .npy for depth.
+
+    Auto-detect probes several common layouts.  Each modality is logged
+    so you can see exactly which file was used.
     """
     color_dir = os.path.dirname(image_path)
     auto_ok = (os.path.basename(color_dir) == "color")
@@ -898,18 +908,14 @@ def load_camera_for_image(
     scene_dir = os.path.dirname(color_dir)
     frame = os.path.splitext(os.path.basename(image_path))[0]
 
-    # Base path (no ext) so the helper can try multiple extensions, OR
-    # the user's explicit override (with its own extension).
-    pose_base = override_pose or os.path.join(scene_dir, "pose", frame)
-    intr_c_base = override_intr_color or os.path.join(
-        scene_dir, "intrinsic", "intrinsic_color")
-    intr_d_base = override_intr_depth or os.path.join(
-        scene_dir, "intrinsic", "intrinsic_depth")
-    depth_base = override_depth or os.path.join(scene_dir, "depth", frame)
-
-    T_c2w, pose_used = _load_matrix_with_fallback(pose_base, "pose")
+    # --- pose -----------------------------------------------------------
+    if override_pose is not None:
+        T_c2w, pose_used = _load_matrix_first_of([override_pose], "pose")
+    else:
+        T_c2w, pose_used = _load_matrix_first_of(
+            _candidate_paths_pose(scene_dir, frame), "pose",
+        )
     if T_c2w.shape == (3, 4):
-        # Augment to 4x4 with bottom row [0, 0, 0, 1].
         bottom = np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
         T_c2w = np.concatenate([T_c2w, bottom], axis=0)
     elif T_c2w.shape != (4, 4):
@@ -919,34 +925,66 @@ def load_camera_for_image(
         raise RuntimeError(
             f"pose has non-finite values (lost tracking?): {pose_used}")
 
-    K_c_full, intr_c_used = _load_matrix_with_fallback(
-        intr_c_base, "intrinsic_color",
-    )
+    # --- intrinsic (color) ---------------------------------------------
+    # Candidate order: explicit override → intrinsic_color → generic
+    # 'intrinsic' (some preprocessors emit a single shared file).
+    if override_intr_color is not None:
+        K_c_full, intr_c_used = _load_matrix_first_of(
+            [override_intr_color], "intrinsic_color",
+        )
+    else:
+        K_c_full, intr_c_used = _load_matrix_first_of(
+            _candidate_paths_intrinsic(scene_dir, "color")
+            + _candidate_paths_intrinsic(scene_dir, "shared"),
+            "intrinsic_color",
+        )
     K_color = K_c_full[:3, :3].astype(np.float32)
 
-    try:
-        K_d_full, intr_d_used = _load_matrix_with_fallback(
-            intr_d_base, "intrinsic_depth",
+    # --- intrinsic (depth) ---------------------------------------------
+    # If the dump has a separate depth intrinsic, use it; otherwise share
+    # K_color (typical when color and depth are rectified together).
+    if override_intr_depth is not None:
+        K_d_full, intr_d_used = _load_matrix_first_of(
+            [override_intr_depth], "intrinsic_depth",
         )
         K_depth = K_d_full[:3, :3].astype(np.float32)
-    except FileNotFoundError:
-        K_depth = K_color
-        intr_d_used = "(none — reusing K_color)"
+    else:
+        try:
+            K_d_full, intr_d_used = _load_matrix_first_of(
+                _candidate_paths_intrinsic(scene_dir, "depth"),
+                "intrinsic_depth",
+            )
+            K_depth = K_d_full[:3, :3].astype(np.float32)
+        except FileNotFoundError:
+            K_depth = K_color
+            intr_d_used = "(none — reusing K_color)"
 
+    # --- color image dims ----------------------------------------------
     from PIL import Image
     with Image.open(image_path) as img:
         W_color, H_color = img.size
 
-    depth, depth_used = _load_depth_with_fallback(depth_base)
+    # --- depth (optional) ----------------------------------------------
+    if override_depth is not None:
+        depth, depth_used = _load_depth_first_of([override_depth])
+    else:
+        depth, depth_used = _load_depth_first_of([
+            os.path.join(scene_dir, "depth", f"{frame}.png"),
+            os.path.join(scene_dir, "depth", f"{frame}.npy"),
+        ])
     H_d = W_d = None
     if depth is not None:
         H_d, W_d = depth.shape
 
-    print(f"[pose] files used:")
-    print(f"           pose          : {pose_used}")
+    print("[pose] files used:")
+    print(f"           pose           : {pose_used}")
     print(f"           intrinsic_color: {intr_c_used}")
     print(f"           intrinsic_depth: {intr_d_used}")
-    print(f"           depth         : {depth_used or '(none)'}")
+    print(f"           depth          : {depth_used or '(none)'}")
+    print(f"           K_color [fx,fy,cx,cy] = "
+          f"({K_color[0,0]:.2f}, {K_color[1,1]:.2f}, "
+          f"{K_color[0,2]:.2f}, {K_color[1,2]:.2f})  "
+          f"image {W_color}x{H_color}")
 
     return dict(
         K_color=K_color, K_depth=K_depth, T_c2w=T_c2w,
