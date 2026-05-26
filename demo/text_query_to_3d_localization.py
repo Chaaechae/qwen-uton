@@ -802,17 +802,81 @@ def utonia_point_features(backbone, coord, color, normal, device):
 # within the frustum disambiguates if multiple objects sit in the same
 # camera ray bundle.
 #
-# Layout expected (ScanNet image-dump):
+# Layout expected (ScanNet image-dump — supports .txt OR .npy):
 #     .../scene_XXXX_YY/color/<frame>.{png,jpg}
-#     .../scene_XXXX_YY/pose/<frame>.txt              4x4 cam-to-world
-#     .../scene_XXXX_YY/intrinsic/intrinsic_color.txt 4x4 K (color)
-#     .../scene_XXXX_YY/intrinsic/intrinsic_depth.txt 4x4 K (depth, opt)
-#     .../scene_XXXX_YY/depth/<frame>.png             16-bit mm (opt)
+#     .../scene_XXXX_YY/pose/<frame>.{txt,npy}        4x4 cam-to-world
+#     .../scene_XXXX_YY/intrinsic/intrinsic_color.{txt,npy}    4x4 K
+#     .../scene_XXXX_YY/intrinsic/intrinsic_depth.{txt,npy}    4x4 K (opt)
+#     .../scene_XXXX_YY/depth/<frame>.{png,npy}                (opt)
 #
-# If pose is unknown (arbitrary image not in ScanNet), use a separate
-# pose-estimation step (e.g. VGGT — already a project dep in
-# demo/8_pca_video.py) to predict (K, T) before calling these helpers.
+# Pose / intrinsic auto-detect tries .npy first, then .txt.  Override any
+# single file with --pose-path / --intrinsic-color-path / etc.  If pose
+# is unknown entirely (arbitrary image not in ScanNet) use --estimate-pose.
 # ---------------------------------------------------------------------------
+def _load_matrix_with_fallback(path_or_base, name, exts=(".npy", ".txt")):
+    """Load a 2D array from a file at path_or_base.  If path_or_base lacks
+    a recognized extension, try each of `exts` in order.  Returns
+    (array, actual_path) or raises FileNotFoundError.
+    """
+    candidates = []
+    root, ext = os.path.splitext(path_or_base)
+    if ext.lower() in (".npy", ".npz", ".txt"):
+        candidates.append(path_or_base)
+    else:
+        # path_or_base has no extension or has an unrecognized one.
+        for e in exts:
+            candidates.append(path_or_base + e if not ext else root + e)
+    for p in candidates:
+        if not os.path.isfile(p):
+            continue
+        if p.endswith(".npy"):
+            arr = np.load(p).astype(np.float32)
+        elif p.endswith(".npz"):
+            with np.load(p) as z:
+                # First array in archive.
+                arr = z[list(z.keys())[0]].astype(np.float32)
+        else:
+            arr = np.loadtxt(p).astype(np.float32)
+        return arr, p
+    raise FileNotFoundError(
+        f"{name} not found; tried: {candidates}"
+    )
+
+
+def _load_depth_with_fallback(depth_path_base):
+    """Try .png (16-bit mm) → .npy.  Returns (depth_meters, actual_path)
+    or (None, None) if no file exists.
+    """
+    from PIL import Image
+    candidates = []
+    root, ext = os.path.splitext(depth_path_base)
+    if ext.lower() in (".png", ".npy", ".npz"):
+        candidates.append(depth_path_base)
+    else:
+        for e in (".png", ".npy"):
+            candidates.append(depth_path_base + e if not ext else root + e)
+    for p in candidates:
+        if not os.path.isfile(p):
+            continue
+        if p.endswith(".npy"):
+            arr = np.load(p).astype(np.float32)
+            # If values look like millimeters (max > 100), scale.
+            if float(np.nanmax(arr)) > 100.0:
+                arr = arr / 1000.0
+            return arr, p
+        elif p.endswith(".npz"):
+            with np.load(p) as z:
+                arr = z[list(z.keys())[0]].astype(np.float32)
+            if float(np.nanmax(arr)) > 100.0:
+                arr = arr / 1000.0
+            return arr, p
+        else:  # .png
+            d_img = np.array(Image.open(p))
+            # ScanNet depth is 16-bit mm. /1000 → meters.
+            return d_img.astype(np.float32) / 1000.0, p
+    return None, None
+
+
 def load_camera_for_image(
     image_path, override_pose=None, override_intr_color=None,
     override_intr_depth=None, override_depth=None,
@@ -820,6 +884,8 @@ def load_camera_for_image(
     """Returns dict with K_color (3,3), K_depth (3,3), T_c2w (4,4),
     H_color/W_color, and (if available) depth (H_d, W_d, float32 meters).
     Any path can be overridden; otherwise auto-detect from image_path.
+    Auto-detect tries .npy first then .txt for pose/intrinsic, .png then
+    .npy for depth.
     """
     color_dir = os.path.dirname(image_path)
     auto_ok = (os.path.basename(color_dir) == "color")
@@ -832,39 +898,55 @@ def load_camera_for_image(
     scene_dir = os.path.dirname(color_dir)
     frame = os.path.splitext(os.path.basename(image_path))[0]
 
-    pose_path = override_pose or os.path.join(
-        scene_dir, "pose", f"{frame}.txt")
-    intr_c_path = override_intr_color or os.path.join(
-        scene_dir, "intrinsic", "intrinsic_color.txt")
-    intr_d_path = override_intr_depth or os.path.join(
-        scene_dir, "intrinsic", "intrinsic_depth.txt")
-    depth_path = override_depth or os.path.join(
-        scene_dir, "depth", f"{frame}.png")
+    # Base path (no ext) so the helper can try multiple extensions, OR
+    # the user's explicit override (with its own extension).
+    pose_base = override_pose or os.path.join(scene_dir, "pose", frame)
+    intr_c_base = override_intr_color or os.path.join(
+        scene_dir, "intrinsic", "intrinsic_color")
+    intr_d_base = override_intr_depth or os.path.join(
+        scene_dir, "intrinsic", "intrinsic_depth")
+    depth_base = override_depth or os.path.join(scene_dir, "depth", frame)
 
-    if not os.path.isfile(pose_path):
-        raise FileNotFoundError(f"pose not found: {pose_path}")
-    if not os.path.isfile(intr_c_path):
-        raise FileNotFoundError(f"intrinsic_color not found: {intr_c_path}")
-
-    T_c2w = np.loadtxt(pose_path).astype(np.float32)
+    T_c2w, pose_used = _load_matrix_with_fallback(pose_base, "pose")
+    if T_c2w.shape == (3, 4):
+        # Augment to 4x4 with bottom row [0, 0, 0, 1].
+        bottom = np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float32)
+        T_c2w = np.concatenate([T_c2w, bottom], axis=0)
+    elif T_c2w.shape != (4, 4):
+        raise RuntimeError(
+            f"pose shape unexpected: {T_c2w.shape} from {pose_used}")
     if not np.isfinite(T_c2w).all():
         raise RuntimeError(
-            f"pose has non-finite values (lost tracking?): {pose_path}")
-    K_color = np.loadtxt(intr_c_path).astype(np.float32)[:3, :3]
-    K_depth = (np.loadtxt(intr_d_path).astype(np.float32)[:3, :3]
-               if os.path.isfile(intr_d_path) else K_color)
+            f"pose has non-finite values (lost tracking?): {pose_used}")
+
+    K_c_full, intr_c_used = _load_matrix_with_fallback(
+        intr_c_base, "intrinsic_color",
+    )
+    K_color = K_c_full[:3, :3].astype(np.float32)
+
+    try:
+        K_d_full, intr_d_used = _load_matrix_with_fallback(
+            intr_d_base, "intrinsic_depth",
+        )
+        K_depth = K_d_full[:3, :3].astype(np.float32)
+    except FileNotFoundError:
+        K_depth = K_color
+        intr_d_used = "(none — reusing K_color)"
 
     from PIL import Image
     with Image.open(image_path) as img:
         W_color, H_color = img.size
 
-    depth = None
+    depth, depth_used = _load_depth_with_fallback(depth_base)
     H_d = W_d = None
-    if os.path.isfile(depth_path):
-        d_img = np.array(Image.open(depth_path))
-        # ScanNet depth is 16-bit mm. /1000 → meters.
-        depth = d_img.astype(np.float32) / 1000.0
+    if depth is not None:
         H_d, W_d = depth.shape
+
+    print(f"[pose] files used:")
+    print(f"           pose          : {pose_used}")
+    print(f"           intrinsic_color: {intr_c_used}")
+    print(f"           intrinsic_depth: {intr_d_used}")
+    print(f"           depth         : {depth_used or '(none)'}")
 
     return dict(
         K_color=K_color, K_depth=K_depth, T_c2w=T_c2w,
