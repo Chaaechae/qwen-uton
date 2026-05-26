@@ -873,11 +873,17 @@ def load_camera_for_image(
     )
 
 
-def project_world_to_pixel(coord, K, T_c2w):
+def project_world_to_pixel(coord, K, T_c2w, invert_pose=False):
     """coord (N, 3) world → (u, v, z_cam) in pixel coords + camera-frame
     z (used for occlusion / behind-camera checks).
+
+    invert_pose=True: treat T_c2w as world-to-camera instead.  Use when
+    the dump's pose .txt actually stores world→cam (some forks do).
     """
-    T_w2c = np.linalg.inv(T_c2w)
+    if invert_pose:
+        T_w2c = T_c2w  # interpret matrix as already world-to-camera
+    else:
+        T_w2c = np.linalg.inv(T_c2w)
     R = T_w2c[:3, :3]
     t = T_w2c[:3, 3]
     p_cam = coord @ R.T + t  # (N, 3)
@@ -888,28 +894,107 @@ def project_world_to_pixel(coord, K, T_c2w):
     return u, v, z
 
 
-def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15):
+def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15,
+                          invert_pose=False, diag=True):
     """Mask (N,) of 3D points whose projection lands inside the 2D bbox
     (and matches the depth map if depth_tol > 0 and depth is available).
 
+    With diag=True, prints stage-by-stage projection statistics and a
+    best-guess diagnosis if the projection looks broken.
+
     Returns:
-        mask           : (N,) bool — final mask
+        mask           : (N,) bool — final mask after bbox + depth
         n_in_frustum   : int — count after geometric bbox test (pre-depth)
         n_depth_dropped: int — count removed by depth occlusion check
+        stages         : dict with bool arrays (in_front, in_image,
+                         in_bbox) for debug visualization
     """
     x1, y1, x2, y2 = bbox_norm
     u1, u2 = x1 * cam["W_color"], x2 * cam["W_color"]
     v1, v2 = y1 * cam["H_color"], y2 * cam["H_color"]
+    N = len(coord)
 
-    u, v, z = project_world_to_pixel(coord, cam["K_color"], cam["T_c2w"])
-    in_frustum = (z > 1e-3) & (u >= u1) & (u < u2) & (v >= v1) & (v < v2)
-    n_in_frustum = int(in_frustum.sum())
+    u, v, z = project_world_to_pixel(
+        coord, cam["K_color"], cam["T_c2w"], invert_pose=invert_pose,
+    )
+
+    # Three nested geometric stages — useful for diagnosing where the
+    # projection breaks down.
+    in_front = z > 1e-3
+    in_image = (
+        in_front
+        & (u >= 0) & (u < cam["W_color"])
+        & (v >= 0) & (v < cam["H_color"])
+    )
+    in_bbox = (
+        in_front
+        & (u >= u1) & (u < u2)
+        & (v >= v1) & (v < v2)
+    )
+
+    if diag:
+        n_front = int(in_front.sum())
+        n_image = int(in_image.sum())
+        n_bbox = int(in_bbox.sum())
+        cam_pos = cam["T_c2w"][:3, 3] if not invert_pose \
+                  else -cam["T_c2w"][:3, :3].T @ cam["T_c2w"][:3, 3]
+        scene_min = coord.min(axis=0)
+        scene_max = coord.max(axis=0)
+        scene_center = (scene_min + scene_max) / 2.0
+        dist = float(np.linalg.norm(cam_pos - scene_center))
+
+        print(f"[pose-diag] projection stages (invert_pose={invert_pose}):")
+        print(f"           total:        {N}")
+        print(f"           z_cam > 0:    {n_front} ({100*n_front/N:.1f}%)")
+        print(f"           inside image: {n_image} ({100*n_image/N:.1f}%)")
+        print(f"           inside bbox:  {n_bbox} ({100*n_bbox/N:.1f}%)  "
+              f"bbox_uv=[{u1:.0f},{v1:.0f}]–[{u2:.0f},{v2:.0f}]  "
+              f"image={cam['W_color']}x{cam['H_color']}")
+        print(f"           camera pos:   ({cam_pos[0]:+.2f}, {cam_pos[1]:+.2f}, "
+              f"{cam_pos[2]:+.2f})")
+        print(f"           scene center: ({scene_center[0]:+.2f}, "
+              f"{scene_center[1]:+.2f}, {scene_center[2]:+.2f})  "
+              f"extent ({scene_max[0]-scene_min[0]:.2f},"
+              f"{scene_max[1]-scene_min[1]:.2f},"
+              f"{scene_max[2]-scene_min[2]:.2f})")
+        print(f"           cam-to-center distance: {dist:.2f}")
+
+        # --- auto-diagnosis -------------------------------------------
+        if n_front < 0.05 * N:
+            print("[pose-diag] LIKELY BAD: <5% of points are in front of "
+                  "camera.")
+            print("            → pose convention may be inverted "
+                  "(world-to-camera instead of camera-to-world).  "
+                  "Try `--invert-pose`.")
+        elif n_image < 0.05 * N:
+            print("[pose-diag] LIKELY BAD: most points are behind camera "
+                  "OR in front but outside the image.")
+            print("            → K may be at the wrong resolution, or "
+                  "image dims don't match the pose's view.  Verify "
+                  "intrinsic_color.txt matches THIS image's resolution.")
+        elif n_bbox == 0:
+            print("[pose-diag] WARN: projection works but bbox area has "
+                  "no scene coverage — likely an occluding wall, or the "
+                  "bbox was drawn on background pixels.")
+        elif n_bbox < 50:
+            print(f"[pose-diag] note: only {n_bbox} pts in bbox — small "
+                  "or distant object?  Should still be enough for "
+                  "downstream clustering.")
+        if dist > 30.0:
+            print(f"[pose-diag] WARN: camera is {dist:.1f}m from scene "
+                  "center.  Pose may be in a different coord frame than "
+                  "the point cloud.")
+
+    mask = in_bbox.copy()
+    n_in_frustum = int(mask.sum())
     n_depth_dropped = 0
 
     if depth_tol > 0 and cam.get("depth") is not None:
         # Project to depth-image coords (may differ in resolution from
         # color), sample depth, compare against camera-z.
-        ud, vd, _ = project_world_to_pixel(coord, cam["K_depth"], cam["T_c2w"])
+        ud, vd, _ = project_world_to_pixel(
+            coord, cam["K_depth"], cam["T_c2w"], invert_pose=invert_pose,
+        )
         Hd, Wd = cam["H_depth"], cam["W_depth"]
         ui = np.clip(ud.astype(np.int32), 0, Wd - 1)
         vi = np.clip(vd.astype(np.int32), 0, Hd - 1)
@@ -917,10 +1002,11 @@ def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15):
         depth_valid = d_at > 0.1
         depth_match = np.abs(z - d_at) <= depth_tol
         depth_ok = depth_valid & depth_match
-        n_depth_dropped = int((in_frustum & ~depth_ok).sum())
-        in_frustum = in_frustum & depth_ok
+        n_depth_dropped = int((mask & ~depth_ok).sum())
+        mask = mask & depth_ok
 
-    return in_frustum, n_in_frustum, n_depth_dropped
+    stages = dict(in_front=in_front, in_image=in_image, in_bbox=in_bbox)
+    return mask, n_in_frustum, n_depth_dropped, stages
 
 
 # ---------------------------------------------------------------------------
@@ -1453,6 +1539,13 @@ def parse_args():
     p.add_argument("--depth-path", default=None,
                    help="Override path to <frame>.png depth map.")
     p.add_argument(
+        "--invert-pose", action="store_true", default=False,
+        help="Interpret the pose .txt matrix as world-to-camera instead "
+             "of camera-to-world.  Standard ScanNet is cam-to-world; "
+             "some forks / preprocessors swap it.  Turn on if the "
+             "[pose-diag] log shows <5%% of points in front of camera, "
+             "or the scene_proj_diag PLY is mostly grey/blue.")
+    p.add_argument(
         "--estimate-pose", action="store_true", default=False,
         help="Estimate camera pose from the image using feature-PnP "
              "instead of loading from ScanNet sibling files.  For each "
@@ -1699,9 +1792,11 @@ def main():
                 print("[pose] continuing WITHOUT frustum filter.")
 
         if cam is not None:
-            frustum_mask, n_geo, n_dropped = bbox_to_frustum_mask(
+            frustum_mask, n_geo, n_dropped, stages = bbox_to_frustum_mask(
                 coord, bbox_for_frustum, cam,
                 depth_tol=args.depth_tol,
+                invert_pose=args.invert_pose,
+                diag=True,
             )
             n_total = len(coord)
             n_kept_pose = int(frustum_mask.sum())
@@ -1713,10 +1808,36 @@ def main():
             else:
                 print(f"[pose] frustum: {n_kept_pose}/{n_total} inside "
                       f"bbox ({100*n_kept_pose/n_total:.2f}% of scene)")
+
+            # Always dump the 4-color projection diagnostic PLY so the
+            # user can visually verify pose alignment.
+            #   red    = in bbox (final frustum mask candidates)
+            #   yellow = in image but outside bbox
+            #   blue   = in front of camera but outside image
+            #   grey   = behind camera (z_cam <= 0)
+            diag_colors = np.full((n_total, 3), 80, dtype=np.uint8)  # grey
+            diag_colors[stages["in_front"] & ~stages["in_image"]] = \
+                np.array([60, 110, 210], dtype=np.uint8)             # blue
+            diag_colors[stages["in_image"] & ~stages["in_bbox"]] = \
+                np.array([220, 200, 60], dtype=np.uint8)             # yellow
+            diag_colors[stages["in_bbox"]] = \
+                np.array([230, 30, 30], dtype=np.uint8)              # red
+            write_ply(
+                os.path.join(args.out_dir, f"scene_proj_diag{sfx}.ply"),
+                coord, diag_colors,
+            )
+            print(f"[save] {args.out_dir}/scene_proj_diag{sfx}.ply  "
+                  "(red=bbox, yellow=in image, blue=in front, grey=behind cam)")
+
             if n_kept_pose == 0:
-                print("[pose] EMPTY frustum — pose probably wrong; "
-                      "ignoring frustum filter.")
+                print("[pose] EMPTY frustum after depth check — "
+                      "ignoring frustum filter for the rest of the run.")
                 frustum_mask = None
+                if not args.invert_pose:
+                    print("       Hint: if scene_proj_diag is mostly grey "
+                          "(behind-camera) or blue (off-image), try "
+                          "`--invert-pose` — your pose .txt may store "
+                          "world→cam instead of cam→world.")
 
     # Output filename suffix → both modes can coexist in one out-dir for
     # direct side-by-side comparison.
