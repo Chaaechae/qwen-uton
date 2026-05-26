@@ -58,24 +58,37 @@ Inputs
   --qwen-path    Path to Qwen3.5-4B HF dir (same one H trained against).
   --out-dir      Where to write the 2D overlay PNG + 3D heatmap PLY.
 
-Outputs
--------
-  <out>/attn_2d.png       Static 2D matplotlib overlay (input image
-                          side-by-side with attention heatmap).
-  <out>/scene_rgb.ply     Original-color point cloud (for orientation).
-  <out>/scene_heatmap.ply Per-point similarity heatmap (jet colormap).
-  <out>/scene_top.ply     Top-K most similar points isolated (K = 1024
-                          default; --top-k to change).
-  <out>/viz.html          ★ Single interactive Plotly page:
-                          LEFT  — input image with attention overlay.
-                          RIGHT — 3D point cloud, orbit/zoom/rotate,
-                                  hover shows (x, y, z, similarity).
-                          Browser-renderable, no extra deps; subsamples
-                          to --plot-max-points (default 80000) when the
-                          cloud is large.
+Grounding modes
+---------------
+--ground-mode siglip    (default) external SigLIP gives a text-image
+                        cosine heatmap → percentile-threshold ROI mask.
+                        Robust open-vocab, but adds SigLIP to inference.
+--ground-mode qwen-bbox Ask Qwen3.5-VL to emit a bbox via generation
+                        ("Locate the X. Output (x1,y1),(x2,y2)."), parse
+                        the coordinates, rasterize as a soft cell-area
+                        mask on the 16x16 grid.  Single-model pipeline;
+                        leans on Qwen's grounding training.  Useful for
+                        compositional queries SigLIP struggles with.
+
+Run both modes against the same scene/query/image and compare the
+scene_heatmap_*.ply / viz_*.html outputs to judge whether the H-aligned
+bridge truly carries Qwen's grounding into 3D as well as it carries
+SigLIP's.
+
+Outputs (suffixed by --ground-mode for side-by-side comparison)
+---------------------------------------------------------------
+  <out>/scene_rgb.ply                 Original-color point cloud (shared).
+  <out>/attn_2d_<mode>.png            2D matplotlib overlay; qwen-bbox
+                                      mode draws the parsed rectangle.
+  <out>/scene_heatmap_<mode>.ply      Per-point similarity heatmap.
+  <out>/scene_top_<mode>.ply          Top-K most similar points isolated.
+  <out>/viz_<mode>.html               ★ Interactive Plotly page:
+                                      LEFT — input image + ROI overlay,
+                                      RIGHT — 3D heatmap, orbit/zoom.
 
 Usage
 -----
+  # baseline (SigLIP-based ROI)
   python demo/text_query_to_3d_localization.py \\
       --scene-dir /group-volume/3Ddataset/data/scannet/val/scene0011_00 \\
       --image-path images/val/scene0011_00/color/12.png \\
@@ -83,10 +96,16 @@ Usage
       --h-ckpt exp/utonia_q35_h/model/model_last.pth \\
       --qwen-path /group-volume/chaewon.yun/Qwen3.5-4B \\
       --out-dir exp/demo/scene0011_00_refrigerator
+
+  # comparison run (Qwen-native bbox ROI) — same out-dir
+  python demo/text_query_to_3d_localization.py \\
+      ...same args... \\
+      --ground-mode qwen-bbox
 """
 
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -290,8 +309,17 @@ def siglip_grounding_map(siglip, image_pil, text_query, device):
 # Qwen3.5-VL — token embedding (text side) + vision tower (image side).
 # Uses transformers.AutoModelForImageTextToText, same as H training.
 # ---------------------------------------------------------------------------
-def build_qwen(qwen_path, device):
-    print(f"[load] Qwen: {qwen_path}")
+def build_qwen(qwen_path, device, keep_llm=False):
+    """Load Qwen3.5-VL. Returns dict with tokenizer/processor/embed_tokens/visual.
+
+    If keep_llm=True, also keeps the full model under key 'model' so it can
+    run .generate() — needed for --ground-mode qwen-bbox (Qwen-native
+    grounding via autoregressive bbox emission).  Otherwise the LLM body
+    is freed and only embed_tokens + visual stay resident (the original
+    SigLIP path didn't need generation).
+    """
+    print(f"[load] Qwen: {qwen_path}"
+          f"  ({'full LLM (for grounding gen)' if keep_llm else 'visual+embed only'})")
     from transformers import (
         AutoTokenizer, AutoModelForImageTextToText, AutoProcessor,
     )
@@ -303,16 +331,221 @@ def build_qwen(qwen_path, device):
     model = AutoModelForImageTextToText.from_pretrained(
         qwen_path, trust_remote_code=True, torch_dtype=torch.bfloat16,
     )
-    # Grab the embed_tokens layer + visual tower; free the rest.
+    model = model.to(device).eval()
     embed_tokens = model.get_input_embeddings()
     visual = model.model.visual
-    embed_tokens = embed_tokens.to(device).eval()
-    visual = visual.to(device).eval()
-    # Drop the LLM body to save VRAM — we only need embed_tokens + visual.
-    del model
-    torch.cuda.empty_cache()
-    return dict(tokenizer=tokenizer, embed_tokens=embed_tokens,
-                visual=visual, processor=processor)
+    result = dict(tokenizer=tokenizer, embed_tokens=embed_tokens,
+                  visual=visual, processor=processor)
+    if keep_llm:
+        result["model"] = model
+    else:
+        # Drop the LLM body to save VRAM.
+        del model
+        torch.cuda.empty_cache()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Qwen-native grounding (alternative to SigLIP).
+#
+# Qwen3.5-VL was trained on grounding data where the LM is supervised to
+# emit bounding-box coordinates as text tokens (Qwen2.5-VL canonical
+# format:  <|object_ref_start|>name<|object_ref_end|>
+#          <|box_start|>(x1,y1),(x2,y2)<|box_end|> ).  This taps that
+# capability directly instead of relying on an external contrastive
+# model: text query → LLM generation → parse bbox → rasterize a soft
+# mask onto Qwen's 16×16 patch grid → same downstream pipeline as the
+# SigLIP path.
+#
+# Why this is interesting to compare against SigLIP
+# ------------------------------------------------
+# * Qwen knows much richer object/relation vocabulary than SigLIP.
+# * Qwen can ground compositional queries ("the chair NEAR the window")
+#   while SigLIP gets diluted on relations.
+# * If the H-aligned bridge truly works, the 3D heatmap from a
+#   Qwen-derived ROI should be at least as clean as the SigLIP one.
+#   When it isn't, the gap is informative — points to either ROI quality
+#   issues or to the 2D→3D bridge being imperfect.
+# ---------------------------------------------------------------------------
+def _parse_first_bbox(text):
+    """Parse the first 4-number bbox from a generation string.
+
+    Handles:
+      <|box_start|>(x1,y1),(x2,y2)<|box_end|>   ← Qwen 2.5/3.x canonical
+      (x1,y1),(x2,y2)
+      [x1, y1, x2, y2]
+      x1, y1, x2, y2
+
+    Returns a tuple of 4 floats or None.
+    """
+    # Strip Qwen special tokens to simplify regex.
+    clean = re.sub(r"<\|[^|]+\|>", " ", text)
+    # (a,b),(c,d) — paired tuples
+    m = re.search(
+        r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)"
+        r"\s*,\s*"
+        r"\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)",
+        clean,
+    )
+    if m:
+        return tuple(float(g) for g in m.groups())
+    # [a, b, c, d] — flat list
+    m = re.search(
+        r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,"
+        r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]",
+        clean,
+    )
+    if m:
+        return tuple(float(g) for g in m.groups())
+    # Fallback: any 4 separator-delimited numbers
+    m = re.search(
+        r"(-?\d+(?:\.\d+)?)[\s,]+(-?\d+(?:\.\d+)?)[\s,]+"
+        r"(-?\d+(?:\.\d+)?)[\s,]+(-?\d+(?:\.\d+)?)",
+        clean,
+    )
+    if m:
+        return tuple(float(g) for g in m.groups())
+    return None
+
+
+@torch.inference_mode()
+def qwen_bbox_grounding(qwen, image_pil, text_query, device, image_size=512):
+    """Use Qwen LLM generation to ground the query as a 2D bbox.
+
+    Returns (bbox_norm, raw_text):
+        bbox_norm : (x1, y1, x2, y2) in normalized [0, 1] image coords,
+                    or None if generation produced no parseable bbox.
+        raw_text  : the model's raw output string (for logging / debug).
+    """
+    if "model" not in qwen:
+        raise RuntimeError(
+            "qwen-bbox mode needs the full LLM but build_qwen was called "
+            "with keep_llm=False.")
+    if qwen["processor"] is None:
+        raise RuntimeError("Qwen processor not available; cannot run generate.")
+    model = qwen["model"]
+    processor = qwen["processor"]
+    tokenizer = qwen["tokenizer"]
+
+    # Squashed-resize to a known square so the bbox we get back lives in
+    # the same image geometry as the 16×16 grid used by qwen_vision_full_
+    # merger downstream.  Processor may further smart-resize to a multiple
+    # of patch_size; we normalize bbox by image_grid_thw below to absorb
+    # that small adjustment exactly.
+    img = image_pil.convert("RGB").resize((image_size, image_size))
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {
+                    "type": "text",
+                    "text": (
+                        f"Locate the {text_query} in the image. "
+                        "Respond with only the bounding box coordinates "
+                        "in the format (x1,y1),(x2,y2)."
+                    ),
+                },
+            ],
+        }
+    ]
+    text_inp = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    inputs = processor(text=[text_inp], images=[img], return_tensors="pt")
+    inputs = {
+        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+        for k, v in inputs.items()
+    }
+
+    out_ids = model.generate(
+        **inputs,
+        max_new_tokens=96,
+        do_sample=False,
+    )
+    in_len = inputs["input_ids"].shape[1]
+    gen_text = tokenizer.decode(out_ids[0, in_len:], skip_special_tokens=False)
+    print(f"[qwen-bbox] raw generation: {gen_text!r}")
+
+    raw_bbox = _parse_first_bbox(gen_text)
+    if raw_bbox is None:
+        return None, gen_text
+
+    # Determine coord scale.  Qwen2.5/3.x-VL canonically uses absolute
+    # pixel coords in the processor's *resized* image space.  Some
+    # variants normalize to 0-1000.  Use image_grid_thw + patch_size to
+    # recover the processor's actual H/W, then decide based on magnitude.
+    if "image_grid_thw" in inputs:
+        thw = inputs["image_grid_thw"][0]  # (3,)
+        try:
+            patch_size = model.config.vision_config.patch_size
+        except AttributeError:
+            patch_size = getattr(model.config, "patch_size", 14)
+        proc_H = int(thw[1].item() * patch_size)
+        proc_W = int(thw[2].item() * patch_size)
+    else:
+        proc_H = proc_W = image_size
+
+    x1, y1, x2, y2 = raw_bbox
+    max_coord = max(abs(x1), abs(y1), abs(x2), abs(y2))
+    if max_coord <= 1.5:
+        # Already normalized [0, 1].
+        x1n, y1n, x2n, y2n = x1, y1, x2, y2
+        scale_note = "normalized [0,1]"
+    elif max_coord > max(proc_W, proc_H) and max_coord <= 1001:
+        # Exceeds the proc image dims but fits in 0-1000 → must be the
+        # 0-1000 normalized convention.
+        x1n, x2n = x1 / 1000.0, x2 / 1000.0
+        y1n, y2n = y1 / 1000.0, y2 / 1000.0
+        scale_note = "normalized 0-1000"
+    else:
+        # Absolute pixel coords in proc_H × proc_W.
+        x1n, x2n = x1 / proc_W, x2 / proc_W
+        y1n, y2n = y1 / proc_H, y2 / proc_H
+        scale_note = f"pixel in {proc_W}x{proc_H}"
+
+    # Enforce ordering and clamp to [0, 1].
+    x1n, x2n = sorted((x1n, x2n))
+    y1n, y2n = sorted((y1n, y2n))
+    bbox_norm = (
+        max(0.0, min(1.0, x1n)),
+        max(0.0, min(1.0, y1n)),
+        max(0.0, min(1.0, x2n)),
+        max(0.0, min(1.0, y2n)),
+    )
+    print(f"[qwen-bbox] parsed bbox ({scale_note}) → norm={bbox_norm}")
+    return bbox_norm, gen_text
+
+
+def bbox_to_grid_mask(bbox_norm, h_grid, w_grid, device):
+    """Rasterize a normalized bbox to a soft (h_grid, w_grid) mask.
+
+    Each cell's value is (bbox ∩ cell area) / (cell area), so cells
+    entirely inside the box get 1.0 and cells partially covered get a
+    fractional weight — better than a hard binary mask when the box
+    happens to align poorly with the 16×16 grid.
+    """
+    x1, y1, x2, y2 = bbox_norm
+    mask = torch.zeros(h_grid, w_grid, device=device)
+    cell_w = 1.0 / w_grid
+    cell_h = 1.0 / h_grid
+    cell_area = cell_w * cell_h
+    for r in range(h_grid):
+        py1 = r * cell_h
+        py2 = (r + 1) * cell_h
+        iy1 = max(py1, y1)
+        iy2 = min(py2, y2)
+        if iy2 <= iy1:
+            continue
+        for c in range(w_grid):
+            px1 = c * cell_w
+            px2 = (c + 1) * cell_w
+            ix1 = max(px1, x1)
+            ix2 = min(px2, x2)
+            if ix2 > ix1:
+                mask[r, c] = (ix2 - ix1) * (iy2 - iy1) / cell_area
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -460,10 +693,12 @@ def utonia_point_features(backbone, coord, color, normal, device):
 # ---------------------------------------------------------------------------
 # Save the 2D attention as an overlay PNG.
 # ---------------------------------------------------------------------------
-def save_2d_overlay(image_pil, attn_grid, out_path):
+def save_2d_overlay(image_pil, attn_grid, out_path, bbox_norm=None,
+                     title_suffix=""):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
     fig, ax = plt.subplots(1, 2, figsize=(12, 6))
     ax[0].imshow(image_pil)
     ax[0].set_title("input image")
@@ -475,7 +710,14 @@ def save_2d_overlay(image_pil, attn_grid, out_path):
     a = (a - a.min()) / max(a.max() - a.min(), 1e-9)
     ax[1].imshow(a, alpha=0.55, cmap="jet",
                  extent=(0, w, h, 0), interpolation="bilinear")
-    ax[1].set_title(f"2D query attention")
+    if bbox_norm is not None:
+        x1, y1, x2, y2 = bbox_norm
+        rect = mpatches.Rectangle(
+            (x1 * w, y1 * h), (x2 - x1) * w, (y2 - y1) * h,
+            linewidth=2.5, edgecolor="#00ff00", facecolor="none",
+        )
+        ax[1].add_patch(rect)
+    ax[1].set_title(f"2D query attention{title_suffix}")
     ax[1].axis("off")
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
@@ -488,7 +730,7 @@ def save_2d_overlay(image_pil, attn_grid, out_path):
 # ---------------------------------------------------------------------------
 def save_plotly_combined(
     image_pil, attn_grid, coord, color_rgb, sim_3d, query_text, out_path,
-    max_points=80000, point_size=2,
+    max_points=80000, point_size=2, bbox_norm=None, mode_label="",
 ):
     """
     image_pil  : PIL.Image input image
@@ -528,6 +770,24 @@ def save_plotly_combined(
     overlay = (0.45 * img + 0.55 * jet)
     overlay = (np.clip(overlay, 0, 1) * 255).astype(np.uint8)
 
+    # Draw bbox rectangle onto the overlay if provided (qwen-bbox mode).
+    if bbox_norm is not None:
+        x1n, y1n, x2n, y2n = bbox_norm
+        x1, x2 = int(round(x1n * W)), int(round(x2n * W))
+        y1, y2 = int(round(y1n * H)), int(round(y2n * H))
+        x1, x2 = max(0, x1), min(W - 1, x2)
+        y1, y2 = max(0, y1), min(H - 1, y2)
+        line_color = np.array([0, 255, 0], dtype=np.uint8)
+        for t in range(3):  # 3-pixel-thick stroke
+            if 0 <= y1 - t < H:
+                overlay[y1 - t, x1:x2 + 1] = line_color
+            if 0 <= y2 + t < H:
+                overlay[y2 + t, x1:x2 + 1] = line_color
+            if 0 <= x1 - t < W:
+                overlay[y1:y2 + 1, x1 - t] = line_color
+            if 0 <= x2 + t < W:
+                overlay[y1:y2 + 1, x2 + t] = line_color
+
     # ---------- 3D side: subsample for browser performance ----------------
     n = coord.shape[0]
     if n > max_points:
@@ -549,8 +809,11 @@ def save_plotly_combined(
         rows=1, cols=2,
         specs=[[{"type": "image"}, {"type": "scene"}]],
         column_widths=[0.4, 0.6],
-        subplot_titles=(f"2D attention  (query='{query_text}')",
-                        "3D point cloud — heatmap"),
+        subplot_titles=(
+            f"2D attention  (query='{query_text}'"
+            f"{', mode=' + mode_label if mode_label else ''})",
+            "3D point cloud — heatmap",
+        ),
         horizontal_spacing=0.04,
     )
 
@@ -584,7 +847,10 @@ def save_plotly_combined(
     )
 
     fig.update_layout(
-        title=f"Text-query 3D localization — '{query_text}'",
+        title=(
+            f"Text-query 3D localization — '{query_text}'"
+            f"{'  [' + mode_label + ']' if mode_label else ''}"
+        ),
         height=720, width=1500,
         scene=dict(
             aspectmode="data",
@@ -611,12 +877,23 @@ def parse_args():
                    help="Text query, e.g. 'refrigerator' or '냉장고'")
     p.add_argument("--h-ckpt",     required=True)
     p.add_argument("--qwen-path",  required=True)
+    p.add_argument(
+        "--ground-mode", choices=["siglip", "qwen-bbox"], default="siglip",
+        help="How to convert the text query into a 2D ROI on Qwen's 16x16 "
+             "patch grid.  'siglip' (default) uses an external "
+             "contrastively-trained model — robust, but adds a SigLIP "
+             "dependency at inference.  'qwen-bbox' uses Qwen3.5-VL's "
+             "own grounding ability (LLM emits bbox coordinates as text "
+             "tokens) — keeps the pipeline single-model but quality "
+             "depends on Qwen recognizing the query.  Run both, compare "
+             "the 3D heatmap PLYs.")
     p.add_argument("--siglip-path", default="google/siglip2-base-patch16-256",
-                   help="SigLIP model used for text→2D grounding.  Qwen3.5-VL "
-                        "is NOT a CLIP-style contrastive model — its text "
+                   help="SigLIP model used for text→2D grounding when "
+                        "--ground-mode siglip.  Qwen3.5-VL is NOT a "
+                        "CLIP-style contrastive model — its text "
                         "embed_tokens and vision patches share a dim but are "
-                        "NOT cosine-comparable, so we use SigLIP for the 2D "
-                        "side and Qwen only for the 3D-bridge query feature.")
+                        "NOT cosine-comparable, so the cosine-based ROI "
+                        "step needs an external contrastive model here.")
     p.add_argument("--out-dir",    required=True)
     p.add_argument("--siglip-thr-percentile", type=float, default=85.0,
                    help="Percentile threshold (0..100) on the SigLIP 2D map "
@@ -662,9 +939,15 @@ def main():
     print(f"[image] {args.image_path}")
 
     # --- Build models ------------------------------------------------------
-    qwen = build_qwen(args.qwen_path, device)
+    # Qwen: need the full LLM iff we're going to call .generate() for the
+    # bbox-grounding path; otherwise we drop the LM body to save VRAM.
+    qwen = build_qwen(
+        args.qwen_path, device,
+        keep_llm=(args.ground_mode == "qwen-bbox"),
+    )
     h = build_h_modules(args.h_ckpt, device)
-    siglip = build_siglip(args.siglip_path, device)
+    siglip = (build_siglip(args.siglip_path, device)
+              if args.ground_mode == "siglip" else None)
 
     # --- Image → Qwen 2D patches (post-merger, 2560-d) ---------------------
     image_tensor, image_pil = image_to_qwen_tensor(args.image_path, 512)
@@ -674,49 +957,74 @@ def main():
     print(f"[2D]  Qwen merged patches: {h_grid}x{w_grid} x {D2}")
     patch_2d_flat = patch_2d.reshape(-1, D2).float()  # (256, 2560)
 
-    # --- SigLIP 2D grounding ---------------------------------------------
-    # The proper text→2D map.  SigLIP IS trained contrastively (cosine
-    # of text & image features is the loss), so this gives a clean
-    # localization of the query object in image-pixel space.
-    print(f"[siglip] computing text-image map for query='{args.query}' ...")
-    sig_heat, h_sig, w_sig = siglip_grounding_map(
-        siglip, image_pil, args.query, device,
+    # --- Build the 2D ROI mask from the chosen grounding source -----------
+    # Two paths, same downstream:
+    #   siglip   : external contrastive model gives a soft heatmap →
+    #              percentile threshold → binary mask.
+    #   qwen-bbox: Qwen LLM emits a bbox as text tokens → rasterize to
+    #              a soft cell-area mask on the 16x16 grid.
+    bbox_norm = None
+    if args.ground_mode == "siglip":
+        print(f"[siglip] computing text-image map for query='{args.query}' ...")
+        sig_heat, h_sig, w_sig = siglip_grounding_map(
+            siglip, image_pil, args.query, device,
+        )
+        print(f"[siglip] grid={h_sig}x{w_sig}  "
+              f"heat range=[{sig_heat.min().item():.3f}, "
+              f"{sig_heat.max().item():.3f}]")
+        # Resample SigLIP heatmap onto Qwen's post-merger 16x16 grid so we
+        # can use it to weight Qwen patches.
+        qwen_heat = F.interpolate(
+            sig_heat[None, None],
+            size=(h_grid, w_grid), mode="bilinear", align_corners=False,
+        )[0, 0]  # (h_grid, w_grid)
+        thr = torch.quantile(qwen_heat.flatten(),
+                             args.siglip_thr_percentile / 100)
+        mask = (qwen_heat >= thr).float()
+        print(f"[siglip] threshold @ p{args.siglip_thr_percentile:.0f} = "
+              f"{thr.item():.3f}")
+    else:  # qwen-bbox
+        print(f"[qwen-bbox] grounding query='{args.query}' "
+              "via Qwen LLM generation ...")
+        bbox_norm, _gen = qwen_bbox_grounding(
+            qwen, image_pil, args.query, device,
+        )
+        if bbox_norm is None:
+            print("[qwen-bbox] failed to parse a bbox from generation. "
+                  "Falling back to uniform mask over all patches "
+                  "(comparison against siglip will not be meaningful).")
+            mask = torch.ones(h_grid, w_grid, device=device)
+        else:
+            mask = bbox_to_grid_mask(bbox_norm, h_grid, w_grid, device)
+        # Use the mask itself as the 'heatmap' for 2D visualization.
+        qwen_heat = mask
+
+    mask_flat = mask.flatten()
+    n_kept = int((mask_flat > 0).sum().item())
+    print(f"[mask] mode={args.ground_mode}  nonzero={n_kept}/{h_grid*w_grid}"
+          f"  sum={mask_flat.sum().item():.2f}")
+
+    # Output filename suffix → both modes can coexist in one out-dir for
+    # direct side-by-side comparison.
+    sfx = f"_{args.ground_mode}"
+
+    save_2d_overlay(
+        image_pil, qwen_heat,
+        os.path.join(args.out_dir, f"attn_2d{sfx}.png"),
+        bbox_norm=bbox_norm,
+        title_suffix=f" [{args.ground_mode}]",
     )
-    print(f"[siglip] grid={h_sig}x{w_sig}  "
-          f"heat range=[{sig_heat.min().item():.3f}, "
-          f"{sig_heat.max().item():.3f}]")
+    print(f"[save] {args.out_dir}/attn_2d{sfx}.png")
 
-    # Resample SigLIP heatmap onto Qwen's post-merger 16x16 grid so we
-    # can use it to weight Qwen patches.
-    qwen_heat = F.interpolate(
-        sig_heat[None, None],
-        size=(h_grid, w_grid), mode="bilinear", align_corners=False,
-    )[0, 0]  # (h_grid, w_grid)
-
-    # Threshold: only patches above the percentile contribute to the
-    # grounded query.  Avoids the "diluted everywhere" failure when we
-    # use a soft weighting over all 256 patches.
-    thr = torch.quantile(qwen_heat.flatten(), args.siglip_thr_percentile / 100)
-    mask = (qwen_heat >= thr).float()  # (h_grid, w_grid)
-    mask_flat = mask.flatten()         # (256,)
-    n_kept = int(mask_flat.sum().item())
-    print(f"[siglip] threshold @ p{args.siglip_thr_percentile:.0f} = "
-          f"{thr.item():.3f}; {n_kept}/{h_grid*w_grid} patches kept")
-
-    # Visualization: jet heatmap of SigLIP map upsampled to image size.
-    save_2d_overlay(image_pil, qwen_heat,
-                    os.path.join(args.out_dir, "attn_2d.png"))
-    print(f"[save] {args.out_dir}/attn_2d.png")
-
-    # --- Grounded query feature: avg of Qwen patches INSIDE SigLIP ROI ---
+    # --- Grounded query feature: weighted avg of Qwen patches inside ROI -
     # The Qwen patches `patch_2d_flat` live in H's qwen_proj training
     # distribution; we just need to pick the spatially right subset.
-    # SigLIP-derived mask tells us which patches lie on the object —
-    # average ONLY those (uniform weight inside ROI, zero outside).
-    if n_kept == 0:
-        # All-low SigLIP map (shouldn't happen if query in vocab);
-        # fall back to all-patches average so the pipeline still runs.
-        print("[warn] SigLIP map empty after threshold — falling back to "
+    # The ROI mask (from SigLIP threshold or from Qwen bbox raster) tells
+    # us which patches lie on the object — average with the mask as
+    # weights so partially-covered cells contribute partially.
+    if mask_flat.sum() <= 0:
+        # All-zero mask — fall back to uniform so the pipeline still runs.
+        print("[warn] ROI mask empty — falling back to "
               "uniform average over all patches.")
         weights = torch.ones_like(mask_flat) / mask_flat.numel()
     else:
@@ -777,28 +1085,29 @@ def main():
           f"mean={sim_3d.mean():.3f}, std={sim_3d.std():.3f}")
 
     # --- Render PLYs ------------------------------------------------------
-    # (a) rgb for orientation
+    # (a) rgb for orientation — shared across modes (overwrite OK).
     write_ply(os.path.join(args.out_dir, "scene_rgb.ply"), coord, color)
 
-    # (b) heatmap colored by sim (after percentile-stretch for visibility)
+    # (b) heatmap colored by sim (after percentile-stretch for visibility).
+    # Mode suffix keeps siglip and qwen-bbox outputs side-by-side.
     sim_lo, sim_hi = np.percentile(sim_3d, [5, 99])
     sim_norm = np.clip((sim_3d - sim_lo) / max(sim_hi - sim_lo, 1e-9), 0, 1)
     hot = jet_colormap(sim_norm).astype(np.uint8)
-    write_ply(os.path.join(args.out_dir, "scene_heatmap.ply"), coord, hot)
-    print(f"[save] {args.out_dir}/scene_heatmap.ply")
+    write_ply(os.path.join(args.out_dir, f"scene_heatmap{sfx}.ply"),
+              coord, hot)
+    print(f"[save] {args.out_dir}/scene_heatmap{sfx}.ply")
 
     # (c) top-K most similar points only
     k = min(args.top_k, len(sim_3d))
     idx_top = np.argpartition(-sim_3d, k - 1)[:k]
-    write_ply(os.path.join(args.out_dir, "scene_top.ply"),
+    write_ply(os.path.join(args.out_dir, f"scene_top{sfx}.ply"),
               coord[idx_top], np.array([[230, 30, 30]] * k, dtype=np.uint8))
-    print(f"[save] {args.out_dir}/scene_top.ply  (top {k} pts)")
+    print(f"[save] {args.out_dir}/scene_top{sfx}.ply  (top {k} pts)")
 
     # (d) interactive Plotly HTML — 2D overlay + 3D heatmap together.
-    # Pass SigLIP's per-patch grounding map (already on Qwen's 16x16 grid
-    # and stretched to [0, 1]) so the 2D side shows a clean object-
-    # specific heat instead of a diffuse all-cells map.
-    html_path = os.path.join(args.out_dir, "viz.html")
+    # The 2D heat is whichever ROI source we used; qwen-bbox additionally
+    # draws the parsed rectangle in green on the overlay.
+    html_path = os.path.join(args.out_dir, f"viz{sfx}.html")
     save_plotly_combined(
         image_pil=image_pil,
         attn_grid=qwen_heat,
@@ -809,6 +1118,8 @@ def main():
         out_path=html_path,
         max_points=args.plot_max_points,
         point_size=args.plot_point_size,
+        bbox_norm=bbox_norm,
+        mode_label=args.ground_mode,
     )
     print(f"[save] {html_path}  "
           "(open in browser — left: 2D attention, right: 3D heatmap, "
