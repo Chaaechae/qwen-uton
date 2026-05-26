@@ -783,6 +783,7 @@ def save_2d_overlay(image_pil, attn_grid, out_path, bbox_norm=None,
 def save_plotly_combined(
     image_pil, attn_grid, coord, color_rgb, sim_3d, query_text, out_path,
     max_points=80000, point_size=2, bbox_norm=None, mode_label="",
+    top_percentile=10.0,
 ):
     """
     image_pil  : PIL.Image input image
@@ -851,10 +852,26 @@ def save_plotly_combined(
         coord_s = coord
         sim_s   = sim_3d
 
-    # Percentile-stretch for visibility (otherwise tail outliers compress
-    # the useful range into a thin band of color).
-    lo, hi = np.percentile(sim_s, [5, 99])
-    sim_norm = np.clip((sim_s - lo) / max(hi - lo, 1e-9), 0, 1)
+    # Top-percentile split: above-threshold rendered with jet colors and
+    # full opacity, below-threshold as faint grey context.  Stretch jet
+    # over the above-threshold range so the highest scores are red and
+    # the threshold itself sits near blue.
+    if top_percentile < 100.0:
+        score_thr = float(np.percentile(sim_s, 100.0 - top_percentile))
+        above = sim_s >= score_thr
+    else:
+        score_thr = float(sim_s.min())
+        above = np.ones_like(sim_s, dtype=bool)
+
+    if above.any():
+        above_lo = float(sim_s[above].min())
+        above_hi = float(sim_s[above].max())
+        sim_norm_above = np.clip(
+            (sim_s[above] - above_lo) / max(above_hi - above_lo, 1e-9),
+            0, 1,
+        )
+    else:
+        sim_norm_above = np.zeros(0, dtype=np.float32)
 
     # ---------- Build subplots --------------------------------------------
     fig = make_subplots(
@@ -871,32 +888,61 @@ def save_plotly_combined(
 
     fig.add_trace(go.Image(z=overlay), row=1, col=1)
 
-    # 3D scatter with jet colorbar.
-    fig.add_trace(
-        go.Scatter3d(
-            x=coord_s[:, 0], y=coord_s[:, 1], z=coord_s[:, 2],
-            mode="markers",
-            marker=dict(
-                size=point_size,
-                color=sim_norm,
-                colorscale="Jet",
-                cmin=0.0, cmax=1.0,
-                showscale=True,
-                colorbar=dict(
-                    title=dict(text="sim(query, 3D)",
-                               side="right"),
-                    thickness=14, len=0.7, x=1.02,
+    # 3D scatter — two traces for clean object isolation:
+    #   (a) below-threshold points: faint grey context.
+    #   (b) above-threshold points: jet colored, full opacity.
+    coord_below = coord_s[~above]
+    if coord_below.shape[0] > 0:
+        fig.add_trace(
+            go.Scatter3d(
+                x=coord_below[:, 0],
+                y=coord_below[:, 1],
+                z=coord_below[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=max(1, point_size - 1),
+                    color="rgb(170,170,170)",
+                    opacity=0.18,
                 ),
-                opacity=0.95,
+                hoverinfo="skip",
+                name="context",
             ),
-            hovertemplate=(
-                "x: %{x:.2f}<br>y: %{y:.2f}<br>z: %{z:.2f}"
-                "<br>sim: %{marker.color:.3f}<extra></extra>"
+            row=1, col=2,
+        )
+
+    coord_above = coord_s[above]
+    sim_above_raw = sim_s[above]
+    if coord_above.shape[0] > 0:
+        fig.add_trace(
+            go.Scatter3d(
+                x=coord_above[:, 0],
+                y=coord_above[:, 1],
+                z=coord_above[:, 2],
+                mode="markers",
+                marker=dict(
+                    size=point_size,
+                    color=sim_norm_above,
+                    colorscale="Jet",
+                    cmin=0.0, cmax=1.0,
+                    showscale=True,
+                    colorbar=dict(
+                        title=dict(
+                            text=f"top {top_percentile:.0f}% score",
+                            side="right",
+                        ),
+                        thickness=14, len=0.7, x=1.02,
+                    ),
+                    opacity=0.97,
+                ),
+                customdata=sim_above_raw,
+                hovertemplate=(
+                    "x: %{x:.2f}<br>y: %{y:.2f}<br>z: %{z:.2f}"
+                    "<br>score: %{customdata:.3f}<extra></extra>"
+                ),
+                name=f"top {top_percentile:.0f}%",
             ),
-            name="points",
-        ),
-        row=1, col=2,
-    )
+            row=1, col=2,
+        )
 
     fig.update_layout(
         title=(
@@ -962,6 +1008,26 @@ def parse_args():
                         "(unused when --siglip-path is set).")
     p.add_argument("--top-k", type=int, default=1024,
                    help="# of top-scored points to isolate in scene_top.ply")
+    p.add_argument(
+        "--bg-subtract", dest="bg_subtract",
+        action="store_true", default=True,
+        help="Score points as cos(point, ROI-mean) - cos(point, "
+             "outside-ROI-mean) instead of plain cos against the ROI "
+             "mean.  Rewards 'looks like the object AND unlike the "
+             "scene background', which sharpens localization a lot. "
+             "On by default; pass --no-bg-subtract for a vanilla "
+             "ROI-cos baseline.")
+    p.add_argument(
+        "--no-bg-subtract", dest="bg_subtract", action="store_false",
+        help="Disable background subtraction (baseline ROI-cos only).")
+    p.add_argument(
+        "--top-percentile", type=float, default=10.0,
+        help="Show only the top X%% of (post-bg-subtract) scored points "
+             "with jet colors in scene_heatmap/viz; the rest are "
+             "rendered as flat grey context.  Counters the 'everything "
+             "is red' effect that percentile [5, 99] stretch produces "
+             "when the cos distribution is narrow.  Use 100 to disable "
+             "masking and color the full spectrum (old behavior).")
     p.add_argument("--plot-max-points", type=int, default=80000,
                    help="Subsample cap for the Plotly 3D scatter "
                         "(browser perf gets bad past ~150k).")
@@ -1074,25 +1140,43 @@ def main():
     )
     print(f"[save] {args.out_dir}/attn_2d{sfx}.png")
 
-    # --- Grounded query feature: weighted avg of Qwen patches inside ROI -
+    # --- Grounded query feature: pos = mean(ROI patches), neg = mean(rest)
     # The Qwen patches `patch_2d_flat` live in H's qwen_proj training
-    # distribution; we just need to pick the spatially right subset.
-    # The ROI mask (from SigLIP threshold or from Qwen bbox raster) tells
-    # us which patches lie on the object — average with the mask as
-    # weights so partially-covered cells contribute partially.
+    # distribution.  The ROI mask says which patches are on the object.
+    #   - q_pos : weighted mean inside ROI ("looks like the object")
+    #   - q_neg : weighted mean outside ROI ("looks like the scene
+    #             background of this image"), if --bg-subtract.
+    # Both are projected via H's qwen_proj into the 512-d common space;
+    # we score points later as cos(point, pos) - cos(point, neg), which
+    # rewards features that are distinctly object-like rather than
+    # generally "indoor-scene-like".
     if mask_flat.sum() <= 0:
-        # All-zero mask — fall back to uniform so the pipeline still runs.
-        print("[warn] ROI mask empty — falling back to "
-              "uniform average over all patches.")
-        weights = torch.ones_like(mask_flat) / mask_flat.numel()
+        print("[warn] ROI mask empty — falling back to uniform pos query.")
+        pos_weights = torch.ones_like(mask_flat) / mask_flat.numel()
     else:
-        weights = mask_flat / mask_flat.sum()
-    query_grounded = (weights.unsqueeze(-1) * patch_2d_flat).sum(dim=0)  # (2560,)
+        pos_weights = mask_flat / mask_flat.sum()
+    q_pos_2d = (pos_weights.unsqueeze(-1) * patch_2d_flat).sum(dim=0)  # (2560,)
+
+    q_neg_2d = None
+    if args.bg_subtract:
+        neg_mask = 1.0 - mask_flat
+        if float(neg_mask.sum().item()) > 0:
+            neg_weights = neg_mask / neg_mask.sum()
+            q_neg_2d = (neg_weights.unsqueeze(-1) * patch_2d_flat).sum(dim=0)
+        else:
+            print("[bg-subtract] mask covers entire image; "
+                  "no patches available for background — disabling.")
 
     with torch.inference_mode():
-        query_common = h["qwen_proj"](query_grounded.unsqueeze(0).float())[0]  # (512,)
-    print(f"[query] common.shape={tuple(query_common.shape)}, "
-          f"norm={query_common.norm().item():.3f}")
+        query_common = h["qwen_proj"](q_pos_2d.unsqueeze(0).float())[0]  # (512,)
+        if q_neg_2d is not None:
+            query_neg_common = h["qwen_proj"](q_neg_2d.unsqueeze(0).float())[0]
+        else:
+            query_neg_common = None
+    print(f"[query] pos.shape={tuple(query_common.shape)}, "
+          f"pos.norm={query_common.norm().item():.3f}"
+          + (f"  neg.norm={query_neg_common.norm().item():.3f}"
+             if query_neg_common is not None else "  (no bg-subtract)"))
 
     # --- Scene → Utonia → patch_proj → 512-d common -----------------------
     print("[3D]  running Utonia backbone ...")
@@ -1128,9 +1212,30 @@ def main():
                                          posinf=0.0, neginf=0.0)
 
     # --- Cosine sim at stage-1 resolution --------------------------------
+    # With --bg-subtract:  score = cos(point, q_pos) - cos(point, q_neg)
+    # Without:             score = cos(point, q_pos)   (legacy)
+    # Subtracting cosines (rather than the raw 2560-d query vectors before
+    # qwen_proj) is the right place to do this: each query goes through
+    # the LayerNorm-containing qwen_proj naturally, and the difference is
+    # taken in the scoring space where it semantically means "shift the
+    # ranking toward points that out-cosine the background".
     pcn = F.normalize(point_common_s1.float(), dim=-1, eps=1e-6)
     qcn = F.normalize(query_common.float(), dim=-1, eps=1e-6)
-    sim_s1 = (pcn @ qcn)  # (N_s1,)
+    sim_pos = (pcn @ qcn)  # (N_s1,)
+    if query_neg_common is not None:
+        qnc = F.normalize(query_neg_common.float(), dim=-1, eps=1e-6)
+        sim_neg = (pcn @ qnc)
+        sim_s1 = sim_pos - sim_neg
+        print(f"[sim] bg-subtracted  "
+              f"pos=[{sim_pos.min().item():.3f},{sim_pos.max().item():.3f}]  "
+              f"neg=[{sim_neg.min().item():.3f},{sim_neg.max().item():.3f}]  "
+              f"diff=[{sim_s1.min().item():.3f},{sim_s1.max().item():.3f}] "
+              f"mean={sim_s1.mean().item():.3f} std={sim_s1.std().item():.3f}")
+    else:
+        sim_s1 = sim_pos
+        print(f"[sim] raw cos  "
+              f"range=[{sim_s1.min().item():.3f},{sim_s1.max().item():.3f}] "
+              f"mean={sim_s1.mean().item():.3f} std={sim_s1.std().item():.3f}")
     sim_s1 = torch.nan_to_num(sim_s1, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Broadcast stage-1 sim → stage-0 grid via the stage-0→stage-1
@@ -1146,11 +1251,37 @@ def main():
     # (a) rgb for orientation — shared across modes (overwrite OK).
     write_ply(os.path.join(args.out_dir, "scene_rgb.ply"), coord, color)
 
-    # (b) heatmap colored by sim (after percentile-stretch for visibility).
-    # Mode suffix keeps siglip and qwen-bbox outputs side-by-side.
-    sim_lo, sim_hi = np.percentile(sim_3d, [5, 99])
-    sim_norm = np.clip((sim_3d - sim_lo) / max(sim_hi - sim_lo, 1e-9), 0, 1)
-    hot = jet_colormap(sim_norm).astype(np.uint8)
+    # (b) heatmap with top-percentile masking.
+    #
+    # The old "percentile [5, 99] stretch on the whole cloud" approach
+    # mapped 94% of points into jet's warm zone whenever the score
+    # distribution was narrow — visually indistinguishable from "the
+    # whole scene matches".  Instead: color only the top X% with a jet
+    # scale stretched OVER THAT TOP SUBSET, and grey out everything
+    # below — so the object pops, the rest provides context.
+    if args.top_percentile < 100.0:
+        score_thr = float(np.percentile(sim_3d, 100.0 - args.top_percentile))
+        above = sim_3d >= score_thr
+        n_above = int(above.sum())
+        print(f"[viz] top-{args.top_percentile:.1f}% threshold={score_thr:.4f}"
+              f"  ({n_above}/{len(sim_3d)} colored, rest grey)")
+    else:
+        above = np.ones_like(sim_3d, dtype=bool)
+        n_above = len(sim_3d)
+        score_thr = float(sim_3d.min())
+
+    if n_above > 0:
+        above_lo = float(sim_3d[above].min())
+        above_hi = float(sim_3d[above].max())
+        sim_norm = np.clip(
+            (sim_3d - above_lo) / max(above_hi - above_lo, 1e-9), 0, 1,
+        )
+    else:
+        sim_norm = np.zeros_like(sim_3d)
+
+    colors_above = jet_colormap(sim_norm).astype(np.uint8)
+    colors_grey = np.full_like(colors_above, 110)  # mid-grey context
+    hot = np.where(above[:, None], colors_above, colors_grey)
     write_ply(os.path.join(args.out_dir, f"scene_heatmap{sfx}.ply"),
               coord, hot)
     print(f"[save] {args.out_dir}/scene_heatmap{sfx}.ply")
@@ -1178,6 +1309,7 @@ def main():
         point_size=args.plot_point_size,
         bbox_norm=bbox_norm,
         mode_label=args.ground_mode,
+        top_percentile=args.top_percentile,
     )
     print(f"[save] {html_path}  "
           "(open in browser — left: 2D attention, right: 3D heatmap, "
