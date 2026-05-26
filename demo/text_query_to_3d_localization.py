@@ -1233,6 +1233,65 @@ def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15,
 
 
 # ---------------------------------------------------------------------------
+# Use the precomputed correspondence/<frame>.npy directly — the EXACT
+# 2D↔3D mapping that H/I training used.  Beats pose-based projection when
+# you don't have pose / depth / intrinsic, because:
+#   - No coordinate-convention mismatches (it's the same ray-cast that
+#     produced the InfoNCE supervision)
+#   - Occlusion is built in: a point hidden behind a closer surface has
+#     correspondence (-1, -1) for that frame, so it can't sneak into the
+#     bbox by being "behind another surface that the depth check accepted"
+#   - No need for K, T, depth files at all
+#
+# File layout (Pointcept-preprocessed ScanNet image dump):
+#   .../scene/correspondence/<frame>.npy   (N_points_full, 2)
+#     each row = (row_in_32x32, col_in_32x32) of that 3D point in this
+#     image's 32×32 Qwen patch grid, or (-1, -1) if not visible.
+#     Row-by-row aligned with the scene's coord.npy.
+# ---------------------------------------------------------------------------
+def load_correspondence_for_frame(image_path, override_path=None):
+    """Returns (corr_array, path_used) or (None, None) if not found."""
+    if override_path:
+        return (np.load(override_path), override_path)
+    color_dir = os.path.dirname(image_path)
+    scene_dir = os.path.dirname(color_dir)
+    frame = os.path.splitext(os.path.basename(image_path))[0]
+    candidates = [
+        os.path.join(scene_dir, "correspondence", f"{frame}.npy"),
+        os.path.join(scene_dir, "correspondences", f"{frame}.npy"),
+        os.path.join(scene_dir, f"correspondence_{frame}.npy"),
+        os.path.join(scene_dir, f"{frame}_correspondence.npy"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return np.load(p), p
+    return None, None
+
+
+def correspondence_bbox_mask(correspondence, bbox_norm, patch_grid=32):
+    """3D point mask from precomputed correspondence + 2D bbox.
+
+    For each 3D point, True iff its (row_32, col_32) in the Qwen patch
+    grid falls inside the bbox.  Points with (-1, -1) (not visible from
+    this frame) are False automatically → occlusion handled for free.
+
+    correspondence : (N, 2) int — (row_32, col_32) or (-1, -1)
+    bbox_norm      : (x1, y1, x2, y2) in [0, 1] of the image
+    patch_grid     : 32 by default (Qwen3.5-VL pre-merger grid)
+    """
+    x1, y1, x2, y2 = bbox_norm
+    valid = (correspondence[:, 0] >= 0) & (correspondence[:, 1] >= 0)
+    row = correspondence[:, 0].astype(np.float32)
+    col = correspondence[:, 1].astype(np.float32)
+    in_bbox = (
+        valid
+        & (row >= y1 * patch_grid) & (row < y2 * patch_grid)
+        & (col >= x1 * patch_grid) & (col < x2 * patch_grid)
+    )
+    return in_bbox, int(valid.sum())
+
+
+# ---------------------------------------------------------------------------
 # Pose estimation via feature-PnP — the same H-aligned 512-d space that
 # powers the cosine localization is ALSO sufficient to recover the
 # camera pose when none is given.  For each Qwen 2D patch we find its
@@ -1736,6 +1795,28 @@ def parse_args():
              "that drops scattered look-alike responses elsewhere in "
              "the scene.  Set to 0 to disable clustering.")
     p.add_argument(
+        "--use-correspondence", action="store_true", default=False,
+        help="Use the precomputed correspondence/<frame>.npy file (the "
+             "ray-cast mapping that H/I training used) to filter 3D "
+             "points by the 2D bbox.  Preferred over --use-pose when "
+             "you have correspondence files but no pose/intrinsic/depth, "
+             "because it's the EXACT mapping training saw, with built-in "
+             "occlusion handling: hidden points have (-1, -1) and are "
+             "auto-excluded.  No coordinate-convention or K-scale "
+             "concerns.  Implies the same downstream pipeline as "
+             "--use-pose (frustum mask → cosine score within frustum).")
+    p.add_argument(
+        "--correspondence-path", default=None,
+        help="Override path to <frame>.npy correspondence file (default: "
+             "auto-detect from --image-path siblings).")
+    p.add_argument(
+        "--correspondence-patch-grid", type=int, default=32,
+        help="Patch grid resolution of the correspondence file.  H/I "
+             "training stores (row, col) in 32x32 units even when the "
+             "effective post-merger grid is 16x16 (the loss path halves "
+             "via correspondence_stride=2).  Keep at 32 unless your "
+             "preprocessing differs.")
+    p.add_argument(
         "--use-pose", action="store_true", default=False,
         help="Enable camera-pose-based 2D→3D frustum filtering.  Loads "
              "pose / intrinsic / depth from sibling dirs of --image-path "
@@ -1953,17 +2034,86 @@ def main():
     # Both ground modes coexist in one out-dir for side-by-side compare.
     sfx = f"_{args.ground_mode}"
 
-    # --- Optional: pose-based bbox-to-frustum geometric mask -------------
-    # Two pose sources:
-    #   --use-pose      : load (K, T) and depth from ScanNet sibling files
-    #   --estimate-pose : recover (K_guess, T) via feature-PnP using
-    #                     patch_common_all ↔ point_common_s1 + coord_s1.
-    #                     Sets depth=None (occlusion check skipped).
-    # The frustum_mask itself is applied to sim_3d *after* KNN smoothing
-    # so the smoothing step isn't contaminated by clamped values.
+    # --- Optional: 2D bbox → 3D point mask, three possible sources ------
+    #   --use-correspondence : use the precomputed correspondence/<frame>.npy
+    #                          (the EXACT mapping H/I training used; built-in
+    #                          occlusion handling).  Best when you have it.
+    #   --use-pose           : load (K, T) and depth from ScanNet sibling
+    #                          files, project bbox into 3D frustum, occlusion
+    #                          via depth map.
+    #   --estimate-pose      : recover (K_guess, T) via feature-PnP using
+    #                          patch_common_all ↔ point_common_s1 + coord_s1.
+    #                          Sets depth=None (occlusion check skipped).
+    # The mask is applied to sim_3d *after* KNN smoothing so the smoothing
+    # step isn't contaminated by clamped values.
     frustum_mask = None
     cam = None
-    if args.use_pose or args.estimate_pose:
+
+    if args.use_correspondence:
+        bbox_for_frustum = bbox_norm
+        if bbox_for_frustum is None:
+            bbox_for_frustum = bbox_from_grid_mask(mask, h_grid, w_grid)
+            if bbox_for_frustum is not None:
+                print(f"[corr] derived bbox from ROI mask: "
+                      f"({bbox_for_frustum[0]:.3f}, {bbox_for_frustum[1]:.3f}, "
+                      f"{bbox_for_frustum[2]:.3f}, {bbox_for_frustum[3]:.3f})")
+        if bbox_for_frustum is None:
+            print("[corr] no bbox available; skipping correspondence filter.")
+        else:
+            corr, corr_path = load_correspondence_for_frame(
+                args.image_path, override_path=args.correspondence_path,
+            )
+            if corr is None:
+                print("[corr] correspondence file not found; tried:")
+                print(f"           {os.path.dirname(os.path.dirname(args.image_path))}"
+                      "/correspondence/<frame>.npy and variants.")
+                print("       Use --correspondence-path /abs/path or "
+                      "fall back to --use-pose / --estimate-pose.")
+            else:
+                print(f"[corr] loaded: {corr_path}")
+                print(f"[corr] correspondence shape: {corr.shape}  "
+                      f"vs coord.npy: {coord.shape[0]} points")
+                if corr.shape[0] != coord.shape[0]:
+                    print(f"[corr] WARN: correspondence row count "
+                          f"{corr.shape[0]} ≠ coord row count "
+                          f"{coord.shape[0]} — mapping is likely wrong, "
+                          "skipping correspondence filter.")
+                else:
+                    frustum_mask, n_valid = correspondence_bbox_mask(
+                        corr, bbox_for_frustum,
+                        patch_grid=args.correspondence_patch_grid,
+                    )
+                    n_kept = int(frustum_mask.sum())
+                    n_total = len(coord)
+                    print(f"[corr] visible in this frame: {n_valid}/"
+                          f"{n_total} ({100*n_valid/n_total:.1f}%)")
+                    print(f"[corr] inside bbox:           {n_kept}/"
+                          f"{n_total} ({100*n_kept/n_total:.2f}%)")
+                    # Debug PLY: red = inside bbox, yellow = visible but
+                    # outside bbox, grey = not visible in this frame.
+                    diag_colors = np.full(
+                        (n_total, 3), 80, dtype=np.uint8,
+                    )  # grey = (-1, -1)
+                    valid_mask = (corr[:, 0] >= 0) & (corr[:, 1] >= 0)
+                    diag_colors[valid_mask & ~frustum_mask] = \
+                        np.array([220, 200, 60], dtype=np.uint8)  # yellow
+                    diag_colors[frustum_mask] = \
+                        np.array([230, 30, 30], dtype=np.uint8)   # red
+                    write_ply(
+                        os.path.join(args.out_dir,
+                                     f"scene_proj_diag{sfx}.ply"),
+                        coord, diag_colors,
+                    )
+                    print(f"[save] {args.out_dir}/scene_proj_diag{sfx}.ply  "
+                          "(red=in bbox, yellow=visible elsewhere, "
+                          "grey=hidden from this frame)")
+                    if n_kept == 0:
+                        print("[corr] EMPTY frustum — bbox doesn't overlap "
+                              "any visible point in this frame.  Ignoring "
+                              "filter.")
+                        frustum_mask = None
+
+    elif args.use_pose or args.estimate_pose:
         bbox_for_frustum = bbox_norm
         if bbox_for_frustum is None:
             bbox_for_frustum = bbox_from_grid_mask(mask, h_grid, w_grid)
