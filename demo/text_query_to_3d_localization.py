@@ -254,6 +254,47 @@ def build_siglip(siglip_path, device):
     return dict(model=model, processor=processor)
 
 
+def _patch_siglip_last_attn_to_value_only(model):
+    """MaskCLIP trick: in the LAST vision encoder block, replace
+    self-attention with a value-only pass (V @ W_O — no Q·K softmax
+    mixing).  Without this, per-patch cosine maps are nearly uniform:
+    the last block's full attention spreads each query/key globally,
+    so every patch ends up carrying a near-identical "image summary",
+    and cosine(text, patch_i) ≈ constant ∀ i.
+
+    Reference: Zhou et al., "Extract Free Dense Labels from CLIP"
+    (MaskCLIP, ECCV 2022).  Standard recipe for any CLIP-/SigLIP-style
+    contrastive tower when you want per-patch grounding instead of a
+    single pooled image vector.
+
+    Idempotent: safe to call multiple times.
+    """
+    last_layer = model.vision_model.encoder.layers[-1]
+    attn = last_layer.self_attn
+    if getattr(attn, "_maskclip_patched", False):
+        return
+    if not (hasattr(attn, "v_proj") and hasattr(attn, "out_proj")):
+        raise RuntimeError(
+            f"SigLIP attention {type(attn).__name__} lacks v_proj/"
+            "out_proj — MaskCLIP patch can't be applied here. "
+            "(If this is SigLIP2 with a fused QKV, the projections may "
+            "be packed into a single Linear; needs a variant-specific "
+            "splitter.)"
+        )
+    v_proj = attn.v_proj
+    out_proj = attn.out_proj
+
+    def value_only_forward(hidden_states, *args, **kwargs):
+        # (B, N, D) → identity on spatial dim; only feature transform.
+        v = v_proj(hidden_states)
+        attn_output = out_proj(v)
+        return attn_output, None
+
+    attn.forward = value_only_forward
+    attn._maskclip_patched = True
+    print("[siglip] applied MaskCLIP value-only patch to last vision block.")
+
+
 @torch.inference_mode()
 def siglip_grounding_map(siglip, image_pil, text_query, device):
     """
@@ -263,12 +304,16 @@ def siglip_grounding_map(siglip, image_pil, text_query, device):
                   native patch grid (e.g. 16×16 for siglip-base-patch16-256).
         h_sig, w_sig : int
 
-    Uses SigLIP's per-patch token features (NOT the pooled output) cosine'd
-    against the text-encoded query.  This is the standard open-vocab
-    localization recipe.
+    Uses MaskCLIP-modified per-patch features (last self-attn replaced
+    with V-only) cosine'd against the text-encoded query.  Without the
+    modification, vanilla SigLIP `last_hidden_state` produces a
+    near-uniform map — see `_patch_siglip_last_attn_to_value_only`.
     """
     model = siglip["model"]
     processor = siglip["processor"]
+
+    # Make per-patch features text-alignable.  Idempotent.
+    _patch_siglip_last_attn_to_value_only(model)
 
     # ---- Text side ----
     text_inputs = processor(text=[text_query], return_tensors="pt",
@@ -278,11 +323,12 @@ def siglip_grounding_map(siglip, image_pil, text_query, device):
     # SigLIP's pooled text feature is the input to the contrastive loss;
     # it lives in the same space as image patch features projected by
     # the vision tower's pre-final-projection layer.
-    text_feat = text_out.pooler_output if hasattr(text_out, "pooler_output") \
-                else text_out.last_hidden_state[:, 0]
+    text_feat = (text_out.pooler_output
+                 if getattr(text_out, "pooler_output", None) is not None
+                 else text_out.last_hidden_state[:, -1])
     text_feat = text_feat[0]  # (D,)
 
-    # ---- Image side: per-patch features (skip the final pooling) ----
+    # ---- Image side: per-patch features (post MaskCLIP-modified tower) ---
     img_inputs = processor(images=image_pil, return_tensors="pt")
     img_inputs = {k: v.to(device) for k, v in img_inputs.items()}
     vision_out = model.vision_model(**img_inputs)
@@ -297,6 +343,12 @@ def siglip_grounding_map(siglip, image_pil, text_query, device):
     text_n  = F.normalize(text_feat.float(), dim=-1, eps=1e-6)
     patch_n = F.normalize(patch_feats.float(), dim=-1, eps=1e-6)
     cos = (patch_n @ text_n).clamp(-1.0, 1.0)  # (n_patches,)
+
+    # Diagnostic: if cos still looks near-uniform after the patch, the
+    # spread tells you something is off (wrong model variant, wrong text
+    # pooling, etc.) before you waste time staring at the heatmap.
+    print(f"[siglip] cos per-patch: min={cos.min().item():.4f}  "
+          f"max={cos.max().item():.4f}  std={cos.std().item():.4f}")
 
     # Stretch [min, max] → [0, 1] for visualization-friendly range.
     cos_min, cos_max = cos.min(), cos.max()
@@ -887,13 +939,19 @@ def parse_args():
              "tokens) — keeps the pipeline single-model but quality "
              "depends on Qwen recognizing the query.  Run both, compare "
              "the 3D heatmap PLYs.")
-    p.add_argument("--siglip-path", default="google/siglip2-base-patch16-256",
-                   help="SigLIP model used for text→2D grounding when "
-                        "--ground-mode siglip.  Qwen3.5-VL is NOT a "
-                        "CLIP-style contrastive model — its text "
-                        "embed_tokens and vision patches share a dim but are "
-                        "NOT cosine-comparable, so the cosine-based ROI "
-                        "step needs an external contrastive model here.")
+    p.add_argument(
+        "--siglip-path",
+        default=os.environ.get(
+            "SIGLIP_PATH", "google/siglip2-base-patch16-256",
+        ),
+        help="SigLIP model path (HF id or local dir) for text→2D "
+             "grounding when --ground-mode siglip.  Defaults to "
+             "$SIGLIP_PATH if set, else the HF id "
+             "'google/siglip2-base-patch16-256'.  Qwen3.5-VL is NOT a "
+             "CLIP-style contrastive model — its text embed_tokens and "
+             "vision patches share a dim but are NOT cosine-comparable, "
+             "so the cosine-based ROI step needs an external contrastive "
+             "model here.")
     p.add_argument("--out-dir",    required=True)
     p.add_argument("--siglip-thr-percentile", type=float, default=85.0,
                    help="Percentile threshold (0..100) on the SigLIP 2D map "
