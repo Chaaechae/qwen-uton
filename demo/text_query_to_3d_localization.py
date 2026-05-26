@@ -966,12 +966,27 @@ def load_camera_for_image(
 
     # --- depth (optional) ----------------------------------------------
     if override_depth is not None:
-        depth, depth_used = _load_depth_first_of([override_depth])
+        depth_candidates = [override_depth]
     else:
-        depth, depth_used = _load_depth_first_of([
+        # Broad probe — depth maps live under wildly different layouts
+        # depending on which extractor produced the dump.
+        depth_candidates = [
+            # canonical ScanNet extract
             os.path.join(scene_dir, "depth", f"{frame}.png"),
             os.path.join(scene_dir, "depth", f"{frame}.npy"),
-        ])
+            # alt subdir naming
+            os.path.join(scene_dir, "depths", f"{frame}.png"),
+            os.path.join(scene_dir, "depths", f"{frame}.npy"),
+            # flat naming at scene root
+            os.path.join(scene_dir, f"depth_{frame}.png"),
+            os.path.join(scene_dir, f"depth_{frame}.npy"),
+            os.path.join(scene_dir, f"{frame}_depth.png"),
+            os.path.join(scene_dir, f"{frame}_depth.npy"),
+            # color/<frame>.png  →  color/<frame>_depth.png  (some extracts)
+            os.path.join(color_dir, f"{frame}_depth.png"),
+            os.path.join(color_dir, f"{frame}_depth.npy"),
+        ]
+    depth, depth_used = _load_depth_first_of(depth_candidates)
     H_d = W_d = None
     if depth is not None:
         H_d, W_d = depth.shape
@@ -985,6 +1000,17 @@ def load_camera_for_image(
           f"({K_color[0,0]:.2f}, {K_color[1,1]:.2f}, "
           f"{K_color[0,2]:.2f}, {K_color[1,2]:.2f})  "
           f"image {W_color}x{H_color}")
+    if depth is None:
+        print("[pose] !!! depth map not found — both per-pixel occlusion "
+              "AND --depth-slab are silently DISABLED.")
+        print("       Without a depth filter, the bbox frustum is "
+              "infinite-depth, so floor / background under the bbox "
+              "edges WILL be included.")
+        print("       Tried paths:")
+        for p in depth_candidates:
+            print(f"           {p}")
+        print("       Pass --depth-path /abs/path explicitly if the file "
+              "is somewhere else.")
 
     return dict(
         K_color=K_color, K_depth=K_depth, T_c2w=T_c2w,
