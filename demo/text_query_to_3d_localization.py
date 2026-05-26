@@ -75,6 +75,26 @@ scene_heatmap_*.ply / viz_*.html outputs to judge whether the H-aligned
 bridge truly carries Qwen's grounding into 3D as well as it carries
 SigLIP's.
 
+Pose-based 2D→3D frustum filtering (optional, very effective)
+-------------------------------------------------------------
+--use-pose            Load camera pose + intrinsic (+ depth if present)
+                      from ScanNet-style siblings of --image-path, then
+                      project the 2D bbox through the camera into a 3D
+                      frustum.  Outside-frustum points are clamped below
+                      any inside-frustum score, so all downstream steps
+                      (top-percentile, clustering, top-K) automatically
+                      restrict to the geometric candidate region.  With
+                      depth available, additionally drops 3D points
+                      hidden behind a closer surface (occlusion test).
+
+                      This is a HARD geometric constraint, complementary
+                      to the SOFT feature-cosine score: feature alignment
+                      is fuzzy across visually similar surfaces, but the
+                      bbox + pose says only points whose ray actually
+                      projects into the bbox can be the object.  Combine
+                      the two and feature cosine only has to resolve
+                      depth ambiguity within one ray bundle.
+
 Outputs (suffixed by --ground-mode for side-by-side comparison)
 ---------------------------------------------------------------
   <out>/scene_rgb.ply                 Original-color point cloud (shared).
@@ -101,6 +121,12 @@ Usage
   python demo/text_query_to_3d_localization.py \\
       ...same args... \\
       --ground-mode qwen-bbox
+
+  # Qwen-bbox + pose-based frustum filtering (geometric + feature):
+  python demo/text_query_to_3d_localization.py \\
+      ...same args... \\
+      --ground-mode qwen-bbox \\
+      --use-pose
 """
 
 import argparse
@@ -743,6 +769,159 @@ def utonia_point_features(backbone, coord, color, normal, device):
 
 
 # ---------------------------------------------------------------------------
+# Camera-pose-based 2D→3D mapping (alternative / complement to feature
+# cosine).  Idea: H/I alignment gives a SEMANTIC match between 3D points
+# and 2D patches, which is fuzzy across visually-similar surfaces.  But
+# the bbox in the image + camera pose is a HARD geometric constraint —
+# only points whose ray actually projects into the bbox are candidates.
+# Combine the two: frustum mask gives the candidate region, cosine score
+# within the frustum disambiguates if multiple objects sit in the same
+# camera ray bundle.
+#
+# Layout expected (ScanNet image-dump):
+#     .../scene_XXXX_YY/color/<frame>.{png,jpg}
+#     .../scene_XXXX_YY/pose/<frame>.txt              4x4 cam-to-world
+#     .../scene_XXXX_YY/intrinsic/intrinsic_color.txt 4x4 K (color)
+#     .../scene_XXXX_YY/intrinsic/intrinsic_depth.txt 4x4 K (depth, opt)
+#     .../scene_XXXX_YY/depth/<frame>.png             16-bit mm (opt)
+#
+# If pose is unknown (arbitrary image not in ScanNet), use a separate
+# pose-estimation step (e.g. VGGT — already a project dep in
+# demo/8_pca_video.py) to predict (K, T) before calling these helpers.
+# ---------------------------------------------------------------------------
+def load_camera_for_image(
+    image_path, override_pose=None, override_intr_color=None,
+    override_intr_depth=None, override_depth=None,
+):
+    """Returns dict with K_color (3,3), K_depth (3,3), T_c2w (4,4),
+    H_color/W_color, and (if available) depth (H_d, W_d, float32 meters).
+    Any path can be overridden; otherwise auto-detect from image_path.
+    """
+    color_dir = os.path.dirname(image_path)
+    auto_ok = (os.path.basename(color_dir) == "color")
+    if not auto_ok and (override_pose is None or override_intr_color is None):
+        raise RuntimeError(
+            "auto-detect needs image to live at .../color/<frame>.png; "
+            "got parent dir = "
+            f"{os.path.basename(color_dir)}.  Override with --pose-path "
+            "/ --intrinsic-color-path to skip auto-detect.")
+    scene_dir = os.path.dirname(color_dir)
+    frame = os.path.splitext(os.path.basename(image_path))[0]
+
+    pose_path = override_pose or os.path.join(
+        scene_dir, "pose", f"{frame}.txt")
+    intr_c_path = override_intr_color or os.path.join(
+        scene_dir, "intrinsic", "intrinsic_color.txt")
+    intr_d_path = override_intr_depth or os.path.join(
+        scene_dir, "intrinsic", "intrinsic_depth.txt")
+    depth_path = override_depth or os.path.join(
+        scene_dir, "depth", f"{frame}.png")
+
+    if not os.path.isfile(pose_path):
+        raise FileNotFoundError(f"pose not found: {pose_path}")
+    if not os.path.isfile(intr_c_path):
+        raise FileNotFoundError(f"intrinsic_color not found: {intr_c_path}")
+
+    T_c2w = np.loadtxt(pose_path).astype(np.float32)
+    if not np.isfinite(T_c2w).all():
+        raise RuntimeError(
+            f"pose has non-finite values (lost tracking?): {pose_path}")
+    K_color = np.loadtxt(intr_c_path).astype(np.float32)[:3, :3]
+    K_depth = (np.loadtxt(intr_d_path).astype(np.float32)[:3, :3]
+               if os.path.isfile(intr_d_path) else K_color)
+
+    from PIL import Image
+    with Image.open(image_path) as img:
+        W_color, H_color = img.size
+
+    depth = None
+    H_d = W_d = None
+    if os.path.isfile(depth_path):
+        d_img = np.array(Image.open(depth_path))
+        # ScanNet depth is 16-bit mm. /1000 → meters.
+        depth = d_img.astype(np.float32) / 1000.0
+        H_d, W_d = depth.shape
+
+    return dict(
+        K_color=K_color, K_depth=K_depth, T_c2w=T_c2w,
+        H_color=H_color, W_color=W_color,
+        depth=depth, H_depth=H_d, W_depth=W_d,
+    )
+
+
+def project_world_to_pixel(coord, K, T_c2w):
+    """coord (N, 3) world → (u, v, z_cam) in pixel coords + camera-frame
+    z (used for occlusion / behind-camera checks).
+    """
+    T_w2c = np.linalg.inv(T_c2w)
+    R = T_w2c[:3, :3]
+    t = T_w2c[:3, 3]
+    p_cam = coord @ R.T + t  # (N, 3)
+    z = p_cam[:, 2]
+    z_safe = np.where(z > 1e-6, z, 1e-6)
+    u = K[0, 0] * p_cam[:, 0] / z_safe + K[0, 2]
+    v = K[1, 1] * p_cam[:, 1] / z_safe + K[1, 2]
+    return u, v, z
+
+
+def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15):
+    """Mask (N,) of 3D points whose projection lands inside the 2D bbox
+    (and matches the depth map if depth_tol > 0 and depth is available).
+
+    Returns:
+        mask           : (N,) bool — final mask
+        n_in_frustum   : int — count after geometric bbox test (pre-depth)
+        n_depth_dropped: int — count removed by depth occlusion check
+    """
+    x1, y1, x2, y2 = bbox_norm
+    u1, u2 = x1 * cam["W_color"], x2 * cam["W_color"]
+    v1, v2 = y1 * cam["H_color"], y2 * cam["H_color"]
+
+    u, v, z = project_world_to_pixel(coord, cam["K_color"], cam["T_c2w"])
+    in_frustum = (z > 1e-3) & (u >= u1) & (u < u2) & (v >= v1) & (v < v2)
+    n_in_frustum = int(in_frustum.sum())
+    n_depth_dropped = 0
+
+    if depth_tol > 0 and cam.get("depth") is not None:
+        # Project to depth-image coords (may differ in resolution from
+        # color), sample depth, compare against camera-z.
+        ud, vd, _ = project_world_to_pixel(coord, cam["K_depth"], cam["T_c2w"])
+        Hd, Wd = cam["H_depth"], cam["W_depth"]
+        ui = np.clip(ud.astype(np.int32), 0, Wd - 1)
+        vi = np.clip(vd.astype(np.int32), 0, Hd - 1)
+        d_at = cam["depth"][vi, ui]
+        depth_valid = d_at > 0.1
+        depth_match = np.abs(z - d_at) <= depth_tol
+        depth_ok = depth_valid & depth_match
+        n_depth_dropped = int((in_frustum & ~depth_ok).sum())
+        in_frustum = in_frustum & depth_ok
+
+    return in_frustum, n_in_frustum, n_depth_dropped
+
+
+def bbox_from_grid_mask(mask_2d, h_grid, w_grid):
+    """Derive a tight enclosing bbox from a 2D grid mask.  Used when
+    --ground-mode siglip produces a soft heatmap rather than a bbox but
+    --use-pose still needs a discrete rectangle.
+    Returns (x1, y1, x2, y2) in normalized [0, 1] or None if empty.
+    """
+    m = mask_2d.cpu().numpy() if isinstance(mask_2d, torch.Tensor) else mask_2d
+    m = m > 0
+    rows = np.any(m, axis=1)
+    cols = np.any(m, axis=0)
+    if not rows.any() or not cols.any():
+        return None
+    r_min, r_max = np.where(rows)[0][[0, -1]]
+    c_min, c_max = np.where(cols)[0][[0, -1]]
+    return (
+        float(c_min) / w_grid,
+        float(r_min) / h_grid,
+        float(c_max + 1) / w_grid,
+        float(r_max + 1) / h_grid,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 3D score post-processing: KNN smoothing + spatial clustering.
 #
 # The H/I alignment makes a continuous feature manifold — raw cos-with-
@@ -1118,6 +1297,32 @@ def parse_args():
              "it as scene_object_<mode>.ply — single-instance extraction "
              "that drops scattered look-alike responses elsewhere in "
              "the scene.  Set to 0 to disable clustering.")
+    p.add_argument(
+        "--use-pose", action="store_true", default=False,
+        help="Enable camera-pose-based 2D→3D frustum filtering.  Loads "
+             "pose / intrinsic / depth from sibling dirs of --image-path "
+             "(ScanNet extract layout).  After the cosine score is "
+             "computed, points OUTSIDE the bbox frustum are clamped to "
+             "the bottom of the score distribution — so top-X%% / "
+             "clustering only ever consider the geometric candidate "
+             "region.  With depth available, also drops 3D points that "
+             "project into the bbox but lie behind a closer surface "
+             "(occlusion test).  Hard geometric constraint that "
+             "complements the fuzzy feature alignment.")
+    p.add_argument(
+        "--depth-tol", type=float, default=0.15,
+        help="Depth match tolerance in meters for the occlusion test. "
+             "A 3D point is kept if abs(projected camera-z - depth_map[u,v]) "
+             "<= this. Set to 0 to skip depth checking (frustum only).")
+    p.add_argument("--pose-path", default=None,
+                   help="Override path to <frame>.txt pose file "
+                        "(default: auto-detect ScanNet layout).")
+    p.add_argument("--intrinsic-color-path", default=None,
+                   help="Override path to intrinsic_color.txt.")
+    p.add_argument("--intrinsic-depth-path", default=None,
+                   help="Override path to intrinsic_depth.txt.")
+    p.add_argument("--depth-path", default=None,
+                   help="Override path to <frame>.png depth map.")
     p.add_argument("--plot-max-points", type=int, default=80000,
                    help="Subsample cap for the Plotly 3D scatter "
                         "(browser perf gets bad past ~150k).")
@@ -1217,6 +1422,62 @@ def main():
     n_kept = int((mask_flat > 0).sum().item())
     print(f"[mask] mode={args.ground_mode}  nonzero={n_kept}/{h_grid*w_grid}"
           f"  sum={mask_flat.sum().item():.2f}")
+
+    # --- Optional: pose-based bbox-to-frustum geometric mask -------------
+    # If --use-pose, load camera + (optional) depth, project the 2D bbox
+    # into a 3D frustum, and prepare a hard mask.  The mask is applied to
+    # sim_3d *after* KNN smoothing so the smoothing step itself isn't
+    # contaminated by clamped values.
+    frustum_mask = None
+    if args.use_pose:
+        # SigLIP mode produces a soft heatmap with no canonical bbox;
+        # derive one from the threshold mask so frustum filtering still
+        # works in that mode.
+        bbox_for_frustum = bbox_norm
+        if bbox_for_frustum is None:
+            bbox_for_frustum = bbox_from_grid_mask(mask, h_grid, w_grid)
+            if bbox_for_frustum is not None:
+                print(f"[pose] derived bbox from ROI mask: "
+                      f"({bbox_for_frustum[0]:.3f}, {bbox_for_frustum[1]:.3f}, "
+                      f"{bbox_for_frustum[2]:.3f}, {bbox_for_frustum[3]:.3f})")
+
+        if bbox_for_frustum is None:
+            print("[pose] no bbox available; skipping frustum filter.")
+        else:
+            try:
+                cam = load_camera_for_image(
+                    args.image_path,
+                    override_pose=args.pose_path,
+                    override_intr_color=args.intrinsic_color_path,
+                    override_intr_depth=args.intrinsic_depth_path,
+                    override_depth=args.depth_path,
+                )
+                depth_note = (
+                    f"depth={cam['W_depth']}x{cam['H_depth']}"
+                    if cam.get("depth") is not None else "depth=N/A"
+                )
+                print(f"[pose] camera loaded  "
+                      f"image={cam['W_color']}x{cam['H_color']}  "
+                      f"K_color[fx,fy]=({cam['K_color'][0,0]:.1f},"
+                      f"{cam['K_color'][1,1]:.1f})  {depth_note}")
+                frustum_mask, n_geo, n_dropped = bbox_to_frustum_mask(
+                    coord, bbox_for_frustum, cam,
+                    depth_tol=args.depth_tol,
+                )
+                n_total = len(coord)
+                n_kept_pose = int(frustum_mask.sum())
+                if args.depth_tol > 0 and cam.get("depth") is not None:
+                    print(f"[pose] frustum: {n_geo}/{n_total} inside bbox, "
+                          f"{n_dropped} dropped by depth occlusion, "
+                          f"{n_kept_pose} kept "
+                          f"({100*n_kept_pose/n_total:.2f}% of scene)")
+                else:
+                    print(f"[pose] frustum: {n_kept_pose}/{n_total} inside "
+                          f"bbox ({100*n_kept_pose/n_total:.2f}% of scene)")
+            except (FileNotFoundError, RuntimeError) as e:
+                print(f"[pose] failed: {e}")
+                print("[pose] continuing WITHOUT frustum filter.")
+                frustum_mask = None
 
     # Output filename suffix → both modes can coexist in one out-dir for
     # direct side-by-side comparison.
@@ -1371,6 +1632,33 @@ def main():
         print(f"[smooth] knn={args.smooth_knn}  "
               f"std {before_std:.4f} → {after_std:.4f}  "
               f"range=[{sim_3d.min():.3f}, {sim_3d.max():.3f}]")
+
+    # --- Pose-based frustum gating ---------------------------------------
+    # Hard geometric constraint: clamp outside-frustum points to a value
+    # below ANY inside-frustum score, so top-percentile / clustering /
+    # top-K downstream all naturally restrict to the bbox cone.  Coupled
+    # with depth occlusion (if available), this gives single-instance
+    # extraction directly — the cosine feature score then only resolves
+    # depth-ambiguity within the same ray bundle.
+    if frustum_mask is not None and frustum_mask.any():
+        inside_sim = sim_3d[frustum_mask]
+        pin_value = float(inside_sim.min()) - 1.0
+        sim_3d = np.where(frustum_mask, sim_3d, pin_value)
+        print(f"[pose] gated  inside-frustum sim "
+              f"range=[{inside_sim.min():.3f}, {inside_sim.max():.3f}] "
+              f"mean={inside_sim.mean():.3f} std={inside_sim.std():.3f}  "
+              f"outside pinned to {pin_value:.3f}")
+        # Debug PLY: red inside frustum, grey outside.  Lets you sanity-
+        # check whether the pose/intrinsics correctly hit the object.
+        fr_colors = np.where(
+            frustum_mask[:, None],
+            np.array([[230, 30, 30]], dtype=np.uint8),
+            np.array([[160, 160, 160]], dtype=np.uint8),
+        )
+        write_ply(os.path.join(args.out_dir, f"scene_frustum{sfx}.ply"),
+                  coord, fr_colors)
+        print(f"[save] {args.out_dir}/scene_frustum{sfx}.ply  "
+              "(red=inside frustum, grey=outside)")
 
     # --- Render PLYs ------------------------------------------------------
     # (a) rgb for orientation — shared across modes (overwrite OK).
