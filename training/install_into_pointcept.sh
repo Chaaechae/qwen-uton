@@ -57,6 +57,19 @@ link "${UTONIA_ROOT}/training/tools/eval_alignment.py" \
 link "${UTONIA_ROOT}/training/tools/eval_alignment_full.py" \
      "${PCEPT_ROOT}/tools/eval_alignment_full.py"
 
+# 2D → 3D retrieval (the direction eval_alignment_full does NOT measure).
+# Phase A mirrors eval_alignment_full's R@K on the K×K matrix; Phase B
+# expands the candidate set to the full per-point cloud (deployment-
+# realistic — the regime open-vocab text→3D actually runs in).
+link "${UTONIA_ROOT}/training/tools/eval_2d_to_3d_retrieval.py" \
+     "${PCEPT_ROOT}/tools/eval_2d_to_3d_retrieval.py"
+
+# Effective-rank diagnostic — singular-value entropy of the pooled
+# f2/f3_proj features.  Distinguishes "collapse" (need retraining)
+# from "smooth manifold" (fixable with post-processing).
+link "${UTONIA_ROOT}/training/tools/feature_rank_diagnostic.py" \
+     "${PCEPT_ROOT}/tools/feature_rank_diagnostic.py"
+
 # Recipes.
 for cfg in "${UTONIA_ROOT}/training/configs/utonia/"distill-utonia-v1m3-*.py; do
     [[ -e "$cfg" ]] || continue

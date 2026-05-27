@@ -1795,6 +1795,17 @@ def parse_args():
              "that drops scattered look-alike responses elsewhere in "
              "the scene.  Set to 0 to disable clustering.")
     p.add_argument(
+        "--diagnostic-single-patch", action="store_true", default=False,
+        help="Use ONE Qwen patch (the highest-mask-weight cell inside "
+             "the bbox) as the query, instead of the bbox-mean query. "
+             "Diagnostic tool: if the single-patch result is sharp but "
+             "the averaged one is diffuse, the problem is aggregation "
+             "(fixable with post-processing — better weighting, bg-"
+             "subtract, etc.).  If both are diffuse, fine-grained "
+             "alignment is weak and retraining is the right next step. "
+             "Output PLY filenames get a '_singlepatch' tag so you can "
+             "compare side-by-side with the averaged run.")
+    p.add_argument(
         "--use-correspondence", action="store_true", default=False,
         help="Use the precomputed correspondence/<frame>.npy file (the "
              "ray-cast mapping that H/I training used) to filter 3D "
@@ -2033,6 +2044,8 @@ def main():
     # scene_proj_diag PLY written from inside that block can use it too.
     # Both ground modes coexist in one out-dir for side-by-side compare.
     sfx = f"_{args.ground_mode}"
+    if args.diagnostic_single_patch:
+        sfx += "_singlepatch"
 
     # --- Optional: 2D bbox → 3D point mask, three possible sources ------
     #   --use-correspondence : use the precomputed correspondence/<frame>.npy
@@ -2296,6 +2309,33 @@ def main():
         else:
             pos_weights = mask_flat / mask_flat.sum()
     q_pos_2d = (pos_weights.unsqueeze(-1) * patch_2d_flat).sum(dim=0)  # (2560,)
+
+    # --- Diagnostic mode: single-patch query (bypass aggregation) -------
+    # The eval ladder distinguishes aggregation problems from alignment
+    # problems by re-running the same pipeline with a SINGLE patch
+    # (bbox center) instead of the ROI mean.  If the single-patch result
+    # is sharp but the averaged one is diffuse → aggregation is to blame
+    # (post-processing fix).  If both are diffuse → fine-grained
+    # alignment is weak (retraining territory).
+    diag_single_patch_idx = None
+    if args.diagnostic_single_patch:
+        # Choose the most "central" patch by ROI weight: highest mask
+        # weight (likely fully-inside-bbox cell).  If ties, lowest index.
+        mf = mask_flat.detach().cpu()
+        if float(mf.max().item()) <= 0:
+            print("[diag-single] ROI mask is empty; cannot pick a single "
+                  "patch.  Falling back to bbox-mean query.")
+        else:
+            best = int(torch.argmax(mf).item())
+            diag_single_patch_idx = best
+            row = best // w_grid
+            col = best % w_grid
+            q_pos_2d = patch_2d_flat[best].clone()  # (2560,), one patch
+            print(f"[diag-single] using SINGLE patch at "
+                  f"(row={row}, col={col}, flat={best})  "
+                  f"mask_weight={float(mf[best]):.3f}")
+            print("[diag-single] q_pos is now ONE Qwen patch — no "
+                  "averaging.  Bg-subtract still uses outside-ROI mean.")
 
     q_neg_2d = None
     if args.bg_subtract:
