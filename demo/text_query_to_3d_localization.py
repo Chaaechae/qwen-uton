@@ -1299,35 +1299,61 @@ def correspondence_bbox_mask(correspondence, bbox_norm, n_points,
         )
         return in_bbox, int(valid.sum())
 
-    # ----- Format B: sparse (N_valid, 3) = (point_idx, y_pix, x_pix) ----
-    if (correspondence.ndim == 2
-            and correspondence.shape[1] == 3
-            and 0 <= int(correspondence[:, 0].min())
-            and int(correspondence[:, 0].max()) < n_points):
-        # Determine image dims from data: max y/x in the file.
-        H = int(correspondence[:, 1].max()) + 1
-        W = int(correspondence[:, 2].max()) + 1
-        # If image_size hint is provided and is larger, use it (file's
-        # max may be < actual image bound).
-        if image_size is not None:
-            W = max(W, int(image_size[0]))
-            H = max(H, int(image_size[1]))
-        print(f"[corr] format=B sparse (point_idx, y_pix, x_pix)  "
-              f"inferred image≈{W}x{H}")
-        u_lo, u_hi = x1 * W, x2 * W
-        v_lo, v_hi = y1 * H, y2 * H
-        pts = correspondence[:, 0].astype(np.int64)
-        ys = correspondence[:, 1].astype(np.float32)
-        xs = correspondence[:, 2].astype(np.float32)
-        in_bbox_pairs = ((xs >= u_lo) & (xs < u_hi)
-                         & (ys >= v_lo) & (ys < v_hi))
-        kept_pts = pts[in_bbox_pairs]
-        mask = np.zeros(n_points, dtype=bool)
-        if kept_pts.size > 0:
-            mask[kept_pts] = True
-        # n_valid = # of UNIQUE points appearing anywhere in the file.
-        n_valid = int(np.unique(pts).size)
-        return mask, n_valid
+    # ----- Format B: sparse (N_valid, 3) — auto-detect column roles -----
+    # Don't assume column ordering; preprocessors differ (point_idx can be
+    # first, last, or middle).  Heuristic: the column whose max is much
+    # larger than common image dimensions (> 2000) AND <= n_points - 1 is
+    # point_idx.  Remaining two are pixel coords; the one with larger max
+    # is x (image width is typically > height).
+    if correspondence.ndim == 2 and correspondence.shape[1] == 3:
+        col_max = [int(correspondence[:, i].max()) for i in range(3)]
+        col_min = [int(correspondence[:, i].min()) for i in range(3)]
+        # Score each column as point_idx candidate:
+        #   - min >= -1 (allows the (-1) sentinel)
+        #   - max < n_points
+        #   - max is the LARGEST among columns (point_idx dominates pix)
+        valid = [
+            (col_min[i] >= -1 and col_max[i] < n_points)
+            for i in range(3)
+        ]
+        if any(valid):
+            # Among valid columns, pick the one with the largest max.
+            pt_col = max(
+                (i for i in range(3) if valid[i]),
+                key=lambda i: col_max[i],
+            )
+            pix_cols = [i for i in range(3) if i != pt_col]
+            # Among pixel cols, larger max = x (width), smaller = y (height).
+            if col_max[pix_cols[0]] >= col_max[pix_cols[1]]:
+                x_col, y_col = pix_cols[0], pix_cols[1]
+            else:
+                x_col, y_col = pix_cols[1], pix_cols[0]
+            H = col_max[y_col] + 1
+            W = col_max[x_col] + 1
+            # image_size hint takes priority when available (file's max
+            # may be < the true image bound if no pixel landed at the
+            # extreme).
+            if image_size is not None:
+                W = max(W, int(image_size[0]))
+                H = max(H, int(image_size[1]))
+            print(f"[corr] format=B sparse  columns: "
+                  f"pt_idx=col{pt_col}, x=col{x_col}, y=col{y_col}  "
+                  f"col_max={col_max}  image≈{W}x{H}")
+            u_lo, u_hi = x1 * W, x2 * W
+            v_lo, v_hi = y1 * H, y2 * H
+            pts = correspondence[:, pt_col].astype(np.int64)
+            xs = correspondence[:, x_col].astype(np.float32)
+            ys = correspondence[:, y_col].astype(np.float32)
+            in_bbox_pairs = ((xs >= u_lo) & (xs < u_hi)
+                             & (ys >= v_lo) & (ys < v_hi))
+            kept_pts = pts[in_bbox_pairs]
+            kept_pts = kept_pts[(kept_pts >= 0) & (kept_pts < n_points)]
+            mask = np.zeros(n_points, dtype=bool)
+            if kept_pts.size > 0:
+                mask[np.unique(kept_pts)] = True
+            valid_pts = pts[(pts >= 0) & (pts < n_points)]
+            n_valid = int(np.unique(valid_pts).size)
+            return mask, n_valid
 
     # ----- Format D: 2D pixel-indexed (H, W) ---------------------------
     if (correspondence.ndim == 2
