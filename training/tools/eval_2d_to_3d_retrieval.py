@@ -31,7 +31,7 @@ deployment gap appears.
 
 Metrics
 =======
-Phase A — K × K  (mirrors eval_alignment_full, just flipped)
+Phase A — K × K  (2D→3D, per-patch averaged candidates)
     For each scene's K paired (point-cluster, patch) features, compute
     the K×K cosine sim matrix and rank the diagonal (correct match)
     in EACH ROW = each 2D patch.
@@ -41,9 +41,17 @@ Phase A — K × K  (mirrors eval_alignment_full, just flipped)
       Correct   : f3_avg[i]
       rank_i    : how many candidates have sim ≥ sim(f2[i], f3_avg[i])
 
-    Reports R@1 / R@5 / R@10, MRR.  Direct comparison to
-    eval_alignment_full's 3D→2D R@K tells you whether the cosine
-    matrix is approximately symmetric (it usually is at K×K scale).
+    NOTE — convention divergence from eval_alignment_full:
+    eval_alignment_full computes f3_avg as `patch_proj(scatter_mean(raw))`
+    (project after averaging the raw backbone features).  This tool
+    uses `scatter_mean(patch_proj(per_point))` — project then average —
+    so that Phase A's candidates live in the SAME distribution as
+    Phase B's per-point candidates.  Under a nonlinear patch_proj
+    (GELU + LayerNorm) the two conventions are NOT equivalent, and
+    keeping them aligned makes the A→B gap purely a candidate-set
+    scale effect, not a projector commutativity artifact.  Direct
+    numeric comparison to eval_alignment_full's R@K therefore has
+    a small systematic offset — expected.
 
 Phase B — K × M  DEPLOYMENT-REALISTIC
     Same query side, but candidates = ALL per-point features in the
@@ -242,31 +250,52 @@ def _extract_pairs_with_per_point(model, batch, device):
     _N = feature2d.shape[0]
     _bad = (feature_index < 0) | (feature_index >= _N)
     if _bad.any():
+        n_bad = int(_bad.sum().item())
+        # Mirror the diagnostic print from eval_alignment_full so a
+        # silent grid-drift (effective_patch_h / stride mismatch with
+        # the cached correspondence) doesn't produce healthy-looking
+        # numbers despite dropped pairs.
+        print(
+            f"  [eval_2d_to_3d] feature_index OOB in this scene: "
+            f"{n_bad}/{feature_index.numel()} rows outside [0, {_N}); "
+            f"eph/epw={eph}/{epw} stride={stride} "
+            f"feature2d.shape={tuple(feature2d.shape)} — dropping."
+        )
         _keep = ~_bad
         feature_index = feature_index[_keep]
         feature3d_pixel = feature3d_pixel[_keep]
         if feature_index.numel() == 0:
             return None
 
-    # Per-patch averaged 3D feature (same as eval_alignment_full).
-    feature3d_pixel_raw = torch_scatter.scatter_mean(
-        feature3d_pixel, feature_index, dim=0, dim_size=feature2d.shape[0]
+    # patch_proj on per-point features FIRST, then scatter_mean — keeps
+    # Phase A's f3_avg_proj and Phase B's f3_pt_proj in the SAME
+    # distribution.  If we projected the scatter_mean (as
+    # eval_alignment_full does), the GELU+LayerNorm inside patch_proj
+    # would make patch_proj(mean(x)) ≠ mean(patch_proj(x)) and the A↔B
+    # gap would mix "candidate-set scale" with "projector-doesn't-
+    # commute-with-averaging".  This convention diverges slightly from
+    # eval_alignment_full's f3 (which is patch_proj(scatter_mean(raw))).
+    f3_pt_proj = model.patch_proj(feature3d_pixel)
+    f3_avg_full = torch_scatter.scatter_mean(
+        f3_pt_proj, feature_index, dim=0, dim_size=feature2d.shape[0]
     )
-    feature3d_pixel_proj = model.patch_proj(feature3d_pixel_raw)
 
-    # The unique flat indices that actually appeared.
+    # The unique flat indices that actually appeared.  torch.unique
+    # returns sorted ascending; the searchsorted point→patch mapping
+    # below relies on that.  Make the contract explicit so a refactor
+    # to unique_consecutive (no sort) breaks loudly.
     feature_index_unique = torch.unique(feature_index)
+    assert bool(
+        (feature_index_unique[1:] > feature_index_unique[:-1]).all().item()
+    ) if feature_index_unique.numel() > 1 else True, (
+        "feature_index_unique must be strictly sorted for searchsorted"
+    )
     f2_patch = feature2d[feature_index_unique]
-    f3_avg_proj = feature3d_pixel_proj[feature_index_unique]
+    f3_avg_proj = f3_avg_full[feature_index_unique]
 
     # Map each point's feature_index to its position in feature_index_unique
-    # (K-index in [0, K)).  torch.unique returns sorted unique values, so
-    # searchsorted gives the canonical mapping.
+    # (K-index in [0, K)).
     point_to_patch = torch.searchsorted(feature_index_unique, feature_index)
-
-    # Project per-point features without averaging — these are the
-    # deployment-realistic candidates for Phase B.
-    f3_pt_proj = model.patch_proj(feature3d_pixel)
 
     # Two-tower mode: qwen_proj lifts Qwen patches into the common space.
     if getattr(model, "common_dim", None) is not None and hasattr(
@@ -315,18 +344,15 @@ def _phase_a_2d_to_3d(f2, f3_avg):
     }
 
 
-def _phase_b_full_cloud(f2, f3_pt, point_to_patch, max_query=None):
+def _phase_b_full_cloud(f2, f3_pt, point_to_patch):
     """K × M 2D→3D retrieval against the full per-point candidate set.
 
     For each 2D patch i, the "correct" candidates are all points j with
-    point_to_patch[j] == i.  Rank is the position of the FIRST such
-    correct point in cosine-sorted order.
-
-    Returns dict with R@1, R@10, R@100, MRR, mean_rank, plus the raw
-    rank array for downstream histogram.
-
-    max_query : optional cap on # of query patches to score (for very
-                large K — uniformly sample if K > max_query).
+    point_to_patch[j] == i.  Rank is the (tie-permissive) position of
+    the BEST-scoring correct point — equivalently, how many cosines in
+    sim[i] are ≥ that point's cosine.  Vectorized into 3 GPU ops to
+    avoid the per-query sync the loop version had (60k+ syncs for K=1000
+    × num_scenes=30).
     """
     K = f2.shape[0]
     M = f3_pt.shape[0]
@@ -335,43 +361,50 @@ def _phase_b_full_cloud(f2, f3_pt, point_to_patch, max_query=None):
 
     f2n = F.normalize(f2, dim=-1, eps=1e-4)
     f3n = F.normalize(f3_pt, dim=-1, eps=1e-4)
+    sim = f2n @ f3n.T  # (K, M)
 
-    # Cap query set if huge.
-    if max_query is not None and K > max_query:
-        sel = torch.randperm(K, device=f2.device)[:max_query]
-        f2n = f2n[sel]
-        K_eval = max_query
-        sel_set = set(sel.tolist())
-    else:
-        sel = torch.arange(K, device=f2.device)
-        K_eval = K
-        sel_set = None
+    # Per-query-patch count of correct candidates — single GPU op.
+    n_correct_per_patch = torch.bincount(point_to_patch, minlength=K)  # (K,)
+    valid = n_correct_per_patch > 0  # (K,) bool
 
-    sim = f2n @ f3n.T  # (K_eval, M)
+    # For each row i, best_correct[i] = max sim[i, j] over j with
+    # point_to_patch[j] == i.  Build a (K, M) mask by broadcasting
+    # arange(K) against point_to_patch, then row-max over a masked
+    # sim where non-correct cells are -inf.
+    patch_idx = torch.arange(K, device=f3_pt.device).unsqueeze(1)   # (K, 1)
+    correct_mask = point_to_patch.unsqueeze(0) == patch_idx          # (K, M)
+    very_neg = torch.full_like(sim, float("-inf"))
+    sim_correct = torch.where(correct_mask, sim, very_neg)
+    best_correct, _ = sim_correct.max(dim=1)                          # (K,)
 
-    ranks = []
-    n_correct_per_patch = []
-    for row, query_patch_idx in enumerate(sel.tolist()):
-        correct_mask = (point_to_patch == query_patch_idx)
-        n_correct = int(correct_mask.sum().item())
-        if n_correct == 0:
-            continue
-        n_correct_per_patch.append(n_correct)
-        correct_sims = sim[row][correct_mask]
-        best_correct = correct_sims.max()
-        # tie-permissive rank: count candidates ≥ best correct cosine
-        rank = int((sim[row] >= best_correct).sum().item())
-        rank = max(1, rank)
-        ranks.append(rank)
+    # Rank (tie-permissive): # candidates with sim >= best_correct.
+    rank_all = (sim >= best_correct.unsqueeze(1)).sum(dim=1)          # (K,)
 
-    if not ranks:
+    # Surface NaN-driven rank=0 explicitly rather than masking it.
+    # Healthy path: best_correct is some real cosine in sim[i], so at
+    # LEAST that cell is `>= itself` → rank ≥ 1.  Only NaN sims (from
+    # eps-normalized zero-vectors) make `NaN >= NaN` False everywhere
+    # and rank = 0.  Reporting these as rank=1 (the old `clamp(min=1)`)
+    # hides the bug.
+    if int((rank_all == 0).logical_and(valid).sum().item()) > 0:
+        bad = int((rank_all == 0).logical_and(valid).sum().item())
+        print(f"  [phaseB] WARN: {bad}/{int(valid.sum())} valid rows "
+              "have rank=0 — likely NaN cosine from a zero-norm "
+              "feature.  Those rows are excluded from metrics.")
+        valid = valid & (rank_all > 0)
+
+    ranks_valid = rank_all[valid].float()
+    if ranks_valid.numel() == 0:
         return None, None
 
-    ranks_np = np.asarray(ranks, dtype=np.float32)
+    ranks_np = ranks_valid.detach().cpu().numpy()
+    n_corr_np = n_correct_per_patch[valid].float().detach().cpu().numpy()
+
     return {
-        "phaseB_K_queried": int(K_eval),
+        "phaseB_K_queried": int(K),
+        "phaseB_K_valid": int(valid.sum().item()),
         "phaseB_M_candidates": int(M),
-        "phaseB_avg_correct_per_patch": float(np.mean(n_correct_per_patch)),
+        "phaseB_avg_correct_per_patch": float(n_corr_np.mean()),
         "phaseB_R@1": float((ranks_np == 1).mean()),
         "phaseB_R@10": float((ranks_np <= 10).mean()),
         "phaseB_R@100": float((ranks_np <= 100).mean()),
@@ -505,9 +538,17 @@ def main():
         # candidate slot.  Phase B R@K chance ≈ K · avg_correct / M.
         avg_correct = float(np.nanmean(col("phaseB_avg_correct_per_patch")))
         M_avg = summary["phaseB_M_avg"]
-        summary["phaseB_chance_R@1"] = avg_correct / max(M_avg, 1)
-        summary["phaseB_chance_R@10"] = (10 * avg_correct) / max(M_avg, 1)
-        summary["phaseB_chance_R@100"] = (100 * avg_correct) / max(M_avg, 1)
+        # Honest chance baseline:  P(≥1 correct in top K random draws)
+        # ≈ 1 − (1 − n/M)^K.  Linear K·n/M overcounts and can exceed 1.0
+        # (e.g. n=20, M=1500 ⇒ linear@100 = 1.33).  Use the proper formula
+        # so summary.txt never reports a chance > observed.
+        p_correct = avg_correct / max(M_avg, 1)
+        p_correct = min(max(p_correct, 0.0), 1.0)
+        def _chance(k):
+            return 1.0 - (1.0 - p_correct) ** k
+        summary["phaseB_chance_R@1"] = _chance(1)
+        summary["phaseB_chance_R@10"] = _chance(10)
+        summary["phaseB_chance_R@100"] = _chance(100)
 
     summary_path = os.path.join(args.out_dir, "summary.txt")
     with open(summary_path, "w") as f:

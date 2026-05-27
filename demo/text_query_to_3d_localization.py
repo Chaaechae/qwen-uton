@@ -2281,61 +2281,88 @@ def main():
     # we score points later as cos(point, pos) - cos(point, neg), which
     # rewards features that are distinctly object-like rather than
     # generally "indoor-scene-like".
+    # Effective mask = optionally-eroded mask, computed ONCE so both the
+    # bbox-mean path (pos_weights) and the single-patch diagnostic path
+    # see the same set of "in-ROI" cells.  Without this, --roi-erode +
+    # --diagnostic-single-patch would compare a single un-eroded boundary
+    # patch against an eroded mean — different ROI definitions making
+    # the A/B diagnostic unreliable.
     if mask_flat.sum() <= 0:
+        effective_mask = mask_flat
+        erode_note = "(empty mask)"
+    elif args.roi_erode > 0:
+        eroded = torch.where(
+            mask_flat >= args.roi_erode,
+            mask_flat, torch.zeros_like(mask_flat),
+        )
+        if float(eroded.sum()) > 0:
+            effective_mask = eroded
+            kept = int((eroded > 0).sum().item())
+            raw = int((mask_flat > 0).sum().item())
+            erode_note = f"erode>={args.roi_erode}: {kept}/{raw} cells"
+        else:
+            effective_mask = mask_flat
+            erode_note = (f"erode>={args.roi_erode} removed all cells; "
+                          "falling back to raw mask")
+    else:
+        effective_mask = mask_flat
+        erode_note = ""
+
+    if float(mask_flat.sum()) <= 0:
         print("[warn] ROI mask empty — falling back to uniform pos query.")
         pos_weights = torch.ones_like(mask_flat) / mask_flat.numel()
     else:
-        # --roi-erode: drop cells with low partial coverage to build a
-        # purer q_pos.  Bbox-boundary cells often mix object + background
-        # pixels at the Qwen 32x32-px resolution, so the boundary patches
-        # carry a "half-object half-scene" feature that pulls q_pos toward
-        # generic-indoor and weakens the 3D contrast.  Higher threshold =
-        # tighter (smaller effective ROI but purer signal).
-        if args.roi_erode > 0:
-            eroded = torch.where(
-                mask_flat >= args.roi_erode,
-                mask_flat, torch.zeros_like(mask_flat),
-            )
-            kept = int((eroded > 0).sum().item())
-            raw = int((mask_flat > 0).sum().item())
-            if eroded.sum() > 0:
-                pos_weights = eroded / eroded.sum()
-                print(f"[roi] erode>={args.roi_erode}: "
-                      f"{kept}/{raw} cells kept for q_pos")
-            else:
-                pos_weights = mask_flat / mask_flat.sum()
-                print(f"[roi] erode>={args.roi_erode} removed all cells; "
-                      "falling back to raw mask.")
-        else:
-            pos_weights = mask_flat / mask_flat.sum()
+        pos_weights = effective_mask / effective_mask.sum()
+        if erode_note:
+            print(f"[roi] {erode_note}")
     q_pos_2d = (pos_weights.unsqueeze(-1) * patch_2d_flat).sum(dim=0)  # (2560,)
 
     # --- Diagnostic mode: single-patch query (bypass aggregation) -------
     # The eval ladder distinguishes aggregation problems from alignment
     # problems by re-running the same pipeline with a SINGLE patch
-    # (bbox center) instead of the ROI mean.  If the single-patch result
-    # is sharp but the averaged one is diffuse → aggregation is to blame
+    # instead of the ROI mean.  If the single-patch result is sharp but
+    # the averaged one is diffuse → aggregation is to blame
     # (post-processing fix).  If both are diffuse → fine-grained
     # alignment is weak (retraining territory).
-    diag_single_patch_idx = None
     if args.diagnostic_single_patch:
-        # Choose the most "central" patch by ROI weight: highest mask
-        # weight (likely fully-inside-bbox cell).  If ties, lowest index.
-        mf = mask_flat.detach().cpu()
-        if float(mf.max().item()) <= 0:
+        if float(effective_mask.sum()) <= 0:
             print("[diag-single] ROI mask is empty; cannot pick a single "
                   "patch.  Falling back to bbox-mean query.")
         else:
-            best = int(torch.argmax(mf).item())
-            diag_single_patch_idx = best
+            # Pick the cell at the MASK'S CENTER OF MASS (not argmax,
+            # which under ties — common when bbox interior cells all
+            # saturate to weight 1.0 — would deterministically return
+            # the top-left corner cell instead of the visual center).
+            # Center-of-mass on GPU directly; no host copy needed.
+            ef_2d = effective_mask.view(h_grid, w_grid).float()
+            total = ef_2d.sum()
+            rs = torch.arange(
+                h_grid, dtype=torch.float32, device=mask_flat.device,
+            ).view(-1, 1)
+            cs = torch.arange(
+                w_grid, dtype=torch.float32, device=mask_flat.device,
+            ).view(1, -1)
+            row_c = (rs * ef_2d).sum() / total
+            col_c = (cs * ef_2d).sum() / total
+            dist = (rs - row_c) ** 2 + (cs - col_c) ** 2
+            # Restrict argmin to cells actually in the ROI.
+            dist = torch.where(
+                ef_2d > 0, dist,
+                torch.full_like(dist, float("inf")),
+            )
+            best = int(torch.argmin(dist.flatten()).item())
             row = best // w_grid
             col = best % w_grid
-            q_pos_2d = patch_2d_flat[best].clone()  # (2560,), one patch
-            print(f"[diag-single] using SINGLE patch at "
+            q_pos_2d = patch_2d_flat[best].clone()  # (2560,)
+            print(f"[diag-single] using single patch at ROI centroid "
                   f"(row={row}, col={col}, flat={best})  "
-                  f"mask_weight={float(mf[best]):.3f}")
-            print("[diag-single] q_pos is now ONE Qwen patch — no "
-                  "averaging.  Bg-subtract still uses outside-ROI mean.")
+                  f"mask_weight={float(effective_mask[best]):.3f}")
+            if args.bg_subtract:
+                print("[diag-single] NOTE: --bg-subtract is also on, so "
+                      "q_pos is one patch while q_neg is the outside-ROI "
+                      "MEAN — diagnostic measures asymmetric aggregation. "
+                      "For a clean single-patch ablation, add "
+                      "--no-bg-subtract.")
 
     q_neg_2d = None
     if args.bg_subtract:

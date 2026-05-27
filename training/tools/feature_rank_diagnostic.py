@@ -107,27 +107,35 @@ def _spectrum(X):
     """
     X = X.float()
     Xc = X - X.mean(dim=0, keepdim=True)
-    # SVD via lowrank not needed at our sample sizes; use full SVD.
     # `torch.linalg.svdvals` returns sorted-descending singular values.
+    # Note: returns min(N, D) sigmas, not D.  Callers must use min(N, D)
+    # as the denominator for participation, NOT D — otherwise a small-N
+    # run looks like reduced participation by construction.
     s = torch.linalg.svdvals(Xc)
     s_np = s.detach().cpu().numpy().astype(np.float64)
-    D = X.shape[1]
+    N, D = X.shape
 
     # Normalize for Shannon-entropy-style effective rank.
     s_sum = s_np.sum()
     if s_sum <= 0:
-        return s_np, 1.0, 1, D
+        # All-zero (or numerically zero) spectrum: features are
+        # constant — no rank to report.  Return NaN sentinels rather
+        # than {1.0, 1} which look like a legitimate rank-1 manifold
+        # in summary.txt and would silently masquerade as "real result".
+        return s_np, float("nan"), 0, D, N
     p = s_np / s_sum
     p_safe = np.clip(p, 1e-12, 1.0)
     H = -(p_safe * np.log(p_safe)).sum()
     eff_rank = float(np.exp(H))
 
-    # Rank at 99% of variance (σ², not σ).
+    # Rank at 99% of variance (σ², not σ).  argmax over a boolean
+    # threshold is clearer than searchsorted, and conveys the intent
+    # "first index where cumulative variance crosses 99%" directly.
     cumvar = np.cumsum(s_np ** 2)
     total = cumvar[-1]
-    rank99 = int(np.searchsorted(cumvar, 0.99 * total) + 1)
+    rank99 = int(np.argmax(cumvar >= 0.99 * total) + 1)
 
-    return s_np, eff_rank, rank99, D
+    return s_np, eff_rank, rank99, D, N
 
 
 def main():
@@ -185,8 +193,15 @@ def main():
     print(f"[setup] pooled: f3_proj {tuple(f3_cat.shape)}  "
           f"f2 {tuple(f2_cat.shape)}")
 
-    s3, er3, r99_3, D3 = _spectrum(f3_cat)
-    s2, er2, r99_2, D2 = _spectrum(f2_cat)
+    s3, er3, r99_3, D3, N3 = _spectrum(f3_cat)
+    s2, er2, r99_2, D2, N2 = _spectrum(f2_cat)
+
+    # Maximum representable rank is min(N, D), not D.  Normalize
+    # participation by that so a small-N run doesn't silently look
+    # like "reduced participation" when in fact features perfectly
+    # span the available rank.  Warn at the bottom if N < D.
+    f3_max_rank = max(min(N3, D3), 1)
+    f2_max_rank = max(min(N2, D2), 1)
 
     summary = dict(
         config=args.config_file,
@@ -196,14 +211,16 @@ def main():
         n_f2=int(f2_cat.shape[0]), D_f2=int(D2),
         f3_effective_rank=er3,
         f3_rank_at_99pct=r99_3,
-        f3_participation=er3 / max(D3, 1),
-        f3_top1_singval=float(s3[0]),
-        f3_median_singval=float(np.median(s3)),
+        f3_max_rank=int(f3_max_rank),
+        f3_participation=(er3 / f3_max_rank) if np.isfinite(er3) else float("nan"),
+        f3_top1_singval=float(s3[0]) if s3.size else float("nan"),
+        f3_median_singval=float(np.median(s3)) if s3.size else float("nan"),
         f2_effective_rank=er2,
         f2_rank_at_99pct=r99_2,
-        f2_participation=er2 / max(D2, 1),
-        f2_top1_singval=float(s2[0]),
-        f2_median_singval=float(np.median(s2)),
+        f2_max_rank=int(f2_max_rank),
+        f2_participation=(er2 / f2_max_rank) if np.isfinite(er2) else float("nan"),
+        f2_top1_singval=float(s2[0]) if s2.size else float("nan"),
+        f2_median_singval=float(np.median(s2)) if s2.size else float("nan"),
     )
 
     summary_path = os.path.join(args.out_dir, "summary.txt")
@@ -233,27 +250,47 @@ def main():
     spec_path = os.path.join(args.out_dir, "spectrum.png")
     fig.savefig(spec_path, dpi=120)
 
-    # Diagnosis text.
+    # Diagnosis text.  NaN effective_rank means the spectrum was all-zero
+    # — surface as a hard failure rather than letting downstream thresholds
+    # silently classify it.
     diag_lines = []
-    if er3 < 10:
+    if not np.isfinite(er3):
+        diag_lines.append(
+            "FAIL: f3_proj spectrum is all-zero — patch_proj output "
+            "is the zero tensor (bad load? collapsed weights?)."
+        )
+    if not np.isfinite(er2):
+        diag_lines.append(
+            "FAIL: f2 spectrum is all-zero — qwen_proj output is zero."
+        )
+    if np.isfinite(er3) and er3 < 10:
         diag_lines.append(
             "WARN: f3_proj effective_rank < 10 — possible collapse."
         )
-    if summary["f3_participation"] < 0.05:
+    if np.isfinite(summary["f3_participation"]) and summary["f3_participation"] < 0.05:
         diag_lines.append(
             f"WARN: f3 participation {summary['f3_participation']:.3f} < 0.05 "
-            "— 3D features barely use the 512-d space."
+            f"— 3D features barely use the available rank "
+            f"(max={f3_max_rank})."
         )
-    if summary["f2_participation"] < 0.05:
+    if np.isfinite(summary["f2_participation"]) and summary["f2_participation"] < 0.05:
         diag_lines.append(
             f"WARN: f2 participation {summary['f2_participation']:.3f} < 0.05 "
             "— Qwen patches projected into a very narrow cone (qwen_proj "
             "may itself be undertrained)."
         )
-    if abs(er3 - er2) > 0.5 * max(er3, er2):
+    if (np.isfinite(er3) and np.isfinite(er2)
+            and abs(er3 - er2) > 0.5 * max(er3, er2)):
         diag_lines.append(
             f"NOTE: large asymmetry  eff_rank f3={er3:.1f}  f2={er2:.1f}  "
             "— one side has collapsed/over-broadened relative to the other."
+        )
+    if N3 < D3 or N2 < D2:
+        diag_lines.append(
+            f"NOTE: pooled sample N is smaller than feature dim "
+            f"(f3: N={N3}/D={D3}, f2: N={N2}/D={D2}).  Participation is "
+            f"normalized by min(N,D); increase --num-scenes for a tighter "
+            f"upper bound on rank."
         )
     if not diag_lines:
         diag_lines.append("Spectrum looks healthy on both sides.")
