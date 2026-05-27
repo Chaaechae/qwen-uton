@@ -1249,6 +1249,131 @@ def bbox_to_frustum_mask(coord, bbox_norm, cam, depth_tol=0.15,
 #     image's 32×32 Qwen patch grid, or (-1, -1) if not visible.
 #     Row-by-row aligned with the scene's coord.npy.
 # ---------------------------------------------------------------------------
+def correspondence_bbox_mask(correspondence, bbox_norm, n_points,
+                              image_size=None, patch_grid=32):
+    """3D point mask from precomputed correspondence + 2D bbox.  Auto-
+    detects file layout — preprocessors differ.  README says
+    "pixel ↔ point index" but the realized layouts we've seen are:
+
+      A. (N_points, 2) — point-indexed.  Row i = (row_32, col_32) of
+         point i in this frame's 32×32 Qwen patch grid, or (-1, -1) if
+         not visible.
+      B. (N_valid, 3) — sparse list.  Each row = (point_idx, y_pix,
+         x_pix) for one valid (point, pixel) pair.  Multiple rows can
+         share a point_idx.
+      C. (N_valid, 2) — sparse pair (point_idx, pixel_flat) or similar.
+      D. (H, W) or (H*W,) — pixel-indexed 2D / flat.  corr[y, x] =
+         point_idx (or -1).
+
+    Returns (mask, n_valid_pts) on success; (None, 0) if format can't
+    be identified.
+
+    image_size : optional (W, H) of the source image — used to reshape
+                 a flat 1D pixel-indexed file or to scale bbox into
+                 sparse pixel coords.  Required when the file's grid
+                 dimensions can't be inferred from its shape.
+    """
+    print(f"[corr] shape={correspondence.shape}  "
+          f"dtype={correspondence.dtype}  "
+          f"min={int(correspondence.min())}  "
+          f"max={int(correspondence.max())}")
+    # Print a handful of rows so an unrecognized layout is debuggable.
+    flat_view = (correspondence
+                 if correspondence.ndim == 1
+                 else correspondence.reshape(-1, correspondence.shape[-1]))
+    print(f"[corr] first 5 entries: {flat_view[:5].tolist()}")
+    x1, y1, x2, y2 = bbox_norm
+
+    # ----- Format A: point-indexed (N_points, 2) ------------------------
+    if (correspondence.ndim == 2
+            and correspondence.shape[0] == n_points
+            and correspondence.shape[1] == 2):
+        print("[corr] format=A point-indexed (N_points, 2 = row_32, col_32)")
+        valid = (correspondence[:, 0] >= 0) & (correspondence[:, 1] >= 0)
+        row = correspondence[:, 0].astype(np.float32)
+        col = correspondence[:, 1].astype(np.float32)
+        in_bbox = (
+            valid
+            & (row >= y1 * patch_grid) & (row < y2 * patch_grid)
+            & (col >= x1 * patch_grid) & (col < x2 * patch_grid)
+        )
+        return in_bbox, int(valid.sum())
+
+    # ----- Format B: sparse (N_valid, 3) = (point_idx, y_pix, x_pix) ----
+    if (correspondence.ndim == 2
+            and correspondence.shape[1] == 3
+            and 0 <= int(correspondence[:, 0].min())
+            and int(correspondence[:, 0].max()) < n_points):
+        # Determine image dims from data: max y/x in the file.
+        H = int(correspondence[:, 1].max()) + 1
+        W = int(correspondence[:, 2].max()) + 1
+        # If image_size hint is provided and is larger, use it (file's
+        # max may be < actual image bound).
+        if image_size is not None:
+            W = max(W, int(image_size[0]))
+            H = max(H, int(image_size[1]))
+        print(f"[corr] format=B sparse (point_idx, y_pix, x_pix)  "
+              f"inferred image≈{W}x{H}")
+        u_lo, u_hi = x1 * W, x2 * W
+        v_lo, v_hi = y1 * H, y2 * H
+        pts = correspondence[:, 0].astype(np.int64)
+        ys = correspondence[:, 1].astype(np.float32)
+        xs = correspondence[:, 2].astype(np.float32)
+        in_bbox_pairs = ((xs >= u_lo) & (xs < u_hi)
+                         & (ys >= v_lo) & (ys < v_hi))
+        kept_pts = pts[in_bbox_pairs]
+        mask = np.zeros(n_points, dtype=bool)
+        if kept_pts.size > 0:
+            mask[kept_pts] = True
+        # n_valid = # of UNIQUE points appearing anywhere in the file.
+        n_valid = int(np.unique(pts).size)
+        return mask, n_valid
+
+    # ----- Format D: 2D pixel-indexed (H, W) ---------------------------
+    if (correspondence.ndim == 2
+            and correspondence.shape[0] != n_points  # not point-indexed
+            and int(correspondence.max()) < n_points * 2):
+        H, W = correspondence.shape
+        print(f"[corr] format=D 2D pixel-indexed ({H}x{W})")
+        u_lo = max(0, int(round(x1 * W)))
+        u_hi = min(W, int(round(x2 * W)))
+        v_lo = max(0, int(round(y1 * H)))
+        v_hi = min(H, int(round(y2 * H)))
+        region = correspondence[v_lo:v_hi, u_lo:u_hi].ravel()
+        region = region[(region >= 0) & (region < n_points)]
+        unique_pts = np.unique(region)
+        mask = np.zeros(n_points, dtype=bool)
+        mask[unique_pts] = True
+        return mask, int(np.unique(correspondence[correspondence >= 0]).size)
+
+    # ----- Format D-flat: 1D pixel-indexed (H*W,) ----------------------
+    if (correspondence.ndim == 1
+            and int(correspondence.max()) < n_points * 2):
+        # Need image dims to reshape.  Prefer image_size hint, else try
+        # to factor.
+        if image_size is not None:
+            W_img, H_img = int(image_size[0]), int(image_size[1])
+            if W_img * H_img == correspondence.size:
+                corr_2d = correspondence.reshape(H_img, W_img)
+                print(f"[corr] format=D-flat reshaped to ({H_img}, {W_img}) "
+                      f"using image_size hint")
+                # Recurse using the 2D form (cheap, no infinite loop:
+                # ndim becomes 2 and format=D path is taken).
+                return correspondence_bbox_mask(
+                    corr_2d, bbox_norm, n_points,
+                    image_size=image_size, patch_grid=patch_grid,
+                )
+        print("[corr] flat 1D correspondence found but image_size hint "
+              "doesn't match.  Pass --correspondence-image-size W,H to "
+              "reshape it explicitly.")
+
+    # ----- Unrecognized -------------------------------------------------
+    print(f"[corr] could NOT auto-detect format.  "
+          f"shape={correspondence.shape}, n_points={n_points}.  "
+          f"Supported formats listed in correspondence_bbox_mask docstring.")
+    return None, 0
+
+
 def load_correspondence_for_frame(image_path, override_path=None):
     """Returns (corr_array, path_used) or (None, None) if not found."""
     if override_path:
@@ -1266,29 +1391,6 @@ def load_correspondence_for_frame(image_path, override_path=None):
         if os.path.isfile(p):
             return np.load(p), p
     return None, None
-
-
-def correspondence_bbox_mask(correspondence, bbox_norm, patch_grid=32):
-    """3D point mask from precomputed correspondence + 2D bbox.
-
-    For each 3D point, True iff its (row_32, col_32) in the Qwen patch
-    grid falls inside the bbox.  Points with (-1, -1) (not visible from
-    this frame) are False automatically → occlusion handled for free.
-
-    correspondence : (N, 2) int — (row_32, col_32) or (-1, -1)
-    bbox_norm      : (x1, y1, x2, y2) in [0, 1] of the image
-    patch_grid     : 32 by default (Qwen3.5-VL pre-merger grid)
-    """
-    x1, y1, x2, y2 = bbox_norm
-    valid = (correspondence[:, 0] >= 0) & (correspondence[:, 1] >= 0)
-    row = correspondence[:, 0].astype(np.float32)
-    col = correspondence[:, 1].astype(np.float32)
-    in_bbox = (
-        valid
-        & (row >= y1 * patch_grid) & (row < y2 * patch_grid)
-        & (col >= x1 * patch_grid) & (col < x2 * patch_grid)
-    )
-    return in_bbox, int(valid.sum())
 
 
 # ---------------------------------------------------------------------------
@@ -2084,32 +2186,38 @@ def main():
                       "fall back to --use-pose / --estimate-pose.")
             else:
                 print(f"[corr] loaded: {corr_path}")
-                print(f"[corr] correspondence shape: {corr.shape}  "
-                      f"vs coord.npy: {coord.shape[0]} points")
-                if corr.shape[0] != coord.shape[0]:
-                    print(f"[corr] WARN: correspondence row count "
-                          f"{corr.shape[0]} ≠ coord row count "
-                          f"{coord.shape[0]} — mapping is likely wrong, "
-                          "skipping correspondence filter.")
+                # Don't bail on shape mismatch — different preprocessors
+                # store correspondence in different layouts (per-point,
+                # sparse, pixel-indexed).  Let correspondence_bbox_mask
+                # auto-detect; only abandon if it returns None.
+                W_img, H_img = image_pil.size
+                n_total = len(coord)
+                result_mask, n_valid = correspondence_bbox_mask(
+                    corr, bbox_for_frustum, n_points=n_total,
+                    image_size=(W_img, H_img),
+                    patch_grid=args.correspondence_patch_grid,
+                )
+                if result_mask is None:
+                    print("[corr] format unidentified — skipping "
+                          "correspondence filter.  Add a debug print of "
+                          "corr's first rows above and share with the "
+                          "maintainer to add a new format handler.")
                 else:
-                    frustum_mask, n_valid = correspondence_bbox_mask(
-                        corr, bbox_for_frustum,
-                        patch_grid=args.correspondence_patch_grid,
-                    )
+                    frustum_mask = result_mask
                     n_kept = int(frustum_mask.sum())
-                    n_total = len(coord)
-                    print(f"[corr] visible in this frame: {n_valid}/"
-                          f"{n_total} ({100*n_valid/n_total:.1f}%)")
-                    print(f"[corr] inside bbox:           {n_kept}/"
-                          f"{n_total} ({100*n_kept/n_total:.2f}%)")
-                    # Debug PLY: red = inside bbox, yellow = visible but
-                    # outside bbox, grey = not visible in this frame.
+                    print(f"[corr] unique 3D points referenced by file: "
+                          f"{n_valid}/{n_total} "
+                          f"({100*n_valid/max(n_total,1):.1f}%)")
+                    print(f"[corr] inside bbox:                        "
+                          f"{n_kept}/{n_total} "
+                          f"({100*n_kept/max(n_total,1):.2f}%)")
+                    # Debug PLY: red = inside bbox, grey otherwise.
+                    # (We dropped the yellow "visible elsewhere" tier
+                    # because not every format gives us that info
+                    # cheaply.)
                     diag_colors = np.full(
-                        (n_total, 3), 80, dtype=np.uint8,
-                    )  # grey = (-1, -1)
-                    valid_mask = (corr[:, 0] >= 0) & (corr[:, 1] >= 0)
-                    diag_colors[valid_mask & ~frustum_mask] = \
-                        np.array([220, 200, 60], dtype=np.uint8)  # yellow
+                        (n_total, 3), 110, dtype=np.uint8,
+                    )  # mid-grey for context
                     diag_colors[frustum_mask] = \
                         np.array([230, 30, 30], dtype=np.uint8)   # red
                     write_ply(
@@ -2118,8 +2226,7 @@ def main():
                         coord, diag_colors,
                     )
                     print(f"[save] {args.out_dir}/scene_proj_diag{sfx}.ply  "
-                          "(red=in bbox, yellow=visible elsewhere, "
-                          "grey=hidden from this frame)")
+                          "(red=in bbox)")
                     if n_kept == 0:
                         print("[corr] EMPTY frustum — bbox doesn't overlap "
                               "any visible point in this frame.  Ignoring "
