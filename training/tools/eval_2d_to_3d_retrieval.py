@@ -121,20 +121,91 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Reuse the parser + data + model setup machinery from the sibling tool.
-# We need access to a few internal helpers; they were written to be
-# stateless so importing them directly is safe.
-from eval_alignment_full import (  # type: ignore
-    _coerce_sample_for_model,
-    _load_into_model,
-)
-
 from pointcept.engines.defaults import default_config_parser
 from pointcept.datasets import build_dataset
 from pointcept.models import build_model
 from pointcept.models.utils import offset2batch, bincount2offset
 from pointcept.models.utils.structure import Point
 import torch_scatter
+
+
+# ---------------------------------------------------------------------------
+# Inline helpers — duplicated from eval_alignment_full.py so this script
+# is standalone.  Tried `from eval_alignment_full import ...` previously
+# but that depended on the user's Pointcept install having a current
+# symlink, which kept breaking on stale checkouts.  These two functions
+# are stable; if eval_alignment_full's versions diverge meaningfully,
+# update here too.
+# ---------------------------------------------------------------------------
+def _coerce_sample_for_model(raw):
+    """Mimic what DataLoader collate does for a single sample.  Promote
+    Python scalars (grid_size etc.) to 1-element tensors so model.forward
+    can index `batch["grid_size"][0]`.
+    """
+    sample = dict(raw)
+    for k in list(sample.keys()):
+        v = sample[k]
+        if isinstance(v, bool):
+            sample[k] = torch.tensor([v], dtype=torch.bool)
+        elif isinstance(v, int):
+            sample[k] = torch.tensor([v], dtype=torch.long)
+        elif isinstance(v, float):
+            sample[k] = torch.tensor([v], dtype=torch.float32)
+        elif isinstance(v, np.ndarray) and v.ndim == 0:
+            sample[k] = torch.tensor([v.item()])
+    return sample
+
+
+def _load_into_model(model, weight_path, label):
+    """Best-effort checkpoint load.  Tries 4 prefix strategies, picks the
+    one that hits the most live-model keys, prints the chosen strategy
+    + match count.  Handles:
+      (a) `module.student.backbone.X`   (training save)
+      (b) `module.X` for raw PTv3       (utonia.pth HF release)
+      (c) `X` for raw PTv3              (no module prefix)
+      (d) `student.backbone.X`          (already-stripped training save)
+    """
+    print(f"[setup/{label}] loading: {weight_path}")
+    ckpt = torch.load(weight_path, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        raw = ckpt["state_dict"]
+    elif isinstance(ckpt, dict):
+        raw = ckpt
+    else:
+        raise TypeError(f"unexpected checkpoint type {type(ckpt)}")
+    model_keys = set(model.state_dict().keys())
+
+    def _strip_module(d):
+        return {(k[len("module."):] if k.startswith("module.") else k): v
+                for k, v in d.items()}
+
+    stripped = _strip_module(raw)
+    candidates = [
+        ("identity", dict(raw)),
+        ("strip_module", stripped),
+        ("strip_module+student.backbone.",
+         {f"student.backbone.{k}": v for k, v in stripped.items()}),
+        ("student.backbone.",
+         {f"student.backbone.{k}": v for k, v in raw.items()}),
+    ]
+    best = None
+    for name, sd in candidates:
+        hits = sum(1 for k in sd.keys() if k in model_keys)
+        if best is None or hits > best[0]:
+            best = (hits, name, sd)
+    hits, chosen, sd = best
+    info = model.load_state_dict(sd, strict=False)
+    print(f"[setup/{label}] transform={chosen!r}  "
+          f"matched={hits}/{len(model_keys)} live-model keys  "
+          f"missing={len(info.missing_keys)} "
+          f"unexpected={len(info.unexpected_keys)}")
+    if hits == 0:
+        raise RuntimeError(
+            f"[setup/{label}] no checkpoint keys matched the model — "
+            f"all four prefix strategies missed.  First 3 ckpt keys: "
+            f"{list(raw.keys())[:3]}; first 3 model keys: "
+            f"{list(model_keys)[:3]}"
+        )
 
 
 def parse_args():

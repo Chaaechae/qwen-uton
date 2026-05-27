@@ -77,15 +77,187 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from eval_alignment_full import (  # type: ignore
-    _coerce_sample_for_model,
-    _load_into_model,
-    _extract_pairs,
-)
-
 from pointcept.engines.defaults import default_config_parser
 from pointcept.datasets import build_dataset
 from pointcept.models import build_model
+from pointcept.models.utils import offset2batch, bincount2offset
+from pointcept.models.utils.structure import Point
+import torch.nn.functional as F  # noqa: F401  (used inside _extract_pairs)
+import torch_scatter
+
+
+# ---------------------------------------------------------------------------
+# Inline helpers — copied from eval_alignment_full.py so this script is
+# standalone (avoids import-fragility on stale Pointcept installs).  If
+# the originals diverge meaningfully, update here too.
+# ---------------------------------------------------------------------------
+def _coerce_sample_for_model(raw):
+    """Promote Python scalars to 1-element tensors (mimics DataLoader
+    collate for a single sample)."""
+    sample = dict(raw)
+    for k in list(sample.keys()):
+        v = sample[k]
+        if isinstance(v, bool):
+            sample[k] = torch.tensor([v], dtype=torch.bool)
+        elif isinstance(v, int):
+            sample[k] = torch.tensor([v], dtype=torch.long)
+        elif isinstance(v, float):
+            sample[k] = torch.tensor([v], dtype=torch.float32)
+        elif isinstance(v, np.ndarray) and v.ndim == 0:
+            sample[k] = torch.tensor([v.item()])
+    return sample
+
+
+def _load_into_model(model, weight_path, label):
+    """Best-effort checkpoint load; tries 4 prefix strategies and picks
+    the one that hits the most live-model keys."""
+    print(f"[setup/{label}] loading: {weight_path}")
+    ckpt = torch.load(weight_path, map_location="cpu", weights_only=False)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        raw = ckpt["state_dict"]
+    elif isinstance(ckpt, dict):
+        raw = ckpt
+    else:
+        raise TypeError(f"unexpected checkpoint type {type(ckpt)}")
+    model_keys = set(model.state_dict().keys())
+
+    def _strip_module(d):
+        return {(k[len("module."):] if k.startswith("module.") else k): v
+                for k, v in d.items()}
+
+    stripped = _strip_module(raw)
+    candidates = [
+        ("identity", dict(raw)),
+        ("strip_module", stripped),
+        ("strip_module+student.backbone.",
+         {f"student.backbone.{k}": v for k, v in stripped.items()}),
+        ("student.backbone.",
+         {f"student.backbone.{k}": v for k, v in raw.items()}),
+    ]
+    best = None
+    for name, sd in candidates:
+        hits = sum(1 for k in sd.keys() if k in model_keys)
+        if best is None or hits > best[0]:
+            best = (hits, name, sd)
+    hits, chosen, sd = best
+    info = model.load_state_dict(sd, strict=False)
+    print(f"[setup/{label}] transform={chosen!r}  "
+          f"matched={hits}/{len(model_keys)} live-model keys  "
+          f"missing={len(info.missing_keys)} "
+          f"unexpected={len(info.unexpected_keys)}")
+    if hits == 0:
+        raise RuntimeError(
+            f"[setup/{label}] no checkpoint keys matched the model.  "
+            f"First 3 ckpt keys: {list(raw.keys())[:3]}; "
+            f"first 3 model keys: {list(model_keys)[:3]}"
+        )
+
+
+@torch.inference_mode()
+def _extract_pairs(model, batch, device):
+    """Extract paired (f3_proj, f2, f3_raw) features for one scene.
+    Mirror of eval_alignment_full._extract_pairs — duplicated here so
+    this script is standalone."""
+    global_point = Point(
+        feat=batch.get("global_feat_full", batch["global_feat"]),
+        coord=batch["global_coord"],
+        origin_coord=batch["global_origin_coord"],
+        offset=batch["global_offset"],
+        grid_size=batch["grid_size"][0],
+    )
+    point_ = model.student.backbone(global_point)
+    point_ = model.up_cast(point_)
+    point_enc2d = model.up_cast(
+        point_, upcast_level=model.enc2d_upcast_level - model.up_cast_level
+    )
+    to_feature = model.pool_corr(point_enc2d, batch["global_correspondence"])
+
+    offset0 = torch.cat(
+        [torch.tensor([0], device=device), to_feature["offset"]], dim=0
+    )
+    enc2d_count = (
+        offset0[1::model.num_global_view]
+        - offset0[0:-1:model.num_global_view]
+    )
+    enc2d_offset = torch.cat(
+        [torch.tensor([0], device=device), torch.cumsum(enc2d_count, dim=0)]
+    )
+    enc2d_mask = torch.cat([
+        torch.arange(0, c, device=device) + offset0[i * model.num_global_view]
+        for i, c in enumerate(enc2d_count)
+    ], dim=0)
+    offset_points_3d = enc2d_offset[1:]
+    batch_points_3d = offset2batch(offset_points_3d)
+
+    imgs = batch["images"]
+    if imgs.shape[0] == 0:
+        return None, None, None
+    feature3d = to_feature["feat"][enc2d_mask]
+    correspondence = to_feature["correspondence"][enc2d_mask]
+    valid_mask = torch.any(
+        correspondence != torch.tensor([-1, -1], device=device), dim=2
+    )
+    valid_index = torch.where(valid_mask)
+    if valid_index[0].numel() == 0:
+        return None, None, None
+
+    bincount_img_num = batch["img_num"]
+    offset_img_num = bincount2offset(bincount_img_num)
+    feature2d = model.ENC2D_forward(imgs)
+    feature2d = feature2d.contiguous().view(-1, feature2d.shape[-1])
+    offset_img_num = torch.cat(
+        [torch.tensor([0], device=device), offset_img_num]
+    )[:-1]
+    batch_index = batch_points_3d[valid_index[0]]
+    batch_img_num = offset_img_num[batch_index]
+    feature3d_pixel = feature3d[valid_index[0]]
+    feature_index = torch.cat([
+        batch_img_num.unsqueeze(-1),
+        valid_index[1].unsqueeze(-1),
+        correspondence[valid_index],
+    ], dim=-1).long()
+
+    eph = getattr(model, "effective_patch_h", model.patch_h)
+    epw = getattr(model, "effective_patch_w", model.patch_w)
+    stride = getattr(model, "correspondence_stride", 1)
+    batch_img_idx = feature_index[:, 0]
+    view_img_idx = feature_index[:, 1]
+    row_eff = (feature_index[:, 2] // stride).clamp_(0, eph - 1)
+    col_eff = (feature_index[:, 3] // stride).clamp_(0, epw - 1)
+    feature_index = (
+        batch_img_idx * eph * epw
+        + view_img_idx * eph * epw
+        + row_eff * epw
+        + col_eff
+    )
+
+    _N = feature2d.shape[0]
+    _bad = (feature_index < 0) | (feature_index >= _N)
+    if _bad.any():
+        _keep = ~_bad
+        feature_index = feature_index[_keep]
+        feature3d_pixel = feature3d_pixel[_keep]
+        if feature_index.numel() == 0:
+            return None, None, None
+
+    feature3d_pixel_raw = torch_scatter.scatter_mean(
+        feature3d_pixel, feature_index, dim=0, dim_size=feature2d.shape[0]
+    )
+    feature3d_pixel_proj = model.patch_proj(feature3d_pixel_raw)
+    feature_index_unique = torch.unique(feature_index)
+    f2 = feature2d[feature_index_unique]
+    f3_proj = feature3d_pixel_proj[feature_index_unique]
+    f3_raw = feature3d_pixel_raw[feature_index_unique]
+
+    if getattr(model, "common_dim", None) is not None and hasattr(
+        model, "qwen_proj"
+    ):
+        f2 = model.qwen_proj(f2.float())
+    if getattr(model, "enc2d_cos_shift", False):
+        f2 = f2 - f2.mean(dim=-1, keepdim=True)
+        f3_proj = f3_proj - f3_proj.mean(dim=-1, keepdim=True)
+
+    return f3_proj.float(), f2.float(), f3_raw.float()
 
 
 def parse_args():
