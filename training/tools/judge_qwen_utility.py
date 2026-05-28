@@ -201,6 +201,8 @@ def qwen_merged_features(model, x: torch.Tensor) -> torch.Tensor:
     T = model.config.temporal_patch_size
     assert Hpx % P == 0 and Wpx % P == 0
     h, w = Hpx // P, Wpx // P
+    assert h % 2 == 0 and w % 2 == 0, \
+        f"merger needs h,w even; got {h}x{w} (crop must be a multiple of 2*P={2*P})"
 
     x_t = x.unsqueeze(1).repeat(1, T, 1, 1, 1)
     patches = x_t.view(B, T, C, h, P, w, P)
@@ -218,15 +220,22 @@ def qwen_merged_features(model, x: torch.Tensor) -> torch.Tensor:
     for blk in model.blocks:
         hidden = blk(hidden, cu_seqlens=cu, position_embeddings=pos_emb)
 
-    merger = model.merger
-    hidden = merger.norm(hidden)
-    # block-major reorder: rows 0,1 cols 0,1 -> 2x2 block per merged token
-    hidden = hidden.view(B, h, w, -1)
-    hidden = hidden.view(B, h // 2, 2, w // 2, 2, -1).permute(0, 1, 3, 2, 4, 5).contiguous()
-    hidden = hidden.view(B * (h // 2) * (w // 2), 4 * hidden.shape[-1])
-    hidden = merger.mlp(hidden) if hasattr(merger, "mlp") else \
-             merger.linear_fc2(merger.act(merger.linear_fc1(hidden)))
-    return hidden.view(B, (h // 2) * (w // 2), -1)
+    # Block-major reorder before handing the (N, D) buffer to merger.
+    # The merger module owns its own norm + spatial-2x2 merge + MLP path
+    # (different Qwen3.5 builds package it as `mlp` or `linear_fc1/act/
+    # linear_fc2` or even-newer variants).  Calling the module directly
+    # avoids hard-coding any specific internal layout — same approach
+    # utonia_v1m3b uses in `ENC2D_forward` (`self.enc2d_model.merger(h_blk)`).
+    D = hidden.shape[-1]
+    h_blk = (
+        hidden.view(B, h, w, D)
+              .view(B, h // 2, 2, w // 2, 2, D)
+              .permute(0, 1, 3, 2, 4, 5)
+              .contiguous()
+              .view(B * (h // 2) * (w // 2) * 4, D)
+    )
+    merged = model.merger(h_blk)
+    return merged.view(B, (h // 2) * (w // 2), -1)
 
 
 @torch.no_grad()
