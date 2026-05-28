@@ -36,15 +36,49 @@ Verdict logic
   - Else if Q3 (Qwen) > random baseline by >= 2x:  "Qwen wins on text"
   - Else:                                          "Stick with DINOv2"
 
+Input modes (one required)
+--------------------------
+  --image-root <dir>
+      Class-folder layout: <dir>/<class>/*.{jpg,png,...}
+      Most natural when you already have per-image class labels.
+
+  --scannet-root <dir>  [--per-scene N]  [--scenes scene0011_00 ...]
+                        [--color-subdir color]
+      ScanNet / ARKitScenes / S3DIS-style layout:
+          <dir>/<scene_id>/<color-subdir>/<frame>.{jpg,png}
+      Each scene becomes one "class".  The Q1 linear probe + Q2 cluster
+      stats then answer "do Qwen features cleanly separate rooms?"
+      — weaker than per-class semseg labels but needs zero annotation.
+      Q3 text-retrieval is meaningless for scene-ids (text embeddings
+      of "scene0011_00" carry no semantic), so expect NaN there.
+
+  --image-list <file>  [--image-list-root <dir>]
+      Free-form: each line is "<path><sep><class>".  Use this when you
+      have your own labels (e.g. ScanNet 2D semantic GT majority-class
+      per image, or room-type metadata).
+
 Usage
 -----
+  # ScanNet val set, 8 images per scene from the 'color' subdir,
+  # whitelist of 20 scenes:
   python tools/judge_qwen_utility.py \
       --qwen        /group-volume/chaewon.yun/Qwen3.5-4B \
       --dinov2      facebook/dinov2-with-registers-giant \
-      --image-root  /path/to/labeled_images \
+      --scannet-root /group-volume/3Ddataset/data/scannet/val \
+      --per-scene   8 \
+      --scenes      scene0011_00 scene0050_00 scene0084_00 ... \
       --crop        512
 
-  <image-root> layout:  <image-root>/<class_name>/*.{jpg,png}
+  # Or auto-pick whatever scenes exist + cap total images:
+  python tools/judge_qwen_utility.py \
+      --qwen        Qwen/Qwen3.5-4B \
+      --scannet-root /group-volume/3Ddataset/data/scannet/val \
+      --per-scene   8 --max-images 400
+
+  # Class-folder layout:
+  python tools/judge_qwen_utility.py \
+      --qwen        Qwen/Qwen3.5-4B \
+      --image-root  /path/to/labeled_images
 """
 
 from __future__ import annotations
@@ -72,6 +106,7 @@ except ImportError:
 # Data loading
 # ---------------------------------------------------------------------------
 def list_labeled_images(image_root: Path):
+    """Class-folder layout: <image_root>/<class>/*.{jpg,png,...}"""
     pairs = []
     classes = sorted(
         d.name for d in image_root.iterdir() if d.is_dir() and not d.name.startswith(".")
@@ -80,6 +115,68 @@ def list_labeled_images(image_root: Path):
         for p in sorted((image_root / cls).iterdir()):
             if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
                 pairs.append((p, cls))
+    return pairs, classes
+
+
+def list_scannet_images(scannet_root: Path, per_scene: int,
+                        scenes: list[str] | None = None,
+                        color_subdir: str = "color"):
+    """ScanNet / ARKitScenes / S3DIS-style layout:
+        <scannet_root>/<scene_id>/<color_subdir>/<frame>.{jpg,png,...}
+
+    Each scene becomes one "class".  Linear probe / cluster-separability then
+    answer: do Qwen features distinguish ROOMS from each other?  That's
+    weaker than ScanNet 20-class semseg, but it's a clean unsupervised
+    signal that doesn't require per-image labels.
+
+    per_scene: cap N images per scene with even striding (diverse views,
+               not just the first N adjacent frames).
+    scenes:    optional whitelist of scene ids to include.
+    """
+    pairs = []
+    scene_dirs = sorted(
+        d for d in scannet_root.iterdir()
+        if d.is_dir() and (d / color_subdir).is_dir()
+    )
+    if scenes:
+        wanted = set(scenes)
+        scene_dirs = [d for d in scene_dirs if d.name in wanted]
+        missing = wanted - {d.name for d in scene_dirs}
+        if missing:
+            print(f"[warn] requested scenes missing from {scannet_root}: "
+                  f"{sorted(missing)[:5]}{'...' if len(missing) > 5 else ''}")
+    for sd in scene_dirs:
+        imgs = sorted(p for p in (sd / color_subdir).iterdir()
+                      if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
+        if per_scene and len(imgs) > per_scene:
+            step = max(1, len(imgs) // per_scene)
+            imgs = imgs[::step][:per_scene]
+        for p in imgs:
+            pairs.append((p, sd.name))
+    classes = sorted({c for _, c in pairs})
+    return pairs, classes
+
+
+def list_from_file(image_list: Path, root: Path | None = None):
+    """Each line: <path>\\t<class>   (also accepts <path>,<class> or <path> <class>)
+    `root` is prepended to relative paths.
+    """
+    pairs = []
+    for raw in image_list.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        for sep in ("\t", ",", " "):
+            if sep in line:
+                path_str, cls = line.split(sep, 1)
+                break
+        else:
+            raise ValueError(f"Cannot split path/class in line: {line!r}")
+        path = Path(path_str.strip())
+        if not path.is_absolute() and root is not None:
+            path = root / path
+        pairs.append((path, cls.strip()))
+    classes = sorted({c for _, c in pairs})
     return pairs, classes
 
 
@@ -211,22 +308,83 @@ def text_retrieval_acc(image_feats: torch.Tensor, text_feats: torch.Tensor,
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--qwen", type=str, default=None, help="Qwen3.5 model path or HF id")
     ap.add_argument("--dinov2", type=str, default=None, help="DINOv2 model path or HF id")
-    ap.add_argument("--image-root", type=Path, required=True,
-                    help="Directory of <class>/<image> subfolders.")
+
+    # Three mutually-exclusive input modes:
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--image-root", type=Path,
+                     help="Class-folder layout: <root>/<class>/*.{jpg,png,...}")
+    src.add_argument("--scannet-root", type=Path,
+                     help="ScanNet-style layout: <root>/<scene>/<color-subdir>/*.{jpg,png}. "
+                          "Each scene becomes one class (tests inter-scene separability).")
+    src.add_argument("--image-list", type=Path,
+                     help="Text file with one '<path><sep><class>' per line "
+                          "(sep = tab / comma / space).")
+
+    ap.add_argument("--per-scene", type=int, default=8,
+                    help="(--scannet-root only) max images per scene; "
+                         "evenly strided over the frame range.")
+    ap.add_argument("--scenes", nargs="+", default=None,
+                    help="(--scannet-root only) whitelist of scene ids "
+                         "(e.g. scene0011_00 scene0050_00 ...).")
+    ap.add_argument("--color-subdir", default="color",
+                    help="(--scannet-root only) subdir inside each scene "
+                         "holding the RGB frames. Default 'color' "
+                         "(ScanNet); ARKit uses 'wide'.")
+    ap.add_argument("--image-list-root", type=Path, default=None,
+                    help="(--image-list only) prepended to relative paths.")
+
+    ap.add_argument("--max-images", type=int, default=None,
+                    help="Cap total images across all classes (random subsample).")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--crop", type=int, default=512)
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
-    pairs, classes = list_labeled_images(args.image_root)
+    # ---- Resolve input mode -----------------------------------------------
+    if args.image_root:
+        pairs, classes = list_labeled_images(args.image_root)
+        mode_label = f"class-folders @ {args.image_root}"
+    elif args.scannet_root:
+        pairs, classes = list_scannet_images(
+            args.scannet_root,
+            per_scene=args.per_scene,
+            scenes=args.scenes,
+            color_subdir=args.color_subdir,
+        )
+        mode_label = (f"scannet-style @ {args.scannet_root} "
+                      f"(per_scene={args.per_scene}, color_subdir={args.color_subdir!r})")
+    else:
+        pairs, classes = list_from_file(args.image_list, root=args.image_list_root)
+        mode_label = f"image-list @ {args.image_list}"
+
+    if args.max_images and len(pairs) > args.max_images:
+        rng = np.random.default_rng(args.seed)
+        idx = rng.choice(len(pairs), size=args.max_images, replace=False)
+        pairs = [pairs[i] for i in idx]
+        classes = sorted({c for _, c in pairs})
+        print(f"[data] subsampled to {len(pairs)} images / {len(classes)} classes")
+
     if len(classes) < 2:
-        raise SystemExit(f"Need >= 2 class folders under {args.image_root}, found {classes}")
+        raise SystemExit(
+            f"Need >= 2 classes (got {classes}). "
+            "For --scannet-root, supply >= 2 scene folders. "
+            "For --image-list, ensure >= 2 distinct class labels."
+        )
     label_to_idx = {c: i for i, c in enumerate(classes)}
     labels = np.array([label_to_idx[c] for _, c in pairs])
-    print(f"[data] {len(pairs)} images across {len(classes)} classes: {classes}")
+    print(f"[data] {len(pairs)} images across {len(classes)} classes "
+          f"({mode_label})")
+    if len(classes) <= 25:
+        print(f"[data] classes: {classes}")
+    else:
+        print(f"[data] classes: {classes[:5]} ... {classes[-5:]} "
+              f"(showing 10/{len(classes)})")
 
     summary = {}
 
