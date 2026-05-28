@@ -11,8 +11,8 @@ UTONIA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PCEPT_ROOT="${UTONIA_ROOT}/third_party/Pointcept"
 
 if [[ ! -d "${PCEPT_ROOT}/pointcept" ]]; then
-    echo "ERROR: Pointcept submodule not initialized at ${PCEPT_ROOT}." >&2
-    echo "Run: git submodule update --init --recursive" >&2
+    echo "ERROR: Pointcept source tree not found at ${PCEPT_ROOT}." >&2
+    echo "Expected vendored copy under third_party/Pointcept/." >&2
     exit 1
 fi
 
