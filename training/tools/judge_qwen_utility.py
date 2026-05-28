@@ -157,6 +157,22 @@ def list_scannet_images(scannet_root: Path, per_scene: int,
     return pairs, classes
 
 
+def load_splits_file(path: Path) -> list[str]:
+    """Read a ScanNet/ARKit-style splits file: one scene id per line
+    (comments / blank lines ignored).  Also accepts whitespace-separated
+    ids on a single line, which some legacy splits files use.
+    """
+    raw = path.read_text()
+    out = []
+    for tok in raw.replace(",", " ").split():
+        tok = tok.strip()
+        if tok and not tok.startswith("#"):
+            out.append(tok)
+    if not out:
+        raise ValueError(f"No scene ids found in splits file {path}")
+    return out
+
+
 def list_from_file(image_list: Path, root: Path | None = None):
     """Each line: <path>\\t<class>   (also accepts <path>,<class> or <path> <class>)
     `root` is prepended to relative paths.
@@ -272,15 +288,35 @@ def dinov2_features(model, x: torch.Tensor) -> torch.Tensor:
 # Metric helpers
 # ---------------------------------------------------------------------------
 def linear_probe(features: np.ndarray, labels: np.ndarray, seed: int = 0) -> float:
+    """Stratified-K-fold linear probe top-1.  Robust to sparse classes:
+    drops classes with <2 samples (they can't be K-folded) and clamps
+    n_splits to the smallest surviving class count, never below 2.
+    """
     if not HAS_SKLEARN:
         print("[warn] sklearn missing — skipping linear probe")
         return float("nan")
-    skf = StratifiedKFold(n_splits=min(5, np.bincount(labels).min()), shuffle=True, random_state=seed)
+    counts = np.bincount(labels)
+    keep_mask = np.isin(labels, np.where(counts >= 2)[0])
+    n_drop = int((~keep_mask).sum())
+    if n_drop:
+        print(f"[probe] dropping {n_drop} sample(s) from classes with <2 images "
+              "(StratifiedKFold can't fold a singleton).")
+    feats_k = features[keep_mask]
+    labels_k = labels[keep_mask]
+    if len(np.unique(labels_k)) < 2:
+        print("[probe] <2 classes have >=2 samples; skipping linear probe.")
+        return float("nan")
+    min_count = int(np.bincount(labels_k)[np.unique(labels_k)].min())
+    n_splits = max(2, min(5, min_count))
+    print(f"[probe] StratifiedKFold(n_splits={n_splits})  "
+          f"surviving classes={len(np.unique(labels_k))}  "
+          f"samples={len(labels_k)}  min_per_class={min_count}")
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     accs = []
-    for tr, te in skf.split(features, labels):
+    for tr, te in skf.split(feats_k, labels_k):
         clf = LogisticRegression(max_iter=2000, C=1.0, multi_class="multinomial")
-        clf.fit(features[tr], labels[tr])
-        accs.append(clf.score(features[te], labels[te]))
+        clf.fit(feats_k[tr], labels_k[tr])
+        accs.append(clf.score(feats_k[te], labels_k[te]))
     return float(np.mean(accs))
 
 
@@ -339,7 +375,12 @@ def main():
                          "evenly strided over the frame range.")
     ap.add_argument("--scenes", nargs="+", default=None,
                     help="(--scannet-root only) whitelist of scene ids "
-                         "(e.g. scene0011_00 scene0050_00 ...).")
+                         "(e.g. scene0011_00 scene0050_00 ...). "
+                         "Merged with --splits-file if both given.")
+    ap.add_argument("--splits-file", type=Path, default=None,
+                    help="(--scannet-root only) text file with scene ids "
+                         "(one per line or whitespace-separated). "
+                         "Example: /.../scannet/splits/scannetv2_val.txt")
     ap.add_argument("--color-subdir", default="color",
                     help="(--scannet-root only) subdir inside each scene "
                          "holding the RGB frames. Default 'color' "
@@ -360,14 +401,23 @@ def main():
         pairs, classes = list_labeled_images(args.image_root)
         mode_label = f"class-folders @ {args.image_root}"
     elif args.scannet_root:
+        scenes_filter = list(args.scenes) if args.scenes else []
+        if args.splits_file:
+            from_split = load_splits_file(args.splits_file)
+            print(f"[splits] loaded {len(from_split)} scene ids from {args.splits_file}")
+            scenes_filter = sorted(set(scenes_filter + from_split))
         pairs, classes = list_scannet_images(
             args.scannet_root,
             per_scene=args.per_scene,
-            scenes=args.scenes,
+            scenes=scenes_filter or None,
             color_subdir=args.color_subdir,
         )
         mode_label = (f"scannet-style @ {args.scannet_root} "
-                      f"(per_scene={args.per_scene}, color_subdir={args.color_subdir!r})")
+                      f"(per_scene={args.per_scene}, "
+                      f"color_subdir={args.color_subdir!r}"
+                      + (f", splits={args.splits_file.name}"
+                         if args.splits_file else "")
+                      + ")")
     else:
         pairs, classes = list_from_file(args.image_list, root=args.image_list_root)
         mode_label = f"image-list @ {args.image_list}"
@@ -394,6 +444,16 @@ def main():
     else:
         print(f"[data] classes: {classes[:5]} ... {classes[-5:]} "
               f"(showing 10/{len(classes)})")
+    cnts = np.bincount(labels)
+    n_single = int((cnts == 1).sum())
+    print(f"[data] per-class images: min={cnts[cnts > 0].min()}  "
+          f"median={int(np.median(cnts[cnts > 0]))}  max={cnts.max()}  "
+          f"singletons={n_single}")
+    if n_single:
+        print(f"[warn] {n_single} class(es) have only 1 image — they will be "
+              "dropped from the linear probe (need >=2 for K-fold). "
+              "Raise --per-scene or use --max-images higher to keep more "
+              "images per scene.")
 
     summary = {}
 
