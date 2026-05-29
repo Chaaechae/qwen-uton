@@ -157,11 +157,51 @@ def list_scannet_images(scannet_root: Path, per_scene: int,
     return pairs, classes
 
 
-def load_splits_file(path: Path) -> list[str]:
-    """Read a ScanNet/ARKit-style splits file: one scene id per line
-    (comments / blank lines ignored).  Also accepts whitespace-separated
-    ids on a single line, which some legacy splits files use.
+def load_splits_file(path: Path, split_key: str | None = None) -> list[str]:
+    """Read a ScanNet/ARKit-style splits file.
+
+    Supported formats:
+      * .txt  — one scene id per line (comments / blank ignored) or
+                whitespace/comma separated ids on a single line.
+      * .json — any of:
+          - ["scene0011_00", "scene0050_00", ...]                (flat list)
+          - {"val": ["scene0011_00", ...], "train": [...]}       (split dict)
+          - {"scene0011_00": {...}, "scene0050_00": {...}}       (id-keyed dict)
+        For the split-dict case, --splits-key picks which split; defaults
+        to the file stem when it matches a key (e.g. scannetv2_val.json →
+        "val"), else takes the union of all splits with a warning.
     """
+    if path.suffix.lower() == ".json":
+        import json
+        data = json.loads(path.read_text())
+        if isinstance(data, list):
+            return [str(x).strip() for x in data if str(x).strip()]
+        if not isinstance(data, dict):
+            raise ValueError(f"Unsupported JSON root type in {path}: {type(data).__name__}")
+        # Dict: distinguish split-dict (values are lists) from id-dict
+        # (values are dicts / metadata).
+        all_values_listlike = all(isinstance(v, (list, tuple)) for v in data.values())
+        if all_values_listlike:
+            if split_key and split_key in data:
+                return [str(x).strip() for x in data[split_key]]
+            stem = path.stem  # e.g. scannetv2_val
+            inferred = next((k for k in data
+                             if stem == k or stem.endswith("_" + k)), None)
+            if inferred:
+                print(f"[splits] JSON has split keys {list(data.keys())}; "
+                      f"inferred split='{inferred}' from filename '{stem}'.")
+                return [str(x).strip() for x in data[inferred]]
+            print(f"[warn] JSON has split keys {list(data.keys())} but no "
+                  "--splits-key given and filename gives no hint; "
+                  "taking UNION of all splits.")
+            out = []
+            for v in data.values():
+                out.extend(str(x).strip() for x in v)
+            return out
+        # id-keyed dict — use the keys
+        return [str(k).strip() for k in data.keys()]
+
+    # Text fallback
     raw = path.read_text()
     out = []
     for tok in raw.replace(",", " ").split():
@@ -378,9 +418,16 @@ def main():
                          "(e.g. scene0011_00 scene0050_00 ...). "
                          "Merged with --splits-file if both given.")
     ap.add_argument("--splits-file", type=Path, default=None,
-                    help="(--scannet-root only) text file with scene ids "
-                         "(one per line or whitespace-separated). "
-                         "Example: /.../scannet/splits/scannetv2_val.txt")
+                    help="(--scannet-root only) splits file with scene ids. "
+                         "Accepts .txt (one id per line / whitespace-sep) "
+                         "or .json (flat list, split-keyed dict, or "
+                         "id-keyed dict). Example: "
+                         "/.../scannet/splits/scannetv2_val.txt")
+    ap.add_argument("--splits-key", type=str, default=None,
+                    help="For .json splits whose root is a dict of "
+                         "{split_name: [scene_ids]}, choose which split "
+                         "key to use (e.g. 'val'). Inferred from filename "
+                         "stem if unset.")
     ap.add_argument("--color-subdir", default="color",
                     help="(--scannet-root only) subdir inside each scene "
                          "holding the RGB frames. Default 'color' "
@@ -403,7 +450,8 @@ def main():
     elif args.scannet_root:
         scenes_filter = list(args.scenes) if args.scenes else []
         if args.splits_file:
-            from_split = load_splits_file(args.splits_file)
+            from_split = load_splits_file(args.splits_file,
+                                          split_key=args.splits_key)
             print(f"[splits] loaded {len(from_split)} scene ids from {args.splits_file}")
             scenes_filter = sorted(set(scenes_filter + from_split))
         pairs, classes = list_scannet_images(
