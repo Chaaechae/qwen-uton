@@ -333,38 +333,66 @@ def _seed_score(seed_mask, coord, radius):
 
 
 # --------------------------------------------------------------------------- #
+# Reusable: 3D features in the DINO-aligned space for one scene
+# --------------------------------------------------------------------------- #
+def compute_scene_F3D(scene_dir, model, patch_proj, device, scale):
+    """Returns (F3D[N,1536] L2-normed, scene dict). Original-point order == the
+    point index used by correspondence files. Shared by the probe and the demo."""
+    scene = load_scene(scene_dir)
+    data = utonia.transform.default(scale)(dict(
+        coord=scene["coord"].astype(np.float32).copy(),
+        color=scene["color"].copy(), normal=scene["normal"].copy()))
+    inverse = data.pop("inverse")
+    if torch.is_tensor(inverse):
+        inverse = inverse.to(device)
+    F3D = F.normalize(extract_3d_features(model, patch_proj, data, inverse, device), dim=-1)
+    return F3D, scene
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def _resolve_scenes(args):
+    if args.scenes:
+        root = os.path.dirname(os.path.normpath(args.scene_dir))
+        return [os.path.join(root, n) for n in args.scenes.split(",")]
+    if args.scene_glob:
+        return sorted(glob.glob(args.scene_glob))
+    return [args.scene_dir]
+
+
 def run_probe(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    image_dir = args.image_dir or default_image_dir(args.scene_dir)
-    print(f"[paths] scene_dir={args.scene_dir}\n        image_dir={image_dir}")
-
     model = load_backbone(args.backbone_ckpt, device)
     # patch_proj defaults to the backbone ckpt (works when that is a full pretrain
     # ckpt); for the released utonia.pth you MUST pass --patch_proj_ckpt <stagev2>.
     patch_proj = load_patch_proj(args.patch_proj_ckpt or args.backbone_ckpt, device)
     dino = load_dino(device)
 
-    scene = load_scene(args.scene_dir)
+    scene_dirs = _resolve_scenes(args)
+    print(f"[scenes] {len(scene_dirs)}")
+    rows = []
+    for scene_dir in scene_dirs:
+        try:
+            probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows)
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"[scene {os.path.basename(scene_dir)}] skip ({e})")
+    _summarize(rows, args.out_csv)
+
+
+def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
+    image_dir = args.image_dir or default_image_dir(scene_dir)
+    name = os.path.basename(os.path.normpath(scene_dir))
+    F3D, scene = compute_scene_F3D(scene_dir, model, patch_proj, device, args.scale)
     coord_w, instance, semantic = scene["coord"], scene["instance"], scene["semantic"]
     N = len(coord_w)
-    print(f"[scene] {N} points, {len(np.unique(instance[instance >= 0]))} instances")
-
-    # 3D features in DINO-aligned space (original point order == correspondence idx)
-    transform = utonia.transform.default(args.scale)
-    data = transform(dict(coord=coord_w.astype(np.float32).copy(),
-                          color=scene["color"].copy(), normal=scene["normal"].copy()))
-    inverse = data.pop("inverse")
-    if torch.is_tensor(inverse):
-        inverse = inverse.to(device)
-    F3D = F.normalize(extract_3d_features(model, patch_proj, data, inverse, device), dim=-1)
-    print(f"[F3D] {tuple(F3D.shape)}")
+    print(f"[{name}] {N} pts, {len(np.unique(instance[instance >= 0]))} inst, "
+          f"F3D={tuple(F3D.shape)}")
 
     frames = args.frames.split(",") if args.frames else list_frames(image_dir)
-    print(f"[frames] {len(frames)} -> {frames[:8]}{'...' if len(frames) > 8 else ''}")
+    if args.max_frames > 0 and len(frames) > args.max_frames:        # even subsample
+        frames = [frames[i] for i in np.linspace(0, len(frames) - 1, args.max_frames).astype(int)]
 
-    rows = []
     for fid in frames:
         try:
             rgb, corr = load_frame_corr(image_dir, fid)
@@ -431,7 +459,7 @@ def run_probe(args):
             ndist = len(np.unique(instance[topk][instance[topk] >= 0]))
 
             rows.append(dict(
-                frame=fid, inst=k, sem=sem_k, n_pts=int(gt_mask.sum()),
+                scene=name, frame=fid, inst=k, sem=sem_k, n_pts=int(gt_mask.sum()),
                 vis_pts=int(vis_k.sum()), occ_pts=occ_n,
                 align_AP=m_align["AP"], align_IoU=m_align["best_IoU"],
                 align_rec200=m_align["rec@200"],
@@ -439,8 +467,9 @@ def run_probe(args):
                 rand_AP=m_rand["AP"],
                 occ_AP=occ_AP, occ_chance=occ_chance, occ_lift=occ_lift,
                 amb_sameclass_otherinst=float(amb), amb_distinct_inst=int(ndist)))
-            print(f"[{fid} inst{k} sem{sem_k} n={rows[-1]['n_pts']} vis={rows[-1]['vis_pts']} "
-                  f"occ={occ_n}] align AP={m_align['AP']:.3f} IoU={m_align['best_IoU']:.3f} | "
+            print(f"[{name} {fid} inst{k} sem{sem_k} n={rows[-1]['n_pts']} "
+                  f"vis={rows[-1]['vis_pts']} occ={occ_n}] "
+                  f"align AP={m_align['AP']:.3f} IoU={m_align['best_IoU']:.3f} | "
                   f"occ AP={occ_AP:.3f} chance={occ_chance:.3f} lift={occ_lift:.2f} | "
                   f"geo AP={m_geo['AP']:.3f} | rand={m_rand['AP']:.3f} | amb={amb:.2f}")
 
@@ -492,8 +521,15 @@ def build_argparser():
                    default="/group-volume/3Ddataset/data/scannet/val/scene0011_00")
     p.add_argument("--image_dir", default=None,
                    help="defaults to <root>/images/<split>/<scene> derived from scene_dir")
+    p.add_argument("--scenes", default="",
+                   help="comma-separated scene NAMES (siblings of --scene_dir) to "
+                        "aggregate over, e.g. scene0011_00,scene0050_00 (A: stability)")
+    p.add_argument("--scene_glob", default="",
+                   help="glob of scene dirs to aggregate, e.g. '/.../scannet/val/scene*'")
     p.add_argument("--frames", default="",
                    help="comma-separated frame ids; empty = all frames in the scene")
+    p.add_argument("--max_frames", type=int, default=0,
+                   help="even-subsample to at most this many frames per scene (0=all)")
     p.add_argument("--scale", type=float, default=1.0,
                    help="utonia.transform.default coord scale; MATCH your extraction")
     p.add_argument("--min_inst_pts", type=int, default=200)

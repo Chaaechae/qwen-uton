@@ -74,6 +74,53 @@ The default uses the **stagev2 full pretrain ckpt for both the backbone and
 `--patch_proj_ckpt` is given. The ckpt is loaded with `weights_only=False`, fixing
 the `UnpicklingError: Weights only load failed`.
 
+### A — stability across scenes/frames
+
+One scene can be a fluke. Aggregate over many:
+
+```bash
+# several named scenes (siblings of --scene_dir):
+python tools/viewpoint_probe/probe_2d3d_alignment.py \
+  --scenes scene0011_00,scene0050_00,scene0231_00 --max_frames 8
+
+# or glob every val scene, ~8 frames each:
+python tools/viewpoint_probe/probe_2d3d_alignment.py \
+  --scene_glob '/group-volume/3Ddataset/data/scannet/val/scene*' --max_frames 8
+```
+
+The SUMMARY then reflects all `(scene, frame, instance)` pairs; the CSV gains a
+`scene` column. Watch whether `align_AP`, `occ_lift`, and `amb` hold up at scale.
+
+## Stage-1 → 3D demo (B): localize from a real 2D image, no GT
+
+`localize_from_2d.py` runs the actual pipeline the probe validated, but Stage-1 is
+**image-only** (no GT correspondence). It writes a heatmap point cloud + top-K indices,
+and (optionally) AP/IoU vs a GT instance so you can read the degradation from the
+probe's GT-surrogate numbers.
+
+```bash
+# point prompt: click a pixel, grow by DINO self-similarity
+python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
+  --mode point --point 640 360 --eval_instance 12 --out /tmp/loc
+
+# box from any external detector (incl. Qwen-VL in this repo):
+python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
+  --mode box --box 410 220 690 540 --out /tmp/loc
+
+# detector dump (text -> box): {frame_id: [{label, box:[x0,y0,x1,y1]}]}
+python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
+  --mode json --boxes_json dets.json --text chair --out /tmp/loc
+
+# open-vocab text (EXPERIMENTAL, needs `pip install open_clip_torch`):
+python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
+  --mode text --text "a chair" --tau 0.6 --out /tmp/loc
+```
+
+Modes: `box` / `json` are the realistic "2D detector → 3D" path (loose boxes, unlike
+the probe's pixel-perfect GT — so this measures real Stage-1 degradation). `point` is
+GT-free and dependency-light. `text` is a best-effort open-vocab heatmap (the weakest
+link; prefer a detector box). Open `<out>.ply` to see where in 3D the object landed.
+
 If `utonia` imports but a dependency is missing, the script tells you exactly which
 package and which interpreter — no `conda activate` involved.
 
