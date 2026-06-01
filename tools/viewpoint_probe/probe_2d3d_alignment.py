@@ -371,9 +371,12 @@ def run_probe(args):
         except FileNotFoundError as e:
             print(f"[frame {fid}] skip ({e})")
             continue
-        if corr.ndim != 2 or corr.shape[0] < 50 or (corr < 0).all():
+        if corr.ndim != 2 or corr.shape[1] < 3 or corr.shape[0] < 50 or (corr < 0).all():
             continue
-        px, py, pidx = corr[:, 0], corr[:, 1], corr[:, 3].astype(np.int64)
+        # correspondence columns: [px, py, (1,) , point_idx]. The homogeneous "1"
+        # column is present in some preprocessor versions (M,4) and absent in others
+        # (M,3). point index is ALWAYS the last column; pixel x,y the first two.
+        px, py, pidx = corr[:, 0], corr[:, 1], corr[:, -1].astype(np.int64)
         valid = (pidx >= 0) & (pidx < N)
         px, py, pidx = px[valid], py[valid], pidx[valid]
         if len(pidx) < 50:
