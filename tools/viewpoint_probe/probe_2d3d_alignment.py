@@ -433,6 +433,19 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
             s_align = (F3D @ q).detach().cpu().numpy()          # (A) learned alignment
             m_align = retrieval_metrics(s_align, gt_mask)
 
+            # (A') BOX variant -- detector stand-in: a loose bbox over the instance's
+            #      pixels (fills in background/other objects between them). Mean query.
+            #      box_AP << align_AP quantifies the bounding-box Stage-1 penalty.
+            pu0 = int(np.clip(px[sel_rows].min() * sx / PATCH_SIZE, 0, PATCH_HW - 1))
+            pu1 = int(np.clip(px[sel_rows].max() * sx / PATCH_SIZE, 0, PATCH_HW - 1))
+            pv0 = int(np.clip(py[sel_rows].min() * sy / PATCH_SIZE, 0, PATCH_HW - 1))
+            pv1 = int(np.clip(py[sel_rows].max() * sy / PATCH_SIZE, 0, PATCH_HW - 1))
+            gu, gv = np.meshgrid(np.arange(pu0, pu1 + 1), np.arange(pv0, pv1 + 1))
+            kp_box = np.unique((gv * PATCH_HW + gu).reshape(-1))
+            q_box = F.normalize(F2D[torch.as_tensor(kp_box, device=device)].mean(0), dim=0)
+            box_AP = retrieval_metrics((F3D @ q_box).detach().cpu().numpy(),
+                                       gt_mask, ks=(100,))["AP"]
+
             s_rand = (F3D @ F.normalize(torch.randn(DINO_DIM, device=device), dim=0)
                       ).detach().cpu().numpy()
             m_rand = retrieval_metrics(s_rand, gt_mask)
@@ -463,7 +476,7 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
                 scene=name, frame=fid, inst=k, sem=sem_k, n_pts=int(gt_mask.sum()),
                 vis_pts=int(vis_k.sum()), occ_pts=occ_n,
                 align_AP=m_align["AP"], align_IoU=m_align["best_IoU"],
-                align_rec200=m_align["rec@200"],
+                align_rec200=m_align["rec@200"], box_AP=box_AP,
                 geo_AP=m_geo["AP"], geo_rec200=m_geo["rec@200"],
                 rand_AP=m_rand["AP"],
                 occ_AP=occ_AP, occ_chance=occ_chance, occ_lift=occ_lift,
@@ -471,6 +484,7 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
             print(f"[{name} {fid} inst{k} sem{sem_k} n={rows[-1]['n_pts']} "
                   f"vis={rows[-1]['vis_pts']} occ={occ_n}] "
                   f"align AP={m_align['AP']:.3f} IoU={m_align['best_IoU']:.3f} | "
+                  f"box AP={box_AP:.3f} | "
                   f"occ AP={occ_AP:.3f} chance={occ_chance:.3f} lift={occ_lift:.2f} | "
                   f"geo AP={m_geo['AP']:.3f} | rand={m_rand['AP']:.3f} | amb={amb:.2f}")
 
@@ -487,17 +501,22 @@ def _summarize(rows, out_csv):
         w.writeheader(); w.writerows(rows)
     arr = lambda k: np.array([r[k] for r in rows], float)
     print(f"\n============= SUMMARY ({len(rows)} pairs) =============")
-    for k in ("align_AP", "align_IoU", "align_rec200", "geo_AP", "geo_rec200",
-              "rand_AP", "occ_AP", "occ_chance", "occ_lift",
+    for k in ("align_AP", "box_AP", "align_IoU", "align_rec200", "geo_AP",
+              "geo_rec200", "rand_AP", "occ_AP", "occ_chance", "occ_lift",
               "amb_sameclass_otherinst", "amb_distinct_inst"):
         v = arr(k)
         print(f"  {k:26s} mean={np.nanmean(v):.3f} median={np.nanmedian(v):.3f}")
     a, g, r = arr("align_AP"), arr("geo_AP"), arr("rand_AP")
+    bx = arr("box_AP")
     amb = arr("amb_sameclass_otherinst")
     oa, ol = arr("occ_AP"), arr("occ_lift")
     print("\n  Verdict:")
     print(f"    alignment vs chance:   {np.nanmean(a):.3f} vs {np.nanmean(r):.3f}  "
           f"-> {'PASS' if np.nanmean(a) > 3 * np.nanmean(r) else 'WEAK'}")
+    print(f"    mask vs box Stage-1:   align {np.nanmean(a):.3f} vs box "
+          f"{np.nanmean(bx):.3f}  (box keeps "
+          f"{100 * np.nanmean(bx) / max(np.nanmean(a), 1e-6):.0f}% -- the rest is the "
+          f"bounding-box penalty)")
     print(f"    OCCLUDED-part recovery: occ_AP {np.nanmean(oa):.3f} vs chance "
           f"{np.nanmean(arr('occ_chance')):.3f} (lift {np.nanmean(ol):.2f})  "
           f"-> {'RECOVERS unseen parts' if np.nanmean(ol) > 2 else 'mostly visible-region only'}")
