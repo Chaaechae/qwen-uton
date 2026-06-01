@@ -91,6 +91,20 @@ python tools/viewpoint_probe/probe_2d3d_alignment.py \
 The SUMMARY then reflects all `(scene, frame, instance)` pairs; the CSV gains a
 `scene` column. Watch whether `align_AP`, `occ_lift`, and `amb` hold up at scale.
 
+It also reports `box_AP` (mask vs loose-box Stage-1 penalty) and a **box-jitter
+robustness curve** — the box is expanded + randomly shifted by `--jitter_levels`
+(default `0.25,0.5`) to mimic the loose / mis-aligned boxes a real detector (Qwen-VL)
+produces, with mean and max aggregation. This is the cheap proxy for "will a real
+detector box still work?" before wiring up an actual VLM:
+
+```bash
+python tools/viewpoint_probe/probe_2d3d_alignment.py \
+  --scene_glob '/.../scannet/val/scene*' --max_frames 8 --jitter_levels 0.25,0.5
+```
+
+Read it as `tight=… j0.25=… j0.5=… j0.5_max=…`: how AP decays as the box gets looser/
+offset, and how much per-point **max aggregation** (`--agg max` in the demo) recovers.
+
 ## Stage-1 → 3D demo (B): localize from a real 2D image, no GT
 
 `localize_from_2d.py` runs the actual pipeline the probe validated, but Stage-1 is

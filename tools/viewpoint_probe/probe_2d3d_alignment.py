@@ -332,6 +332,41 @@ def _seed_score(seed_mask, coord, radius):
     return np.exp(-d / max(radius, 1e-6))
 
 
+def _ap_only(scores, gt_mask):
+    g = gt_mask[np.argsort(-scores)]
+    n = int(gt_mask.sum())
+    if n == 0:
+        return float("nan")
+    tp = np.cumsum(g)
+    prec = tp / (np.arange(len(g)) + 1)
+    return float((prec * g).sum() / n)
+
+
+def _max_sim_scores(F3D, Fk, chunk=256):
+    """Per-3D-point max cosine over patch features Fk[n,C], memory-safe."""
+    best = torch.full((F3D.shape[0],), -1e9, device=F3D.device)
+    for i in range(0, Fk.shape[0], chunk):
+        best = torch.maximum(best, (F3D @ Fk[i:i + chunk].T).max(dim=1).values)
+    return best.detach().cpu().numpy()
+
+
+def _box_patches(pu0, pu1, pv0, pv1):
+    gu, gv = np.meshgrid(np.arange(min(pu0, pu1), max(pu0, pu1) + 1),
+                         np.arange(min(pv0, pv1), max(pv0, pv1) + 1))
+    return np.unique((gv * PATCH_HW + gu).reshape(-1))
+
+
+def jittered_box_patches(pu0, pu1, pv0, pv1, frac, rng):
+    """Detector-noise box: expand each side by frac*size and random-shift by ~frac*size."""
+    bw, bh = pu1 - pu0 + 1, pv1 - pv0 + 1
+    padu, padv = int(round(frac * bw)), int(round(frac * bh))
+    su = int(round(rng.uniform(-frac, frac) * bw))
+    sv = int(round(rng.uniform(-frac, frac) * bh))
+    cl = lambda x: int(np.clip(x, 0, PATCH_HW - 1))
+    return _box_patches(cl(pu0 - padu + su), cl(pu1 + padu + su),
+                        cl(pv0 - padv + sv), cl(pv1 + padv + sv))
+
+
 # --------------------------------------------------------------------------- #
 # Reusable: 3D features in the DINO-aligned space for one scene
 # --------------------------------------------------------------------------- #
@@ -433,18 +468,31 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
             s_align = (F3D @ q).detach().cpu().numpy()          # (A) learned alignment
             m_align = retrieval_metrics(s_align, gt_mask)
 
-            # (A') BOX variant -- detector stand-in: a loose bbox over the instance's
-            #      pixels (fills in background/other objects between them). Mean query.
-            #      box_AP << align_AP quantifies the bounding-box Stage-1 penalty.
+            # (A') BOX variant -- detector stand-in: a bbox over the instance's pixels.
+            #   box_AP (tight, mean query) quantifies the bbox Stage-1 penalty, and the
+            #   JITTER sweep (expand+shift, mean & max agg) tests robustness to the
+            #   loose / mis-aligned boxes a real detector (e.g. Qwen-VL) produces.
             pu0 = int(np.clip(px[sel_rows].min() * sx / PATCH_SIZE, 0, PATCH_HW - 1))
             pu1 = int(np.clip(px[sel_rows].max() * sx / PATCH_SIZE, 0, PATCH_HW - 1))
             pv0 = int(np.clip(py[sel_rows].min() * sy / PATCH_SIZE, 0, PATCH_HW - 1))
             pv1 = int(np.clip(py[sel_rows].max() * sy / PATCH_SIZE, 0, PATCH_HW - 1))
-            gu, gv = np.meshgrid(np.arange(pu0, pu1 + 1), np.arange(pv0, pv1 + 1))
-            kp_box = np.unique((gv * PATCH_HW + gu).reshape(-1))
-            q_box = F.normalize(F2D[torch.as_tensor(kp_box, device=device)].mean(0), dim=0)
-            box_AP = retrieval_metrics((F3D @ q_box).detach().cpu().numpy(),
-                                       gt_mask, ks=(100,))["AP"]
+
+            def _box_ap(kpb, agg):
+                Fk = F2D[torch.as_tensor(kpb, device=device)]
+                if agg == "max":
+                    return _ap_only(_max_sim_scores(F3D, Fk), gt_mask)
+                q_ = F.normalize(Fk.mean(0), dim=0)
+                return _ap_only((F3D @ q_).detach().cpu().numpy(), gt_mask)
+
+            box_AP = _box_ap(_box_patches(pu0, pu1, pv0, pv1), "mean")  # tight, mean
+            rng = np.random.default_rng(abs(hash((name, fid, k))) % (2**32))
+            jit = {}  # mean-agg AP at each jitter level (+ max-agg at the largest)
+            for L in args.jitter_levels:
+                kpj = jittered_box_patches(pu0, pu1, pv0, pv1, L, rng)
+                jit[f"boxj{L:g}_AP"] = _box_ap(kpj, "mean")
+            Lmax = max(args.jitter_levels) if args.jitter_levels else 0.0
+            jit[f"boxj{Lmax:g}_max_AP"] = _box_ap(
+                jittered_box_patches(pu0, pu1, pv0, pv1, Lmax, rng), "max")
 
             s_rand = (F3D @ F.normalize(torch.randn(DINO_DIM, device=device), dim=0)
                       ).detach().cpu().numpy()
@@ -472,7 +520,7 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
             amb = ((semantic[topk] == sem_k) & (instance[topk] != k)).mean()
             ndist = len(np.unique(instance[topk][instance[topk] >= 0]))
 
-            rows.append(dict(
+            row = dict(
                 scene=name, frame=fid, inst=k, sem=sem_k, n_pts=int(gt_mask.sum()),
                 vis_pts=int(vis_k.sum()), occ_pts=occ_n,
                 align_AP=m_align["AP"], align_IoU=m_align["best_IoU"],
@@ -480,13 +528,16 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
                 geo_AP=m_geo["AP"], geo_rec200=m_geo["rec@200"],
                 rand_AP=m_rand["AP"],
                 occ_AP=occ_AP, occ_chance=occ_chance, occ_lift=occ_lift,
-                amb_sameclass_otherinst=float(amb), amb_distinct_inst=int(ndist)))
-            print(f"[{name} {fid} inst{k} sem{sem_k} n={rows[-1]['n_pts']} "
-                  f"vis={rows[-1]['vis_pts']} occ={occ_n}] "
+                amb_sameclass_otherinst=float(amb), amb_distinct_inst=int(ndist))
+            row.update(jit)
+            rows.append(row)
+            jit_str = " ".join(f"{kk.replace('_AP','').replace('box','b')}={vv:.3f}"
+                               for kk, vv in jit.items())
+            print(f"[{name} {fid} inst{k} sem{sem_k} n={row['n_pts']} "
+                  f"vis={row['vis_pts']} occ={occ_n}] "
                   f"align AP={m_align['AP']:.3f} IoU={m_align['best_IoU']:.3f} | "
-                  f"box AP={box_AP:.3f} | "
-                  f"occ AP={occ_AP:.3f} chance={occ_chance:.3f} lift={occ_lift:.2f} | "
-                  f"geo AP={m_geo['AP']:.3f} | rand={m_rand['AP']:.3f} | amb={amb:.2f}")
+                  f"box AP={box_AP:.3f} jit[{jit_str}] | "
+                  f"occ AP={occ_AP:.3f} lift={occ_lift:.2f} | amb={amb:.2f}")
 
     _summarize(rows, args.out_csv)
 
@@ -522,6 +573,18 @@ def _summarize(rows, out_csv):
           f"-> {'RECOVERS unseen parts' if np.nanmean(ol) > 2 else 'mostly visible-region only'}")
     print(f"    instance ambiguity: {np.nanmean(amb):.2f}  "
           f"-> {'LOW (good)' if np.nanmean(amb) < 0.2 else 'HIGH (duplicates pollute)'}")
+    # box-jitter robustness curve (detector-noise simulation)
+    jcols = [k for k in rows[0] if k.startswith("boxj")]
+    if jcols:
+        print("    box-jitter robustness (mean AP; detector-noise sim):")
+        print(f"      tight={np.nanmean(bx):.3f}  "
+              + "  ".join(f"{c.replace('box','').replace('_AP','')}={np.nanmean(arr(c)):.3f}"
+                          for c in jcols))
+        mc = [c for c in jcols if c.endswith("max_AP")]
+        if mc:
+            print(f"      -> max-agg at largest jitter recovers to "
+                  f"{np.nanmean(arr(mc[0])):.3f} "
+                  f"(vs mean {np.nanmean(arr(jcols[-2] if len(jcols) > 1 else jcols[0])):.3f})")
     print(f"\n  CSV -> {out_csv}")
 
 
@@ -559,6 +622,10 @@ def build_argparser():
     p.add_argument("--max_targets", type=int, default=20)
     p.add_argument("--bp_radius", type=float, default=0.10)
     p.add_argument("--amb_k", type=int, default=200)
+    p.add_argument("--jitter_levels", default=[0.25, 0.5],
+                   type=lambda s: [float(x) for x in s.split(",") if x != ""],
+                   help="box expand+shift fractions for detector-noise robustness "
+                        "(comma list, e.g. 0.25,0.5). Adds boxj* columns.")
     p.add_argument("--out_csv", default="viewpoint_probe_results.csv")
     return p
 
