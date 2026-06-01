@@ -421,7 +421,8 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
 
         for k in targets:
             gt_mask = (instance == k)
-            sem_k = int(np.bincount(semantic[gt_mask & (semantic >= 0)]).argmax())
+            sem_pts = semantic[gt_mask & (semantic >= 0)]
+            sem_k = int(np.bincount(sem_pts).argmax()) if len(sem_pts) else -1
 
             sel_rows = inst_of_corr == k                       # corr rows seeing inst k
             kp = np.unique(patch[sel_rows])

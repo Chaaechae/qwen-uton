@@ -116,6 +116,35 @@ def _openclip_dense(visual, x):
     return z
 
 
+def instance_box_from_corr(corr, instance, inst_id, N, pad=8):
+    """Bounding box (x0,y0,x1,y1) of inst_id's projected pixels -- detector stand-in."""
+    px, py, pidx = corr[:, 0], corr[:, 1], corr[:, -1].astype(np.int64)
+    valid = (pidx >= 0) & (pidx < N)
+    px, py, pidx = px[valid], py[valid], pidx[valid]
+    sel = instance[pidx] == inst_id
+    if sel.sum() == 0:
+        return None
+    return (float(px[sel].min() - pad), float(py[sel].min() - pad),
+            float(px[sel].max() + pad), float(py[sel].max() + pad))
+
+
+def dominant_instance_under_patches(corr, instance, kp, sx, sy, N):
+    """What GT instances actually sit under the Stage-1-selected patches?
+    Lets you see if a click/box hit the object you meant. Returns [(inst, count), ...]."""
+    px, py, pidx = corr[:, 0], corr[:, 1], corr[:, -1].astype(np.int64)
+    valid = (pidx >= 0) & (pidx < N)
+    px, py, pidx = px[valid], py[valid], pidx[valid]
+    patch = P.px_to_patch(px, py, sx, sy)
+    under = np.isin(patch, kp)
+    insts = instance[pidx[under]]
+    insts = insts[insts >= 0]
+    if len(insts) == 0:
+        return None
+    vals, counts = np.unique(insts, return_counts=True)
+    order = np.argsort(-counts)
+    return [(int(vals[i]), int(counts[i])) for i in order[:5]]
+
+
 def write_ply(path, coord, color01):
     color = (np.clip(color01, 0, 1) * 255).astype(np.uint8)
     with open(path, "w") as f:
@@ -138,7 +167,11 @@ def main():
     ap.add_argument("--image_dir", default=None)
     ap.add_argument("--frame", default="0", help="scene frame id used as the 2D query image")
     ap.add_argument("--image", default=None, help="external query image (overrides --frame)")
-    ap.add_argument("--mode", choices=["box", "json", "point", "text"], default="point")
+    ap.add_argument("--mode", choices=["box", "json", "point", "text", "auto"],
+                    default="point",
+                    help="auto: derive the Stage-1 box from --eval_instance's "
+                         "correspondence in --frame (detector stand-in; the proper "
+                         "way to measure loose-box degradation).")
     ap.add_argument("--box", type=float, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"))
     ap.add_argument("--point", type=float, nargs=2, default=None, metavar=("X", "Y"))
     ap.add_argument("--text", default=None, help="label for --mode text/json")
@@ -160,19 +193,34 @@ def main():
     coord = scene["coord"]
     print(f"[F3D] {tuple(F3D.shape)}")
 
-    # load the query image
+    # load the query image (and, for scene frames, the GT correspondence for the
+    # auto box / diagnostics -- NOT used by point/box/text Stage-1 selection).
     import imageio.v2 as imageio
+    corr = None
     if args.image:
         rgb = imageio.imread(args.image)
     else:
         image_dir = args.image_dir or P.default_image_dir(args.scene_dir)
         rgb = imageio.imread(os.path.join(image_dir, "color", f"{args.frame}.png"))
+        try:
+            _, corr = P.load_frame_corr(image_dir, args.frame)
+        except FileNotFoundError:
+            pass
     H, W = rgb.shape[:2]
+    N = len(coord)
     img_t, sx, sy = P.dino_preprocess(rgb)
     F2D = F.normalize(P.extract_dino_patches(dino, img_t, device), dim=-1)
 
-    # Stage-1: image-only patch selection
-    if args.mode == "box":
+    # Stage-1: object -> DINO patches
+    if args.mode == "auto":
+        assert args.eval_instance is not None and corr is not None, \
+            "--mode auto needs --eval_instance and a scene frame with correspondence"
+        box = instance_box_from_corr(corr, scene["instance"], args.eval_instance, N)
+        assert box, f"instance {args.eval_instance} not visible in frame {args.frame}"
+        print(f"[stage-1] auto box from inst {args.eval_instance}: "
+              f"({box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f})")
+        kp = select_patches_box(box, W, H)
+    elif args.mode == "box":
         assert args.box, "--box required"
         kp = select_patches_box(args.box, W, H)
     elif args.mode == "json":
@@ -188,6 +236,13 @@ def main():
         kp = select_patches_text(img_t, args.text, rgb, device, args.tau)
     assert len(kp) > 0, "Stage-1 selected no patches"
     print(f"[stage-1] mode={args.mode} -> {len(kp)} DINO patches")
+
+    # diagnostic: which GT instances actually sit under the selected patches?
+    if corr is not None:
+        dom = dominant_instance_under_patches(corr, scene["instance"], kp, sx, sy, N)
+        print(f"[stage-1 diag] GT instances under selected patches (inst,count): {dom}"
+              + ("" if args.eval_instance is None else
+                 f"  <- you are evaluating inst {args.eval_instance}"))
 
     # Stage-2: cosine match to the DINO-aligned 3D map
     q = F.normalize(F2D[torch.as_tensor(kp, device=device)].mean(0), dim=0)
