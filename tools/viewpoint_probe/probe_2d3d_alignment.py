@@ -404,13 +404,27 @@ def run_probe(args):
             s_align = (F3D @ q).detach().cpu().numpy()          # (A) learned alignment
             m_align = retrieval_metrics(s_align, gt_mask)
 
+            s_rand = (F3D @ F.normalize(torch.randn(DINO_DIM, device=device), dim=0)
+                      ).detach().cpu().numpy()
+            m_rand = retrieval_metrics(s_rand, gt_mask)
+
             vis_k = np.zeros(N, dtype=bool)                     # (B) frame coverage
             vis_k[np.unique(pidx[sel_rows])] = True
             m_geo = retrieval_metrics(_seed_score(vis_k, coord_w, args.bp_radius), gt_mask)
 
-            s_rand = (F3D @ F.normalize(torch.randn(DINO_DIM, device=device), dim=0)
-                      ).detach().cpu().numpy()
-            m_rand = retrieval_metrics(s_rand, gt_mask)
+            # (C) OCCLUDED-SUBSET AP -- the decisive test for "finds the part of the
+            #     object NOT visible in this frame". Rank only {occluded_k U background}
+            #     (visible_k excluded); positives = occluded_k. occ_AP >> occ_chance
+            #     => alignment lifts unseen object parts above background.
+            occ_mask = gt_mask & ~vis_k
+            restrict = occ_mask | (~gt_mask)
+            occ_n = int(occ_mask.sum())
+            if occ_n >= args.min_occ_pts and restrict.sum() > occ_n:
+                occ_AP = retrieval_metrics(s_align[restrict], occ_mask[restrict], ks=(50,))["AP"]
+                occ_chance = retrieval_metrics(s_rand[restrict], occ_mask[restrict], ks=(50,))["AP"]
+            else:
+                occ_AP = occ_chance = float("nan")
+            occ_lift = occ_AP / occ_chance if occ_chance and occ_chance > 0 else float("nan")
 
             topk = np.argsort(-s_align)[: args.amb_k]
             amb = ((semantic[topk] == sem_k) & (instance[topk] != k)).mean()
@@ -418,17 +432,17 @@ def run_probe(args):
 
             rows.append(dict(
                 frame=fid, inst=k, sem=sem_k, n_pts=int(gt_mask.sum()),
-                vis_pts=int(vis_k.sum()),
+                vis_pts=int(vis_k.sum()), occ_pts=occ_n,
                 align_AP=m_align["AP"], align_IoU=m_align["best_IoU"],
                 align_rec200=m_align["rec@200"],
                 geo_AP=m_geo["AP"], geo_rec200=m_geo["rec@200"],
                 rand_AP=m_rand["AP"],
+                occ_AP=occ_AP, occ_chance=occ_chance, occ_lift=occ_lift,
                 amb_sameclass_otherinst=float(amb), amb_distinct_inst=int(ndist)))
-            print(f"[{fid} inst{k} sem{sem_k} n={rows[-1]['n_pts']} vis={rows[-1]['vis_pts']}] "
-                  f"align AP={m_align['AP']:.3f} IoU={m_align['best_IoU']:.3f} "
-                  f"rec200={m_align['rec@200']:.3f} | geo AP={m_geo['AP']:.3f} "
-                  f"rec200={m_geo['rec@200']:.3f} | rand={m_rand['AP']:.3f} | "
-                  f"amb={amb:.2f} ndist={ndist}")
+            print(f"[{fid} inst{k} sem{sem_k} n={rows[-1]['n_pts']} vis={rows[-1]['vis_pts']} "
+                  f"occ={occ_n}] align AP={m_align['AP']:.3f} IoU={m_align['best_IoU']:.3f} | "
+                  f"occ AP={occ_AP:.3f} chance={occ_chance:.3f} lift={occ_lift:.2f} | "
+                  f"geo AP={m_geo['AP']:.3f} | rand={m_rand['AP']:.3f} | amb={amb:.2f}")
 
     _summarize(rows, args.out_csv)
 
@@ -444,18 +458,19 @@ def _summarize(rows, out_csv):
     arr = lambda k: np.array([r[k] for r in rows], float)
     print(f"\n============= SUMMARY ({len(rows)} pairs) =============")
     for k in ("align_AP", "align_IoU", "align_rec200", "geo_AP", "geo_rec200",
-              "rand_AP", "amb_sameclass_otherinst", "amb_distinct_inst"):
+              "rand_AP", "occ_AP", "occ_chance", "occ_lift",
+              "amb_sameclass_otherinst", "amb_distinct_inst"):
         v = arr(k)
         print(f"  {k:26s} mean={np.nanmean(v):.3f} median={np.nanmedian(v):.3f}")
     a, g, r = arr("align_AP"), arr("geo_AP"), arr("rand_AP")
-    ar, gr = arr("align_rec200"), arr("geo_rec200")
     amb = arr("amb_sameclass_otherinst")
+    oa, ol = arr("occ_AP"), arr("occ_lift")
     print("\n  Verdict:")
     print(f"    alignment vs chance:   {np.nanmean(a):.3f} vs {np.nanmean(r):.3f}  "
           f"-> {'PASS' if np.nanmean(a) > 3 * np.nanmean(r) else 'WEAK'}")
-    print(f"    alignment vs frame-coverage (recall@200): {np.nanmean(ar):.3f} vs "
-          f"{np.nanmean(gr):.3f}  "
-          f"-> {'lights up unseen parts' if np.nanmean(ar) > np.nanmean(gr) else 'within frame only'}")
+    print(f"    OCCLUDED-part recovery: occ_AP {np.nanmean(oa):.3f} vs chance "
+          f"{np.nanmean(arr('occ_chance')):.3f} (lift {np.nanmean(ol):.2f})  "
+          f"-> {'RECOVERS unseen parts' if np.nanmean(ol) > 2 else 'mostly visible-region only'}")
     print(f"    instance ambiguity: {np.nanmean(amb):.2f}  "
           f"-> {'LOW (good)' if np.nanmean(amb) < 0.2 else 'HIGH (duplicates pollute)'}")
     print(f"\n  CSV -> {out_csv}")
@@ -482,6 +497,8 @@ def build_argparser():
     p.add_argument("--scale", type=float, default=1.0,
                    help="utonia.transform.default coord scale; MATCH your extraction")
     p.add_argument("--min_inst_pts", type=int, default=200)
+    p.add_argument("--min_occ_pts", type=int, default=50,
+                   help="min occluded points to score the occluded-subset AP")
     p.add_argument("--min_patches", type=int, default=3)
     p.add_argument("--max_targets", type=int, default=20)
     p.add_argument("--bp_radius", type=float, default=0.10)
