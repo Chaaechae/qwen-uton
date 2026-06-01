@@ -43,7 +43,7 @@ camera pose/depth for the lift.
 
 | Need | Detail |
 |---|---|
-| **Full pretrain ckpt** | `Utonia-v1m1` with **both** `module.student.backbone.*` and `module.patch_proj.*`. Backbone-only weights abort the script (the aligned space only exists after `patch_proj`). Default path: `/group-volume/Utonia/utonia.pth`. |
+| **Checkpoints** | **`patch_proj` lives ONLY in a full pretrain ckpt (e.g. stagev2).** The released `utonia.pth` is backbone-only (standalone format, no `patch_proj`) so it cannot define the aligned space by itself. Use `--backbone_ckpt` for the backbone (utonia.pth *or* a pretrain ckpt) and `--patch_proj_ckpt` for a pretrain ckpt that holds `patch_proj`. Full pretrain ckpts are loaded with `weights_only=False` (they carry optimizer/EMA state), which fixes the `UnpicklingError: Weights only load failed`. |
 | **DINOv2 teacher** | `facebook/dinov2-with-registers-giant` (auto-downloaded). |
 | **Preprocessed scene** | `scene_dir` with `coord/color/normal/segment20/instance.npy`; `image_dir` with `color/<f>.png` + `correspondence/<f>.npy`. depth/pose/intrinsic are **not** needed (correspondence is already raycast/occlusion-aware). |
 | **Env** | An interpreter that has the utonia deps (`torch`, `spconv`, `flash_attn`, `torch_scatter`, `transformers`, `timm`, `huggingface_hub`) + `scipy`, `imageio`, `torchvision`. **No `conda activate` needed** — see Run. The script auto-adds the repo root to `sys.path` (same as the repo's `export PYTHONPATH=./` convention), so `pip install -e .` is not required either. |
@@ -64,10 +64,15 @@ python tools/viewpoint_probe/probe_2d3d_alignment.py        # defaults to your p
 
 # explicit args (defaults already match your layout):
 python tools/viewpoint_probe/probe_2d3d_alignment.py \
-  --pretrain_ckpt /group-volume/Utonia/utonia.pth \
+  --backbone_ckpt /group-volume/Utonia/pretrain-utonia-v1m1-0-base-stagev2.pth \
   --scene_dir     /group-volume/3Ddataset/data/scannet/val/scene0011_00 \
   --frames        0,300,600          # omit / "" = all frames in the scene
 ```
+
+The default uses the **stagev2 full pretrain ckpt for both the backbone and
+`patch_proj`** (the matched pair). `patch_proj` is read from the same ckpt unless
+`--patch_proj_ckpt` is given. The ckpt is loaded with `weights_only=False`, fixing
+the `UnpicklingError: Weights only load failed`.
 
 If `utonia` imports but a dependency is missing, the script tells you exactly which
 package and which interpreter — no `conda activate` involved.

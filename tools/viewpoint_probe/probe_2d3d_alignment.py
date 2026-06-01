@@ -107,44 +107,86 @@ IGNORE = -100                     # preprocessor IGNORE_INDEX for instance/segme
 
 # --------------------------------------------------------------------------- #
 # Model loading
+#
+# Two checkpoint formats exist:
+#   * STANDALONE  (the released `utonia.pth`): {"config": {...}, "state_dict": {...}}
+#       with BARE backbone keys ("embedding.*", "enc.*", ...). NO `patch_proj`.
+#       -> load via the embedded config (same as utonia.load).
+#   * FULL PRETRAIN (e.g. stagev2 `*.pth`): state_dict keys prefixed
+#       "module.student.backbone.*" and "module.patch_proj.*". Contains the
+#       trained `patch_proj` (1332->1536) -- the ONLY place the DINO-aligned space
+#       lives. Saved with optimizer/EMA state, so it needs weights_only=False.
 # --------------------------------------------------------------------------- #
-def _strip_prefixes(sd):
-    backbone_sd, patch_proj_sd = {}, {}
+def _torch_load(path):
+    # weights_only=False: full pretrain ckpts carry non-tensor objects (addict
+    # Dict / numpy / EMA bookkeeping) that the torch>=2.6 default rejects.
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _state_dict(ckpt):
+    return ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+
+
+def _is_standalone(sd):
+    return (any(k.startswith(("embedding.", "enc.", "dec.")) for k in sd)
+            and not any(k.startswith(("module.", "student.", "teacher.")) for k in sd))
+
+
+def load_backbone(backbone_ckpt, device):
+    ckpt = _torch_load(backbone_ckpt)
+    sd = _state_dict(ckpt)
+    if _is_standalone(sd):
+        cfg = ckpt.get("config") if isinstance(ckpt, dict) else None
+        if cfg is None:
+            raise RuntimeError(f"{backbone_ckpt}: standalone format but no 'config'.")
+        model = utonia.model.PointTransformerV3(**cfg)
+        model.load_state_dict(sd)
+        print(f"[backbone] standalone format from embedded config "
+              f"(enc_mode={cfg.get('enc_mode')}, traceable={cfg.get('traceable')}, "
+              f"in_channels={cfg.get('in_channels')})")
+        if not cfg.get("traceable", False):
+            print("  WARNING: traceable=False -> no pooling chain for up_cast. "
+                  "Use a full pretrain ckpt as --backbone_ckpt instead.")
+    else:
+        bsd = {}
+        for k, v in sd.items():
+            kk = k[len("module."):] if k.startswith("module.") else k
+            if kk.startswith("student.backbone."):
+                bsd[kk[len("student.backbone."):]] = v
+            elif kk.startswith("backbone.") and "teacher" not in kk:
+                bsd[kk[len("backbone."):]] = v
+        if not bsd:
+            raise RuntimeError(
+                f"{backbone_ckpt}: no backbone weights. prefixes seen: "
+                f"{sorted({k.split('.')[0] for k in sd})[:8]}")
+        model = utonia.model.PointTransformerV3(**BACKBONE_CONFIG)
+        missing, unexpected = model.load_state_dict(bsd, strict=False)
+        print(f"[backbone] pretrain student.backbone loaded; "
+              f"missing={len(missing)} unexpected={len(unexpected)}")
+    return model.to(device).eval()
+
+
+def load_patch_proj(pp_ckpt, device):
+    """patch_proj lives ONLY in a full pretrain ckpt. Returns the Linear or exits."""
+    sd = _state_dict(_torch_load(pp_ckpt))
+    pp = {}
     for k, v in sd.items():
         kk = k[len("module."):] if k.startswith("module.") else k
-        if kk.startswith("student.backbone."):
-            backbone_sd[kk[len("student.backbone."):]] = v
-        elif kk.startswith("backbone."):
-            backbone_sd[kk[len("backbone."):]] = v
-        elif kk.startswith("patch_proj."):
-            patch_proj_sd[kk[len("patch_proj."):]] = v
-    return backbone_sd, patch_proj_sd
-
-
-def load_backbone_and_proj(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    sd = ckpt.get("state_dict", ckpt)
-    backbone_sd, patch_proj_sd = _strip_prefixes(sd)
-    if not backbone_sd:
-        raise RuntimeError(
-            f"No backbone weights in {ckpt_path} (expected 'module.student.backbone.*'). "
-            f"Available top-level prefixes: "
-            f"{sorted({k.split('.')[0] for k in sd})[:10]}"
-        )
-    model = utonia.model.PointTransformerV3(**BACKBONE_CONFIG)
-    missing, unexpected = model.load_state_dict(backbone_sd, strict=False)
-    print(f"[backbone] loaded; missing={len(missing)} unexpected={len(unexpected)}")
-    model = model.to(device).eval()
-
-    if not patch_proj_sd:
-        print("ERROR: checkpoint has no `patch_proj` -> the DINO-aligned space does "
-              "not exist. Supply a FULL Utonia-v1m1 pretrain checkpoint.")
+        if kk.startswith("patch_proj."):
+            pp[kk[len("patch_proj."):]] = v
+    if not pp:
+        print(f"ERROR: no `patch_proj` in {pp_ckpt}. The DINO-aligned space does not\n"
+              f"exist without it. The released utonia.pth is backbone-only -- point\n"
+              f"--patch_proj_ckpt at a FULL pretrain checkpoint (e.g. stagev2).")
         sys.exit(2)
-    patch_proj = torch.nn.Linear(BACKBONE_OUT_CHANNELS, DINO_DIM)
-    patch_proj.load_state_dict(patch_proj_sd)
-    patch_proj = patch_proj.to(device).eval()
-    print("[patch_proj] loaded (faithful aligned space).")
-    return model, patch_proj
+    out_c, in_c = pp["weight"].shape           # [DINO_DIM, BACKBONE_OUT_CHANNELS]
+    lin = torch.nn.Linear(in_c, out_c)
+    lin.load_state_dict(pp)
+    if (in_c, out_c) != (BACKBONE_OUT_CHANNELS, DINO_DIM):
+        print(f"  WARNING: patch_proj is {in_c}->{out_c}, expected "
+              f"{BACKBONE_OUT_CHANNELS}->{DINO_DIM}. Check enc2d_upcast_level / dims.")
+    print(f"[patch_proj] loaded {in_c}->{out_c} (faithful aligned space).")
+    return lin.to(device).eval()
 
 
 def load_dino(device):
@@ -298,7 +340,10 @@ def run_probe(args):
     image_dir = args.image_dir or default_image_dir(args.scene_dir)
     print(f"[paths] scene_dir={args.scene_dir}\n        image_dir={image_dir}")
 
-    model, patch_proj = load_backbone_and_proj(args.pretrain_ckpt, device)
+    model = load_backbone(args.backbone_ckpt, device)
+    # patch_proj defaults to the backbone ckpt (works when that is a full pretrain
+    # ckpt); for the released utonia.pth you MUST pass --patch_proj_ckpt <stagev2>.
+    patch_proj = load_patch_proj(args.patch_proj_ckpt or args.backbone_ckpt, device)
     dino = load_dino(device)
 
     scene = load_scene(args.scene_dir)
@@ -416,7 +461,15 @@ def _summarize(rows, out_csv):
 def build_argparser():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pretrain_ckpt", default="/group-volume/Utonia/utonia.pth")
+    # Default: stagev2 full pretrain ckpt for BOTH backbone + patch_proj (matched pair).
+    p.add_argument("--backbone_ckpt",
+                   default="/group-volume/Utonia/pretrain-utonia-v1m1-0-base-stagev2.pth",
+                   help="backbone weights. A full pretrain ckpt (stagev2) holds both "
+                        "the student backbone and patch_proj. The released utonia.pth "
+                        "is backbone-only (no patch_proj).")
+    p.add_argument("--patch_proj_ckpt", default=None,
+                   help="ckpt holding `patch_proj`; defaults to --backbone_ckpt. "
+                        "Only needed separately if backbone comes from utonia.pth.")
     p.add_argument("--scene_dir",
                    default="/group-volume/3Ddataset/data/scannet/val/scene0011_00")
     p.add_argument("--image_dir", default=None,
