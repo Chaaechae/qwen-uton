@@ -367,6 +367,28 @@ def jittered_box_patches(pu0, pu1, pv0, pv1, frac, rng):
                         cl(pv0 - padv + sv), cl(pv1 + padv + sv))
 
 
+def _fg_patches(F2D, kpb, device):
+    """Foreground filter inside a box: 2-means on DINO features, keep the cluster
+    nearest the box centroid (object usually occupies the box interior)."""
+    if len(kpb) < 6:
+        return kpb
+    feats = F2D[torch.as_tensor(kpb, device=device)]            # [n,C] normalized
+    pu, pv = kpb % PATCH_HW, kpb // PATCH_HW
+    cu, cv = pu.mean(), pv.mean()
+    g = feats @ feats.T
+    i = int(g.sum(1).argmin()); j = int(g[i].argmin())
+    c = torch.stack([feats[i], feats[j]])
+    for _ in range(5):
+        a = (feats @ c.T).argmax(1)
+        for t in (0, 1):
+            if (a == t).any():
+                c[t] = F.normalize(feats[a == t].mean(0), dim=0)
+    a = a.cpu().numpy()
+    d = (pu - cu) ** 2 + (pv - cv) ** 2
+    keep = 0 if d[a == 0].mean() <= d[a == 1].mean() else 1
+    return kpb[a == keep]
+
+
 # --------------------------------------------------------------------------- #
 # Reusable: 3D features in the DINO-aligned space for one scene
 # --------------------------------------------------------------------------- #
@@ -486,13 +508,14 @@ def probe_one_scene(scene_dir, model, patch_proj, dino, device, args, rows):
 
             box_AP = _box_ap(_box_patches(pu0, pu1, pv0, pv1), "mean")  # tight, mean
             rng = np.random.default_rng(abs(hash((name, fid, k))) % (2**32))
-            jit = {}  # mean-agg AP at each jitter level (+ max-agg at the largest)
+            jit = {}  # mean-agg AP at each jitter level (+ fg-filtered at the largest)
             for L in args.jitter_levels:
                 kpj = jittered_box_patches(pu0, pu1, pv0, pv1, L, rng)
                 jit[f"boxj{L:g}_AP"] = _box_ap(kpj, "mean")
             Lmax = max(args.jitter_levels) if args.jitter_levels else 0.0
-            jit[f"boxj{Lmax:g}_max_AP"] = _box_ap(
-                jittered_box_patches(pu0, pu1, pv0, pv1, Lmax, rng), "max")
+            kpj = jittered_box_patches(pu0, pu1, pv0, pv1, Lmax, rng)
+            # foreground filter recovery (the real lever; max-agg makes loose boxes worse)
+            jit[f"boxj{Lmax:g}_fg_AP"] = _box_ap(_fg_patches(F2D, kpj, device), "mean")
 
             s_rand = (F3D @ F.normalize(torch.randn(DINO_DIM, device=device), dim=0)
                       ).detach().cpu().numpy()
@@ -580,11 +603,12 @@ def _summarize(rows, out_csv):
         print(f"      tight={np.nanmean(bx):.3f}  "
               + "  ".join(f"{c.replace('box','').replace('_AP','')}={np.nanmean(arr(c)):.3f}"
                           for c in jcols))
-        mc = [c for c in jcols if c.endswith("max_AP")]
-        if mc:
-            print(f"      -> max-agg at largest jitter recovers to "
-                  f"{np.nanmean(arr(mc[0])):.3f} "
-                  f"(vs mean {np.nanmean(arr(jcols[-2] if len(jcols) > 1 else jcols[0])):.3f})")
+        fc = [c for c in jcols if c.endswith("fg_AP")]
+        mn = [c for c in jcols if c.endswith("_AP") and not c.endswith("fg_AP")]
+        if fc and mn:
+            print(f"      -> foreground filter at largest jitter: "
+                  f"{np.nanmean(arr(fc[0])):.3f} vs plain {np.nanmean(arr(mn[-1])):.3f} "
+                  f"(fg {'helps' if np.nanmean(arr(fc[0])) > np.nanmean(arr(mn[-1])) else 'no gain'})")
     print(f"\n  CSV -> {out_csv}")
 
 
