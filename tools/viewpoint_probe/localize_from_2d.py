@@ -128,6 +128,36 @@ def instance_box_from_corr(corr, instance, inst_id, N, pad=8):
             float(px[sel].max() + pad), float(py[sel].max() + pad))
 
 
+def visible_instances(corr, instance, N, top=12):
+    pidx = corr[:, -1].astype(np.int64)
+    pidx = pidx[(pidx >= 0) & (pidx < N)]
+    insts = instance[pidx]
+    insts = insts[insts >= 0]
+    if len(insts) == 0:
+        return []
+    vals, counts = np.unique(insts, return_counts=True)
+    order = np.argsort(-counts)
+    return [(int(vals[i]), int(counts[i])) for i in order[:top]]
+
+
+def best_frame_for_instance(image_dir, instance, inst_id, N):
+    """Scan correspondence/*.npy; return (frame_id, pixel_count) where inst_id shows most."""
+    best_f, best_c = None, 0
+    for f in P.list_frames(image_dir):
+        try:
+            corr = np.load(os.path.join(image_dir, "correspondence", f"{f}.npy"))
+        except (FileNotFoundError, OSError):
+            continue
+        if corr.ndim != 2 or corr.shape[1] < 3:
+            continue
+        pidx = corr[:, -1].astype(np.int64)
+        pidx = pidx[(pidx >= 0) & (pidx < N)]
+        c = int((instance[pidx] == inst_id).sum())
+        if c > best_c:
+            best_f, best_c = f, c
+    return best_f, best_c
+
+
 def dominant_instance_under_patches(corr, instance, kp, sx, sy, N):
     """What GT instances actually sit under the Stage-1-selected patches?
     Lets you see if a click/box hit the object you meant. Returns [(inst, count), ...]."""
@@ -193,30 +223,48 @@ def main():
     coord = scene["coord"]
     print(f"[F3D] {tuple(F3D.shape)}")
 
-    # load the query image (and, for scene frames, the GT correspondence for the
-    # auto box / diagnostics -- NOT used by point/box/text Stage-1 selection).
     import imageio.v2 as imageio
+    N = len(coord)
+    image_dir = args.image_dir or P.default_image_dir(args.scene_dir)
+    frame = args.frame
+
+    # auto mode: if the requested object isn't visible in --frame, jump to the
+    # frame that shows it best (so the eval prompt provably targets the object).
+    if args.mode == "auto" and not args.image:
+        assert args.eval_instance is not None, "--mode auto needs --eval_instance"
+        _, corr0 = P.load_frame_corr(image_dir, frame)
+        if instance_box_from_corr(corr0, scene["instance"], args.eval_instance, N) is None:
+            bf, bc = best_frame_for_instance(image_dir, scene["instance"],
+                                             args.eval_instance, N)
+            if bf is None:
+                vis = visible_instances(corr0, scene["instance"], N)
+                sys.exit(f"instance {args.eval_instance} not visible in ANY frame.\n"
+                         f"instances visible in frame {frame} (inst,count): {vis}")
+            print(f"[auto] inst {args.eval_instance} not in frame {frame}; "
+                  f"switching to frame {bf} ({bc} px).")
+            frame = bf
+
+    # load the query image (+ correspondence for auto box / diagnostics)
     corr = None
     if args.image:
         rgb = imageio.imread(args.image)
     else:
-        image_dir = args.image_dir or P.default_image_dir(args.scene_dir)
-        rgb = imageio.imread(os.path.join(image_dir, "color", f"{args.frame}.png"))
+        rgb = imageio.imread(os.path.join(image_dir, "color", f"{frame}.png"))
         try:
-            _, corr = P.load_frame_corr(image_dir, args.frame)
+            _, corr = P.load_frame_corr(image_dir, frame)
         except FileNotFoundError:
             pass
     H, W = rgb.shape[:2]
-    N = len(coord)
     img_t, sx, sy = P.dino_preprocess(rgb)
     F2D = F.normalize(P.extract_dino_patches(dino, img_t, device), dim=-1)
+    if corr is not None:
+        print(f"[frame {frame}] visible instances (inst,count): "
+              f"{visible_instances(corr, scene['instance'], N)}")
 
     # Stage-1: object -> DINO patches
     if args.mode == "auto":
-        assert args.eval_instance is not None and corr is not None, \
-            "--mode auto needs --eval_instance and a scene frame with correspondence"
         box = instance_box_from_corr(corr, scene["instance"], args.eval_instance, N)
-        assert box, f"instance {args.eval_instance} not visible in frame {args.frame}"
+        assert box, f"instance {args.eval_instance} not visible in frame {frame}"
         print(f"[stage-1] auto box from inst {args.eval_instance}: "
               f"({box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f})")
         kp = select_patches_box(box, W, H)
@@ -225,9 +273,9 @@ def main():
         kp = select_patches_box(args.box, W, H)
     elif args.mode == "json":
         assert args.boxes_json and args.text, "--boxes_json and --text required"
-        dets = json.load(open(args.boxes_json)).get(str(args.frame), [])
+        dets = json.load(open(args.boxes_json)).get(str(frame), [])
         cand = [d for d in dets if args.text.lower() in str(d.get("label", "")).lower()]
-        assert cand, f"no '{args.text}' box for frame {args.frame} in {args.boxes_json}"
+        assert cand, f"no '{args.text}' box for frame {frame} in {args.boxes_json}"
         kp = select_patches_box(cand[0]["box"], W, H)
     elif args.mode == "point":
         assert args.point, "--point required"
