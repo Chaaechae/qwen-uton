@@ -116,6 +116,46 @@ def _openclip_dense(visual, x):
     return z
 
 
+def patches_with_instance_pixels(corr, instance, inst_id, sx, sy, N):
+    """Pixel-accurate (mask-level) patch set: patches that actually contain inst_id
+    pixels (via correspondence) -- same selection the probe used. Isolates the
+    bounding-box penalty from the alignment quality."""
+    px, py, pidx = corr[:, 0], corr[:, 1], corr[:, -1].astype(np.int64)
+    valid = (pidx >= 0) & (pidx < N)
+    px, py, pidx = px[valid], py[valid], pidx[valid]
+    sel = instance[pidx] == inst_id
+    if sel.sum() == 0:
+        return np.array([], dtype=np.int64)
+    return np.unique(P.px_to_patch(px[sel], py[sel], sx, sy))
+
+
+def foreground_filter(F2D, kp, box, W, H, device):
+    """Within a (loose) box, keep the patch cluster nearest the box center via a
+    tiny 2-means on DINO features -- a training-free, SAM-free foreground proxy."""
+    if len(kp) < 6:
+        return kp
+    feats = F2D[torch.as_tensor(kp, device=device)]            # [n,C] normalized
+    # patch grid centers in image px
+    sx, sy = P.CROP / W, P.CROP / H
+    pu = (kp % P.PATCH_HW); pv = (kp // P.PATCH_HW)
+    cx = (pu + 0.5) * P.PATCH_SIZE / sx; cy = (pv + 0.5) * P.PATCH_SIZE / sy
+    bx, by = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    # 2-means (5 iters) seeded by the two most dissimilar patches
+    g = (feats @ feats.T)
+    i = int(g.sum(1).argmin()); j = int(g[i].argmin())
+    c = torch.stack([feats[i], feats[j]])
+    for _ in range(5):
+        a = (feats @ c.T).argmax(1)
+        for t in (0, 1):
+            if (a == t).any():
+                c[t] = F.normalize(feats[a == t].mean(0), dim=0)
+    a = a.cpu().numpy()
+    # pick the cluster whose patches are closer to the box center
+    d = (cx - bx) ** 2 + (cy - by) ** 2
+    keep = 0 if d[a == 0].mean() <= d[a == 1].mean() else 1
+    return kp[a == keep]
+
+
 def instance_box_from_corr(corr, instance, inst_id, N, pad=8):
     """Bounding box (x0,y0,x1,y1) of inst_id's projected pixels -- detector stand-in."""
     px, py, pidx = corr[:, 0], corr[:, 1], corr[:, -1].astype(np.int64)
@@ -197,11 +237,17 @@ def main():
     ap.add_argument("--image_dir", default=None)
     ap.add_argument("--frame", default="0", help="scene frame id used as the 2D query image")
     ap.add_argument("--image", default=None, help="external query image (overrides --frame)")
-    ap.add_argument("--mode", choices=["box", "json", "point", "text", "auto"],
+    ap.add_argument("--mode",
+                    choices=["box", "json", "point", "text", "auto", "auto_mask"],
                     default="point",
-                    help="auto: derive the Stage-1 box from --eval_instance's "
-                         "correspondence in --frame (detector stand-in; the proper "
-                         "way to measure loose-box degradation).")
+                    help="auto: box from --eval_instance's correspondence (loose "
+                         "detector stand-in). auto_mask: pixel-accurate patches "
+                         "(== probe selection; isolates the bounding-box penalty).")
+    ap.add_argument("--agg", choices=["mean", "max"], default="mean",
+                    help="Stage-2 aggregation over selected patches (max is more "
+                         "robust to background patches in a loose box).")
+    ap.add_argument("--fg", action="store_true",
+                    help="foreground-filter a (loose) box via 2-means before matching")
     ap.add_argument("--box", type=float, nargs=4, default=None, metavar=("X0", "Y0", "X1", "Y1"))
     ap.add_argument("--point", type=float, nargs=2, default=None, metavar=("X", "Y"))
     ap.add_argument("--text", default=None, help="label for --mode text/json")
@@ -228,10 +274,10 @@ def main():
     image_dir = args.image_dir or P.default_image_dir(args.scene_dir)
     frame = args.frame
 
-    # auto mode: if the requested object isn't visible in --frame, jump to the
+    # auto/auto_mask: if the requested object isn't visible in --frame, jump to the
     # frame that shows it best (so the eval prompt provably targets the object).
-    if args.mode == "auto" and not args.image:
-        assert args.eval_instance is not None, "--mode auto needs --eval_instance"
+    if args.mode in ("auto", "auto_mask") and not args.image:
+        assert args.eval_instance is not None, "--mode auto* needs --eval_instance"
         _, corr0 = P.load_frame_corr(image_dir, frame)
         if instance_box_from_corr(corr0, scene["instance"], args.eval_instance, N) is None:
             bf, bc = best_frame_for_instance(image_dir, scene["instance"],
@@ -261,29 +307,41 @@ def main():
         print(f"[frame {frame}] visible instances (inst,count): "
               f"{visible_instances(corr, scene['instance'], N)}")
 
-    # Stage-1: object -> DINO patches
+    # Stage-1: object -> DINO patches.  box=loose detector box (mixes background),
+    # auto_mask=pixel-accurate patches (== probe selection; isolates the box penalty).
+    box = None
     if args.mode == "auto":
         box = instance_box_from_corr(corr, scene["instance"], args.eval_instance, N)
         assert box, f"instance {args.eval_instance} not visible in frame {frame}"
         print(f"[stage-1] auto box from inst {args.eval_instance}: "
               f"({box[0]:.0f},{box[1]:.0f},{box[2]:.0f},{box[3]:.0f})")
         kp = select_patches_box(box, W, H)
+    elif args.mode == "auto_mask":
+        kp = patches_with_instance_pixels(corr, scene["instance"],
+                                          args.eval_instance, sx, sy, N)
+        assert len(kp), f"instance {args.eval_instance} not visible in frame {frame}"
     elif args.mode == "box":
         assert args.box, "--box required"
-        kp = select_patches_box(args.box, W, H)
+        box = tuple(args.box)
+        kp = select_patches_box(box, W, H)
     elif args.mode == "json":
         assert args.boxes_json and args.text, "--boxes_json and --text required"
         dets = json.load(open(args.boxes_json)).get(str(frame), [])
         cand = [d for d in dets if args.text.lower() in str(d.get("label", "")).lower()]
         assert cand, f"no '{args.text}' box for frame {frame} in {args.boxes_json}"
-        kp = select_patches_box(cand[0]["box"], W, H)
+        box = tuple(cand[0]["box"])
+        kp = select_patches_box(box, W, H)
     elif args.mode == "point":
         assert args.point, "--point required"
         kp = select_patches_point(F2D, args.point, W, H, args.tau)
     else:  # text
         kp = select_patches_text(img_t, args.text, rgb, device, args.tau)
     assert len(kp) > 0, "Stage-1 selected no patches"
-    print(f"[stage-1] mode={args.mode} -> {len(kp)} DINO patches")
+    if args.fg and box is not None:                       # box foreground filter
+        kp2 = foreground_filter(F2D, kp, box, W, H, device)
+        print(f"[stage-1] fg filter: {len(kp)} -> {len(kp2)} patches")
+        kp = kp2 if len(kp2) else kp
+    print(f"[stage-1] mode={args.mode} agg={args.agg} -> {len(kp)} DINO patches")
 
     # diagnostic: which GT instances actually sit under the selected patches?
     if corr is not None:
@@ -292,9 +350,16 @@ def main():
               + ("" if args.eval_instance is None else
                  f"  <- you are evaluating inst {args.eval_instance}"))
 
-    # Stage-2: cosine match to the DINO-aligned 3D map
-    q = F.normalize(F2D[torch.as_tensor(kp, device=device)].mean(0), dim=0)
-    scores = (F3D @ q).detach().cpu().numpy()
+    # Stage-2: cosine match to the DINO-aligned 3D map.
+    #   mean = single averaged query (sensitive to background patches in the set)
+    #   max  = per-3D-point max cosine over the selected patches (robust to a few
+    #          off-object patches; object points still score high via object patches)
+    Fk = F2D[torch.as_tensor(kp, device=device)]
+    if args.agg == "max":
+        scores = (F3D @ Fk.T).max(dim=1).values.detach().cpu().numpy()
+    else:
+        q = F.normalize(Fk.mean(0), dim=0)
+        scores = (F3D @ q).detach().cpu().numpy()
     topk = np.argsort(-scores)[: args.topk]
     np.save(args.out + "_topk.npy", topk)
 

@@ -116,10 +116,25 @@ python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
   --mode text --text "a chair" --tau 0.6 --out /tmp/loc
 ```
 
-Modes: `box` / `json` are the realistic "2D detector → 3D" path (loose boxes, unlike
-the probe's pixel-perfect GT — so this measures real Stage-1 degradation). `point` is
-GT-free and dependency-light. `text` is a best-effort open-vocab heatmap (the weakest
-link; prefer a detector box). Open `<out>.ply` to see where in 3D the object landed.
+Modes: `box`/`json` = realistic 2D-detector boxes; `auto` = box auto-derived from
+`--eval_instance`'s correspondence (detector stand-in, auto-picks a frame that shows
+it); `auto_mask` = pixel-accurate patches (== the probe's selection) to isolate the
+box penalty; `point` = click + DINO self-similarity; `text` = experimental open-vocab.
+
+### The bounding-box penalty (important)
+
+On scene0011 the probe's pixel-perfect selection gives align AP ≈ 0.31, but a loose
+`auto` **box** drops to ≈ 0.06 with prec@100 = 0 — the box mixes floor/wall/other
+objects into the query, so a mean query matches large background structures. The
+alignment is fine; the **bbox Stage-1 is the bottleneck**. Mitigations:
+
+- `--mode auto_mask` — confirms the pipeline (should recover ≈ the probe number).
+- `--agg max` — per-point max cosine over patches; robust to a few background patches.
+- `--fg` — 2-means foreground filter inside the box (keeps the central cluster).
+- Real fix: a **mask** (SAM / segmentation) Stage-1, not just a box.
+
+The `[stage-1 diag]` line prints which GT instances actually sit under the selected
+patches — use it to see box contamination. Open `<out>.ply` to see the 3D heatmap.
 
 If `utonia` imports but a dependency is missing, the script tells you exactly which
 package and which interpreter — no `conda activate` involved.
