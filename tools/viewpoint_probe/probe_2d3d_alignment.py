@@ -38,14 +38,35 @@ import sys
 import glob
 import numpy as np
 
-# --- make the standalone `utonia` package importable without `pip install -e .` ---
+# --- import the standalone `utonia` package the same way the repo's demos do ---
+# The README convention is `export PYTHONPATH=./` from the repo root (NO conda
+# activate, NO pip install).  We replicate that here by putting the repo root on
+# sys.path automatically, so the script runs from any cwd with any interpreter
+# that has the deps -- you do not need to remember PYTHONPATH or to activate.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 import torch
 import torch.nn.functional as F
-import utonia
+
+try:
+    import utonia
+except ModuleNotFoundError as e:
+    if e.name in ("utonia",):
+        sys.exit(
+            f"Cannot import `utonia` (looked under repo root: {_REPO_ROOT}).\n"
+            f"Run from the repo root, or check that {_REPO_ROOT}/utonia/ exists."
+        )
+    # utonia was found but one of ITS dependencies is missing -> env problem,
+    # not a path problem. Tell the user exactly which, no conda activate needed.
+    sys.exit(
+        f"`utonia` is on the path but its dependency `{e.name}` is missing in this\n"
+        f"interpreter ({sys.executable}).\n"
+        f"Use the interpreter that has the utonia env's packages "
+        f"(e.g. /path/to/envs/utonia/bin/python {__file__}) -- no `conda activate` "
+        f"required -- or `pip install {e.name}` into it."
+    )
 
 
 # Backbone config (PT-v3m3) copied verbatim from

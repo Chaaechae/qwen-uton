@@ -46,21 +46,31 @@ camera pose/depth for the lift.
 | **Full pretrain ckpt** | `Utonia-v1m1` with **both** `module.student.backbone.*` and `module.patch_proj.*`. Backbone-only weights abort the script (the aligned space only exists after `patch_proj`). Default path: `/group-volume/Utonia/utonia.pth`. |
 | **DINOv2 teacher** | `facebook/dinov2-with-registers-giant` (auto-downloaded). |
 | **Preprocessed scene** | `scene_dir` with `coord/color/normal/segment20/instance.npy`; `image_dir` with `color/<f>.png` + `correspondence/<f>.npy`. depth/pose/intrinsic are **not** needed (correspondence is already raycast/occlusion-aware). |
-| **Env** | `utonia` conda env (`flash_attn`, `torch_scatter`) + `scipy`, `imageio`, `torchvision`. The script auto-adds the repo root to `sys.path`, so `pip install -e .` is optional. |
+| **Env** | An interpreter that has the utonia deps (`torch`, `spconv`, `flash_attn`, `torch_scatter`, `transformers`, `timm`, `huggingface_hub`) + `scipy`, `imageio`, `torchvision`. **No `conda activate` needed** — see Run. The script auto-adds the repo root to `sys.path` (same as the repo's `export PYTHONPATH=./` convention), so `pip install -e .` is not required either. |
 
-## Run
+## Run (no `conda activate`)
 
-Defaults already point at your paths:
+Same convention as the repo's demos (`export PYTHONPATH=./` from the repo root),
+or just call the interpreter that has the deps by its absolute path. The script also
+puts the repo root on `sys.path` itself, so the path part needs no setup.
 
 ```bash
-python tools/viewpoint_probe/probe_2d3d_alignment.py
-# == explicit ==
+# Option A — repo convention, run from repo root:
+export PYTHONPATH=./
+python tools/viewpoint_probe/probe_2d3d_alignment.py        # defaults to your paths
+
+# Option B — point straight at the env's python, no activate, run from anywhere:
+/path/to/envs/utonia/bin/python tools/viewpoint_probe/probe_2d3d_alignment.py
+
+# explicit args (defaults already match your layout):
 python tools/viewpoint_probe/probe_2d3d_alignment.py \
   --pretrain_ckpt /group-volume/Utonia/utonia.pth \
   --scene_dir     /group-volume/3Ddataset/data/scannet/val/scene0011_00 \
-  --frames        ""          # empty = all frames in the scene \
-  --out_csv       results_scene0011.csv
+  --frames        0,300,600          # omit / "" = all frames in the scene
 ```
+
+If `utonia` imports but a dependency is missing, the script tells you exactly which
+package and which interpreter — no `conda activate` involved.
 
 `image_dir` is auto-derived as `<root>/images/<split>/<scene>`
 (→ `/group-volume/3Ddataset/data/scannet/images/val/scene0011_00`); override with
