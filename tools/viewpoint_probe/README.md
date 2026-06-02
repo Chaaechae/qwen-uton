@@ -202,3 +202,29 @@ instance ambiguity: <frac>   (LOW (good) / HIGH (duplicates pollute))
   diagnostic quantifies exactly this.
 - The Stage-1 selection uses correspondence (≈ ground truth) to isolate alignment
   quality. Replace with your real 2D detector/CLIP step once alignment passes.
+
+## Attention video (`attention_video.py`): fixed scene, sweep frames
+
+Same scene point cloud, many 2D frames → animate how the 3D attention shifts per
+frame. Output is a self-contained plotly **HTML with Play + a frame slider** (left =
+input frame, right = 3D scene colored by match), so it plays in a browser — no 3D
+viewer needed. Optional `.mp4`/`.gif` if `kaleido` + `imageio` are installed.
+
+```bash
+export PYTHONPATH=./
+# whole-image footprint per frame:
+python tools/viewpoint_probe/attention_video.py \
+  --scene_dir /group-volume/3Ddataset/data/scannet/val/scene0011_00 \
+  --max_frames 40 --fps 4 --out /tmp/scene0011_attn
+
+# track an object by text across frames:
+python tools/viewpoint_probe/attention_video.py --mode text --text "chair" \
+  --max_frames 40 --out /tmp/scene0011_chair
+
+# also write an mp4 (needs `pip install -U kaleido imageio[ffmpeg]`):
+python tools/viewpoint_probe/attention_video.py --max_frames 40 --mp4 --out /tmp/scene0011_attn
+```
+
+The geometry is sent once; animation frames carry only the per-point color + the small
+input image (partial updates), so the HTML stays compact. Tune `--max_points`
+(default 40k) and `--max_frames` for size vs. detail.
