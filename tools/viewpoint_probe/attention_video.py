@@ -122,10 +122,14 @@ def _write_html(path, co, imgs, scs, frames, args):
         x=co[:, 0], y=co[:, 1], z=co[:, 2], mode="markers",
         marker=dict(size=1.6, color=scs[0], colorscale="Spectral_r",
                     cmin=0.0, cmax=1.0, opacity=0.85)), row=1, col=2)
-    # partial frame updates (only image z + marker color) -> small file
-    fig.frames = [go.Frame(name=str(f), data=[dict(z=imgs[i]),
-                                              dict(marker=dict(color=scs[i],
-                                                   colorscale="Spectral_r", cmin=0, cmax=1))],
+    # partial frame updates (only image z + marker color) -> small file.
+    # NOTE: dicts MUST carry "type" or plotly validates them as a 2D Scatter and
+    # rejects 'z' ("invalid property ... Scatter: 'z'").
+    fig.frames = [go.Frame(name=str(f), data=[
+                      dict(type="image", z=imgs[i]),
+                      dict(type="scatter3d",
+                           marker=dict(color=scs[i], colorscale="Spectral_r",
+                                       cmin=0, cmax=1, size=1.6, opacity=0.85))],
                            traces=[0, 1]) for i, f in enumerate(frames[:len(scs)])]
     dur = int(1000 / max(args.fps, 1))
     fig.update_layout(
