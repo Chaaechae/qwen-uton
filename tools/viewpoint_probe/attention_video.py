@@ -59,8 +59,12 @@ def main():
     ap.add_argument("--max_points", type=int, default=40000,
                     help="point subsample for a responsive/small HTML")
     ap.add_argument("--fps", type=int, default=4)
-    ap.add_argument("--mp4", action="store_true", help="also render an .mp4 (needs kaleido+imageio)")
-    ap.add_argument("--gif", action="store_true", help="also render a .gif (needs kaleido+imageio)")
+    ap.add_argument("--mp4", action="store_true",
+                    help="also render .mp4 via matplotlib+imageio (no chrome; needs imageio-ffmpeg)")
+    ap.add_argument("--gif", action="store_true",
+                    help="also render .gif via matplotlib+imageio (no chrome; pillow only)")
+    ap.add_argument("--elev", type=float, default=30.0, help="mpl 3D view elevation")
+    ap.add_argument("--azim", type=float, default=-60.0, help="mpl 3D view azimuth")
     ap.add_argument("--out", default="/tmp/scene_attn")
     args = ap.parse_args()
 
@@ -153,37 +157,43 @@ def _write_html(path, co, imgs, scs, frames, args):
 
 
 def _write_video(out, co, imgs, scs, frames, args):
-    """Optional raster video via kaleido (static 3D render) + imageio."""
+    """Raster video WITHOUT a browser/chrome: render each frame with matplotlib (Agg)
+    and stitch with imageio. .gif needs only pillow; .mp4 needs imageio-ffmpeg."""
     try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
         import imageio.v2 as imageio
     except Exception as e:
-        print(f"[video] skipped ({e})")
+        print(f"[video] skipped ({e}); HTML still written.")
         return
-    cam = dict(eye=dict(x=1.5, y=1.5, z=1.2))   # fixed camera so the scene doesn't spin
-    pngs = []
+    rng = co.max(0) - co.min(0)
+    rendered = []
     for i in range(len(scs)):
-        fig = make_subplots(rows=1, cols=2, column_widths=[0.36, 0.64],
-                            specs=[[{"type": "image"}, {"type": "scene"}]])
-        fig.add_trace(go.Image(z=imgs[i]), row=1, col=1)
-        fig.add_trace(go.Scatter3d(
-            x=co[:, 0], y=co[:, 1], z=co[:, 2], mode="markers",
-            marker=dict(size=1.6, color=scs[i], colorscale="Spectral_r",
-                        cmin=0, cmax=1, opacity=0.85)), row=1, col=2)
-        fig.update_layout(scene=dict(aspectmode="data", camera=cam),
-                          margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
-        try:
-            pngs.append(imageio.imread(fig.to_image(format="png", width=1100, height=620,
-                                                    engine="kaleido")))
-        except Exception as e:
-            print(f"[video] kaleido render failed ({e}); install kaleido. Skipping mp4/gif.")
-            return
+        fig = plt.figure(figsize=(11, 6), dpi=100)
+        axi = fig.add_subplot(1, 2, 1); axi.imshow(imgs[i]); axi.axis("off")
+        axi.set_title(f"frame {frames[i]}", fontsize=9)
+        ax = fig.add_subplot(1, 2, 2, projection="3d")
+        ax.scatter(co[:, 0], co[:, 1], co[:, 2], c=scs[i], cmap="Spectral_r",
+                   vmin=0, vmax=1, s=2, linewidths=0, depthshade=False)
+        ax.view_init(elev=args.elev, azim=args.azim)
+        ax.set_box_aspect(rng)
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.canvas.draw()
+        rendered.append(np.asarray(fig.canvas.buffer_rgba())[..., :3].copy())
+        plt.close(fig)
+        print(f"  rendered {i + 1}/{len(scs)}")
     if args.mp4:
-        imageio.mimsave(out + ".mp4", pngs, fps=args.fps)
-        print(f"[out] {out}.mp4")
+        try:
+            imageio.mimsave(out + ".mp4", rendered, fps=args.fps)
+            print(f"[out] {out}.mp4")
+        except Exception as e:
+            print(f"[video] mp4 failed ({e}); writing .gif instead.")
+            imageio.mimsave(out + ".gif", rendered, fps=args.fps)
+            print(f"[out] {out}.gif")
     if args.gif:
-        imageio.mimsave(out + ".gif", pngs, fps=args.fps)
+        imageio.mimsave(out + ".gif", rendered, fps=args.fps)
         print(f"[out] {out}.gif")
 
 
