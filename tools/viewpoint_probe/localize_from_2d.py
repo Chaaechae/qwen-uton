@@ -10,7 +10,7 @@ isolate *alignment* quality; here Stage-1 is image-only:
         --mode box    : an explicit pixel box (from any 2D detector, incl. Qwen-VL)
         --mode json   : boxes from a detector dump (qwen-uton); pick by --text label
         --mode point  : a clicked pixel, grown by DINO self-similarity
-        --mode text   : open-vocab heatmap via open_clip (optional dep; experimental)
+        --mode text   : open-vocab region via CLIPSeg (transformers); text -> 2D mask
     Stage-2 (2D->3D)  : cosine-match the selected DINO feature(s) to the
         DINO-aligned 3D map features (patch_proj space) -> per-point score.
 
@@ -68,53 +68,42 @@ def select_patches_point(F2D, point, W, H, tau):
     return idx if len(idx) else np.array([p0], dtype=np.int64)
 
 
-def select_patches_text(image_chw_unused, text, rgb, device, tau):
-    """Open-vocab via open_clip dense features (EXPERIMENTAL; needs `pip install open_clip_torch`).
-    Returns DINO patch indices over the same 37x37 grid by thresholding a CLIP
-    text-patch cosine heatmap resampled to 37x37."""
-    import open_clip
-    import torchvision.transforms.functional as TF
-    model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained="laion2b_s34b_b88k")
-    tok = open_clip.get_tokenizer("ViT-B-16")
-    model = model.to(device).eval()
-    H, W = rgb.shape[:2]
-    x = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).float() / 255.0
-    x = TF.resize(x, [224, 224], antialias=True)
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1)
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1)
-    x = ((x - mean) / std).unsqueeze(0).to(device)
+_CLIPSEG = {}
+
+
+def clip_text_region(rgb, text, device, topp):
+    """Open-vocab text -> 2D region via CLIPSeg (transformers, no exotic deps).
+    Returns (kp, heat37): DINO patch indices selected (top-`topp` fraction of the
+    text-conditioned segmentation) and the 37x37 heatmap (0..1) for visualization."""
+    from transformers import CLIPSegProcessor, CLIPSegForImageSegmentation
+    from PIL import Image
+    if "m" not in _CLIPSEG:
+        mid = "CIDAS/clipseg-rd64-refined"
+        _CLIPSEG["p"] = CLIPSegProcessor.from_pretrained(mid)
+        _CLIPSEG["m"] = CLIPSegForImageSegmentation.from_pretrained(mid).to(device).eval()
+    proc, seg = _CLIPSEG["p"], _CLIPSEG["m"]
+    inp = proc(text=[text], images=[Image.fromarray(np.ascontiguousarray(rgb))],
+               return_tensors="pt").to(device)
     with torch.inference_mode():
-        v = model.visual
-        tokens = v.trunk.forward_features(x) if hasattr(v, "trunk") else None
-        if tokens is None:                       # open_clip native ViT
-            feats = _openclip_dense(v, x)        # [1, n_patch, C]
-        else:
-            feats = tokens
-        feats = feats[:, -((224 // 16) ** 2):, :]
-        feats = F.normalize(feats[0], dim=-1)    # [196, C]
-        t = F.normalize(model.encode_text(tok([text]).to(device)).float(), dim=-1)[0]
-        heat = (feats @ t).reshape(14, 14).detach().cpu().numpy()
+        logits = seg(**inp).logits                       # [H,W] or [1,H,W]
+    if logits.dim() == 2:
+        logits = logits[None]
+    heat = torch.sigmoid(logits)[None].float()           # [1,1,H,W]
+    heat = F.interpolate(heat, size=(P.PATCH_HW, P.PATCH_HW),
+                         mode="bilinear", align_corners=False)[0, 0].cpu().numpy()
     heat = (heat - heat.min()) / (heat.ptp() + 1e-6)
-    # resample 14x14 -> 37x37 grid, threshold
-    grid = np.kron(heat, np.ones((3, 3)))[:P.PATCH_HW, :P.PATCH_HW]
-    return np.where(grid.reshape(-1) > tau)[0]
+    thr = np.quantile(heat, 1.0 - topp)                  # keep top-`topp` patches
+    kp = np.where(heat.reshape(-1) >= max(thr, 1e-6))[0]
+    return kp.astype(np.int64), heat
 
 
-def _openclip_dense(visual, x):
-    """Best-effort dense token extraction from an open_clip ViT (no attention pool)."""
-    v = visual
-    z = v.conv1(x)
-    z = z.reshape(z.shape[0], z.shape[1], -1).permute(0, 2, 1)
-    cls = v.class_embedding.to(z.dtype) + torch.zeros(z.shape[0], 1, z.shape[-1], device=z.device, dtype=z.dtype)
-    z = torch.cat([cls, z], dim=1) + v.positional_embedding.to(z.dtype)
-    z = v.ln_pre(z)
-    z = z.permute(1, 0, 2)
-    z = v.transformer(z)
-    z = z.permute(1, 0, 2)
-    z = v.ln_post(z)
-    if v.proj is not None:
-        z = z @ v.proj
-    return z
+def highlight_image(rgb, heat37, lo=0.35):
+    """Dim the image outside the text-matched region (heat upsampled to image size)."""
+    import torch.nn.functional as TF_
+    h = torch.from_numpy(heat37)[None, None].float()
+    h = TF_.interpolate(h, size=rgb.shape[:2], mode="bilinear", align_corners=False)[0, 0].numpy()
+    w = (lo + (1 - lo) * h)[..., None]
+    return np.clip(rgb.astype(np.float32) * w, 0, 255).astype(np.uint8)
 
 
 def patches_with_instance_pixels(corr, instance, inst_id, sx, sy, N):
@@ -296,7 +285,9 @@ def main():
     ap.add_argument("--text", default=None, help="label for --mode text/json")
     ap.add_argument("--boxes_json", default=None,
                     help="detector dump: {frame_id: [{label, box:[x0,y0,x1,y1]}, ...]}")
-    ap.add_argument("--tau", type=float, default=0.6, help="self-sim / heatmap threshold")
+    ap.add_argument("--tau", type=float, default=0.6, help="self-sim threshold (point mode)")
+    ap.add_argument("--text_topp", type=float, default=0.2,
+                    help="--mode text: keep the top fraction of CLIPSeg-scored patches")
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--topk", type=int, default=2000)
     ap.add_argument("--eval_instance", type=int, default=None,
@@ -346,6 +337,7 @@ def main():
         except FileNotFoundError:
             pass
     H, W = rgb.shape[:2]
+    viz_img = rgb                                # left panel image (text mode dims it)
     img_t, sx, sy = P.dino_preprocess(rgb)
     F2D = F.normalize(P.extract_dino_patches(dino, img_t, device), dim=-1)
     if corr is not None:
@@ -382,8 +374,11 @@ def main():
     elif args.mode == "point":
         assert args.point, "--point required"
         kp = select_patches_point(F2D, args.point, W, H, args.tau)
-    else:  # text
-        kp = select_patches_text(img_t, args.text, rgb, device, args.tau)
+    else:  # text -> open-vocab region via CLIPSeg
+        assert args.text, "--text required for --mode text"
+        kp, heat37 = clip_text_region(rgb, args.text, device, args.text_topp)
+        viz_img = highlight_image(rgb, heat37)               # dim outside the region
+        print(f"[stage-1] text '{args.text}' -> {len(kp)} patches (top {args.text_topp})")
     assert len(kp) > 0, "Stage-1 selected no patches"
     if args.fg and box is not None:                       # box foreground filter
         kp2 = foreground_filter(F2D, kp, box, W, H, device)
@@ -429,9 +424,10 @@ def main():
         print(f"[eval image footprint] visible={int(gt_vis.sum())} | "
               f"AP={m['AP']:.3f} IoU={m['best_IoU']:.3f} prec@500={m['prec@500']:.3f}")
 
-    write_scatter_html(args.out + ".html", coord, value=scores, image=rgb,
-                       title=f"{args.mode} | bright=match | red trace=GT (toggle)",
-                       overlay=overlay, max_points=args.max_points)
+    ttl = f"{args.mode}" + (f" '{args.text}'" if args.mode == "text" else "") \
+        + " | bright=match | red trace=GT (toggle)"
+    write_scatter_html(args.out + ".html", coord, value=scores, image=viz_img,
+                       title=ttl, overlay=overlay, max_points=args.max_points)
     print(f"[out] {args.out}.html  {args.out}_topk.npy  (open the .html in a browser)")
 
     if args.eval_instance is not None:

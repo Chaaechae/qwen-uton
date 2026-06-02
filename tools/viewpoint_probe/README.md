@@ -125,15 +125,15 @@ python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
 python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
   --mode json --boxes_json dets.json --text chair --out /tmp/loc
 
-# open-vocab text (EXPERIMENTAL, needs `pip install open_clip_torch`):
+# open-vocab TEXT (CLIPSeg via transformers; text -> 2D region -> 3D):
 python tools/viewpoint_probe/localize_from_2d.py --frame 300 \
-  --mode text --text "a chair" --tau 0.6 --out /tmp/loc
+  --mode text --text "chair" --text_topp 0.2 --out /tmp/loc
 ```
 
 Modes: `box`/`json` = realistic 2D-detector boxes; `auto` = box auto-derived from
 `--eval_instance`'s correspondence (detector stand-in, auto-picks a frame that shows
 it); `auto_mask` = pixel-accurate patches (== the probe's selection) to isolate the
-box penalty; `point` = click + DINO self-similarity; `text` = experimental open-vocab.
+box penalty; `point` = click + DINO self-similarity; `text` = open-vocab via CLIPSeg (text → 2D region; the left HTML panel dims everything outside the matched region).
 
 ### The bounding-box penalty (important)
 
