@@ -222,34 +222,49 @@ def _subsample(n, max_points, seed=0):
     return np.random.default_rng(seed).choice(n, size=max_points, replace=False)
 
 
-def write_scatter_html(path, coord, value=None, rgb=None, colorscale="Spectral_r",
-                       title="", overlay=None, max_points=120000):
-    """Self-contained plotly HTML 3D scatter of a point cloud.
-    value: per-point scalar -> colorscale+colorbar. rgb: per-point [0,1]^3 colors.
-    overlay: optional (mask, 'red', name) extra trace toggled via the legend."""
+def write_scatter_html(path, coord, value=None, point_rgb=None, colorscale="Spectral_r",
+                       title="", overlay=None, image=None, max_points=120000):
+    """Self-contained plotly HTML: the input 2D image (left) next to the 3D point-cloud
+    heatmap (right), so you can eyeball that the highlighted region is the right place.
+    value: per-point scalar -> colorscale. point_rgb: per-point [0,1]^3 colors.
+    overlay: optional (mask, color, name) extra 3D trace toggled via the legend.
+    image: HxWx3 uint8 input image to show beside the scene."""
     import plotly.graph_objects as go
     idx = _subsample(len(coord), max_points)
     c = coord[idx]
     if value is not None:
         marker = dict(size=1.5, color=np.asarray(value)[idx], colorscale=colorscale,
-                      colorbar=dict(title="cosine"), opacity=0.8)
-    elif rgb is not None:
-        cols = (np.clip(np.asarray(rgb)[idx], 0, 1) * 255).astype(int)
+                      colorbar=dict(title="cosine", x=1.0), opacity=0.8)
+    elif point_rgb is not None:
+        cols = (np.clip(np.asarray(point_rgb)[idx], 0, 1) * 255).astype(int)
         marker = dict(size=1.5, color=[f"rgb({r},{g},{b})" for r, g, b in cols], opacity=0.8)
     else:
         marker = dict(size=1.5, opacity=0.8)
-    traces = [go.Scatter3d(x=c[:, 0], y=c[:, 1], z=c[:, 2], mode="markers",
-                           marker=marker, name="points")]
+    cloud = go.Scatter3d(x=c[:, 0], y=c[:, 1], z=c[:, 2], mode="markers",
+                         marker=marker, name="points")
+    over = None
     if overlay is not None:
         mask, ocolor, oname = overlay
-        m = np.asarray(mask)[idx]
-        oc = c[m]
-        traces.append(go.Scatter3d(
-            x=oc[:, 0], y=oc[:, 1], z=oc[:, 2], mode="markers",
-            marker=dict(size=2.0, color=ocolor), name=oname, visible="legendonly"))
-    fig = go.Figure(traces)
+        oc = c[np.asarray(mask)[idx]]
+        over = go.Scatter3d(x=oc[:, 0], y=oc[:, 1], z=oc[:, 2], mode="markers",
+                            marker=dict(size=2.0, color=ocolor), name=oname,
+                            visible="legendonly")
+
+    if image is not None:
+        from plotly.subplots import make_subplots
+        img = np.asarray(image)
+        step = max(1, int(np.ceil(img.shape[1] / 640)))   # downscale wide images
+        fig = make_subplots(rows=1, cols=2, column_widths=[0.38, 0.62],
+                            specs=[[{"type": "image"}, {"type": "scene"}]],
+                            subplot_titles=("input image", "3D scene (bright = match)"))
+        fig.add_trace(go.Image(z=img[::step, ::step]), row=1, col=1)
+        fig.add_trace(cloud, row=1, col=2)
+        if over is not None:
+            fig.add_trace(over, row=1, col=2)
+    else:
+        fig = go.Figure([cloud] + ([over] if over is not None else []))
     fig.update_layout(title=title, scene=dict(aspectmode="data"),
-                      margin=dict(l=0, r=0, t=30, b=0))
+                      margin=dict(l=0, r=0, t=40, b=0))
     fig.write_html(path, include_plotlyjs=True, full_html=True)
 
 
@@ -414,7 +429,7 @@ def main():
         print(f"[eval image footprint] visible={int(gt_vis.sum())} | "
               f"AP={m['AP']:.3f} IoU={m['best_IoU']:.3f} prec@500={m['prec@500']:.3f}")
 
-    write_scatter_html(args.out + ".html", coord, value=scores,
+    write_scatter_html(args.out + ".html", coord, value=scores, image=rgb,
                        title=f"{args.mode} | bright=match | red trace=GT (toggle)",
                        overlay=overlay, max_points=args.max_points)
     print(f"[out] {args.out}.html  {args.out}_topk.npy  (open the .html in a browser)")
