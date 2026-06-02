@@ -14,9 +14,10 @@ isolate *alignment* quality; here Stage-1 is image-only:
     Stage-2 (2D->3D)  : cosine-match the selected DINO feature(s) to the
         DINO-aligned 3D map features (patch_proj space) -> per-point score.
 
-Outputs: a heatmap point cloud (<out>.ply), top-K point indices (<out>_topk.npy),
-and -- if --eval_instance is given -- AP/IoU vs that GT instance, so you can read
-the degradation from the probe's GT-surrogate numbers to an image-only Stage-1.
+Outputs: a self-contained plotly heatmap (<out>.html, open in a browser), top-K
+point indices (<out>_topk.npy), and -- if --eval_instance is given -- AP/IoU vs that
+GT instance, so you can read the degradation from the probe's GT-surrogate numbers
+to an image-only Stage-1.
 
 Run (no conda activate; repo root on sys.path automatically):
     python tools/viewpoint_probe/localize_from_2d.py \
@@ -215,15 +216,41 @@ def dominant_instance_under_patches(corr, instance, kp, sx, sy, N):
     return [(int(vals[i]), int(counts[i])) for i in order[:5]]
 
 
-def write_ply(path, coord, color01):
-    color = (np.clip(color01, 0, 1) * 255).astype(np.uint8)
-    with open(path, "w") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {len(coord)}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
-        for (x, y, z), (r, g, b) in zip(coord, color):
-            f.write(f"{x:.4f} {y:.4f} {z:.4f} {r} {g} {b}\n")
+def _subsample(n, max_points, seed=0):
+    if n <= max_points:
+        return np.arange(n)
+    return np.random.default_rng(seed).choice(n, size=max_points, replace=False)
+
+
+def write_scatter_html(path, coord, value=None, rgb=None, colorscale="Spectral_r",
+                       title="", overlay=None, max_points=120000):
+    """Self-contained plotly HTML 3D scatter of a point cloud.
+    value: per-point scalar -> colorscale+colorbar. rgb: per-point [0,1]^3 colors.
+    overlay: optional (mask, 'red', name) extra trace toggled via the legend."""
+    import plotly.graph_objects as go
+    idx = _subsample(len(coord), max_points)
+    c = coord[idx]
+    if value is not None:
+        marker = dict(size=1.5, color=np.asarray(value)[idx], colorscale=colorscale,
+                      colorbar=dict(title="cosine"), opacity=0.8)
+    elif rgb is not None:
+        cols = (np.clip(np.asarray(rgb)[idx], 0, 1) * 255).astype(int)
+        marker = dict(size=1.5, color=[f"rgb({r},{g},{b})" for r, g, b in cols], opacity=0.8)
+    else:
+        marker = dict(size=1.5, opacity=0.8)
+    traces = [go.Scatter3d(x=c[:, 0], y=c[:, 1], z=c[:, 2], mode="markers",
+                           marker=marker, name="points")]
+    if overlay is not None:
+        mask, ocolor, oname = overlay
+        m = np.asarray(mask)[idx]
+        oc = c[m]
+        traces.append(go.Scatter3d(
+            x=oc[:, 0], y=oc[:, 1], z=oc[:, 2], mode="markers",
+            marker=dict(size=2.0, color=ocolor), name=oname, visible="legendonly"))
+    fig = go.Figure(traces)
+    fig.update_layout(title=title, scene=dict(aspectmode="data"),
+                      margin=dict(l=0, r=0, t=30, b=0))
+    fig.write_html(path, include_plotlyjs=True, full_html=True)
 
 
 def main():
@@ -260,6 +287,8 @@ def main():
     ap.add_argument("--eval_instance", type=int, default=None,
                     help="GT instance id to score AP/IoU against (sanity vs the probe)")
     ap.add_argument("--out", default="/tmp/loc")
+    ap.add_argument("--max_points", type=int, default=120000,
+                    help="subsample cap for the HTML scatter (keeps it responsive)")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -373,25 +402,22 @@ def main():
     topk = np.argsort(-scores)[: args.topk]
     np.save(args.out + "_topk.npy", topk)
 
-    import matplotlib.cm as cm
-    s01 = (scores - scores.min()) / (scores.ptp() + 1e-6)
-    write_ply(args.out + ".ply", coord, cm.get_cmap("Spectral_r")(s01)[:, :3])
-    print(f"[out] {args.out}.ply  {args.out}_topk.npy")
-
-    # --mode image: the GT "footprint" is the set of points actually visible in the
-    # frame (from correspondence). Write it for side-by-side comparison + score it.
+    # --mode image: GT "footprint" = points actually visible in the frame.
+    overlay = None
     if args.mode == "image" and corr is not None:
         pidx = corr[:, -1].astype(np.int64)
         pidx = pidx[(pidx >= 0) & (pidx < N)]
         gt_vis = np.zeros(N, dtype=bool)
         gt_vis[np.unique(pidx)] = True
-        gt_col = np.tile([0.6, 0.6, 0.6], (N, 1))
-        gt_col[gt_vis] = [0.9, 0.1, 0.1]
-        write_ply(args.out + "_gt.ply", coord, gt_col)
+        overlay = (gt_vis, "red", "GT visible (toggle)")
         m = P.retrieval_metrics(scores, gt_vis)
         print(f"[eval image footprint] visible={int(gt_vis.sum())} | "
-              f"AP={m['AP']:.3f} IoU={m['best_IoU']:.3f} prec@500={m['prec@500']:.3f}  "
-              f"(pred .ply vs GT _gt.ply)")
+              f"AP={m['AP']:.3f} IoU={m['best_IoU']:.3f} prec@500={m['prec@500']:.3f}")
+
+    write_scatter_html(args.out + ".html", coord, value=scores,
+                       title=f"{args.mode} | bright=match | red trace=GT (toggle)",
+                       overlay=overlay, max_points=args.max_points)
+    print(f"[out] {args.out}.html  {args.out}_topk.npy  (open the .html in a browser)")
 
     if args.eval_instance is not None:
         gt = (scene["instance"] == args.eval_instance)

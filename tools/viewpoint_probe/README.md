@@ -108,7 +108,7 @@ offset, and how much per-point **max aggregation** (`--agg max` in the demo) rec
 ## Stage-1 → 3D demo (B): localize from a real 2D image, no GT
 
 `localize_from_2d.py` runs the actual pipeline the probe validated, but Stage-1 is
-**image-only** (no GT correspondence). It writes a heatmap point cloud + top-K indices,
+**image-only** (no GT correspondence). It writes a self-contained plotly HTML heatmap + top-K indices,
 and (optionally) AP/IoU vs a GT instance so you can read the degradation from the
 probe's GT-surrogate numbers.
 
@@ -148,7 +148,7 @@ alignment is fine; the **bbox Stage-1 is the bottleneck**. Mitigations:
 - Real fix: a **mask** (SAM / segmentation) Stage-1, not just a box.
 
 The `[stage-1 diag]` line prints which GT instances actually sit under the selected
-patches — use it to see box contamination. Open `<out>.ply` to see the 3D heatmap.
+patches — use it to see box contamination. Open `<out>.html` (plotly) in a browser.
 
 ### `--mode image`: where in the scene is this whole 2D image looking?
 
@@ -161,9 +161,9 @@ python tools/viewpoint_probe/localize_from_2d.py --mode image --frame 300 --out 
 python tools/viewpoint_probe/localize_from_2d.py --mode image --image /path/photo.jpg --out /tmp/img
 ```
 
-Writes `<out>.ply` (heatmap: bright = matches the image) and, for a scene frame,
-`<out>_gt.ply` (red = points actually visible in that frame, from correspondence)
-plus an `[eval image footprint]` AP/IoU. Caveat: because DINO is class-semantic,
+Writes a self-contained plotly `<out>.html` (heatmap: bright = matches the image;
+for a scene frame, a **GT-visible** red trace is toggleable in the legend) plus an
+`[eval image footprint]` AP/IoU. Open the `.html` in a browser — no 3D viewer needed. Caveat: because DINO is class-semantic,
 generic content (floor/wall) matches similar surfaces *elsewhere* in the scene, so
 the highlight is the viewed region **plus some bleed** to look-alike areas — it is a
 soft footprint, not a sharp camera frustum (recovering the exact frustum needs pose).
