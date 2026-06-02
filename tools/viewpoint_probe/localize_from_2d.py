@@ -238,7 +238,8 @@ def main():
     ap.add_argument("--frame", default="0", help="scene frame id used as the 2D query image")
     ap.add_argument("--image", default=None, help="external query image (overrides --frame)")
     ap.add_argument("--mode",
-                    choices=["box", "json", "point", "text", "auto", "auto_mask"],
+                    choices=["box", "json", "point", "text", "auto", "auto_mask",
+                             "image"],
                     default="point",
                     help="auto: box from --eval_instance's correspondence (loose "
                          "detector stand-in). auto_mask: pixel-accurate patches "
@@ -308,9 +309,12 @@ def main():
               f"{visible_instances(corr, scene['instance'], N)}")
 
     # Stage-1: object -> DINO patches.  box=loose detector box (mixes background),
-    # auto_mask=pixel-accurate patches (== probe selection; isolates the box penalty).
+    # auto_mask=pixel-accurate patches (== probe selection; isolates the box penalty),
+    # image=ALL patches (no text/box: "where in the scene is this whole image looking?").
     box = None
-    if args.mode == "auto":
+    if args.mode == "image":
+        kp = np.arange(P.PATCH_HW * P.PATCH_HW, dtype=np.int64)
+    elif args.mode == "auto":
         box = instance_box_from_corr(corr, scene["instance"], args.eval_instance, N)
         assert box, f"instance {args.eval_instance} not visible in frame {frame}"
         print(f"[stage-1] auto box from inst {args.eval_instance}: "
@@ -351,12 +355,18 @@ def main():
                  f"  <- you are evaluating inst {args.eval_instance}"))
 
     # Stage-2: cosine match to the DINO-aligned 3D map.
-    #   mean = single averaged query (sensitive to background patches in the set)
-    #   max  = per-3D-point max cosine over the selected patches (robust to a few
-    #          off-object patches; object points still score high via object patches)
+    #   mean = single averaged query (sensitive to off-object patches in the set)
+    #   max  = per-3D-point max cosine over the selected patches (chunked, memory-safe)
+    # For --mode image, mean over the whole image = generic scene appearance (useless),
+    # so we force max: each 3D point lights up by its single best-matching image patch.
+    agg = args.agg
+    if args.mode == "image" and agg == "mean":
+        print("[stage-2] --mode image: forcing --agg max (mean over all patches is "
+              "uninformative)")
+        agg = "max"
     Fk = F2D[torch.as_tensor(kp, device=device)]
-    if args.agg == "max":
-        scores = (F3D @ Fk.T).max(dim=1).values.detach().cpu().numpy()
+    if agg == "max":
+        scores = P._max_sim_scores(F3D, Fk)
     else:
         q = F.normalize(Fk.mean(0), dim=0)
         scores = (F3D @ q).detach().cpu().numpy()
@@ -367,6 +377,21 @@ def main():
     s01 = (scores - scores.min()) / (scores.ptp() + 1e-6)
     write_ply(args.out + ".ply", coord, cm.get_cmap("Spectral_r")(s01)[:, :3])
     print(f"[out] {args.out}.ply  {args.out}_topk.npy")
+
+    # --mode image: the GT "footprint" is the set of points actually visible in the
+    # frame (from correspondence). Write it for side-by-side comparison + score it.
+    if args.mode == "image" and corr is not None:
+        pidx = corr[:, -1].astype(np.int64)
+        pidx = pidx[(pidx >= 0) & (pidx < N)]
+        gt_vis = np.zeros(N, dtype=bool)
+        gt_vis[np.unique(pidx)] = True
+        gt_col = np.tile([0.6, 0.6, 0.6], (N, 1))
+        gt_col[gt_vis] = [0.9, 0.1, 0.1]
+        write_ply(args.out + "_gt.ply", coord, gt_col)
+        m = P.retrieval_metrics(scores, gt_vis)
+        print(f"[eval image footprint] visible={int(gt_vis.sum())} | "
+              f"AP={m['AP']:.3f} IoU={m['best_IoU']:.3f} prec@500={m['prec@500']:.3f}  "
+              f"(pred .ply vs GT _gt.ply)")
 
     if args.eval_instance is not None:
         gt = (scene["instance"] == args.eval_instance)

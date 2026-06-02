@@ -150,6 +150,24 @@ alignment is fine; the **bbox Stage-1 is the bottleneck**. Mitigations:
 The `[stage-1 diag]` line prints which GT instances actually sit under the selected
 patches — use it to see box contamination. Open `<out>.ply` to see the 3D heatmap.
 
+### `--mode image`: where in the scene is this whole 2D image looking?
+
+No text, no box — just a scene point cloud + one 2D image. Uses ALL DINO patches and
+per-point max-cosine to highlight the 3D region the image corresponds to.
+
+```bash
+python tools/viewpoint_probe/localize_from_2d.py --mode image --frame 300 --out /tmp/img
+# external image (no GT overlay):
+python tools/viewpoint_probe/localize_from_2d.py --mode image --image /path/photo.jpg --out /tmp/img
+```
+
+Writes `<out>.ply` (heatmap: bright = matches the image) and, for a scene frame,
+`<out>_gt.ply` (red = points actually visible in that frame, from correspondence)
+plus an `[eval image footprint]` AP/IoU. Caveat: because DINO is class-semantic,
+generic content (floor/wall) matches similar surfaces *elsewhere* in the scene, so
+the highlight is the viewed region **plus some bleed** to look-alike areas — it is a
+soft footprint, not a sharp camera frustum (recovering the exact frustum needs pose).
+
 If `utonia` imports but a dependency is missing, the script tells you exactly which
 package and which interpreter — no `conda activate` involved.
 
