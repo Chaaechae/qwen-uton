@@ -412,6 +412,10 @@ data_length = None
 data = dict(
     train=dict(
         type="ConcatDataset",
+        # Indoor multi-dataset distillation set. ScanNet was the original
+        # single-dataset target; ScanNet++ / ArkitScenes / Structured3D broaden
+        # the indoor distribution the encoder is aligned over. Append further
+        # indoor datasets (s3dis, hm3d_fix, re10k_align, ...) the same way.
         datasets=[
             dict(
                 type="SkipOnErrorImagePointDataset",
@@ -420,6 +424,39 @@ data = dict(
                 patch_size=patch_size,
                 split=["train", "val"],
                 data_root=f"{DATASET_ROOT}/data/scannet",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["train", "val", "test"],
+                data_root=f"{DATASET_ROOT}/data/scannetpp",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["Training", "Validation"],
+                data_root=f"{DATASET_ROOT}/data/arkitscenes",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["train", "val", "test"],
+                data_root=f"{DATASET_ROOT}/data/structured3d",
                 transform=indoor_transform,
                 test_mode=False,
                 loop=1,

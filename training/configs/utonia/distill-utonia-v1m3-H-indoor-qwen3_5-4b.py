@@ -1,48 +1,40 @@
 """
-Version G — Two-tower (bidirectional) projection, SSL off.
+Version H — Align at Qwen's MERGED (16×16, LLM-dim) scale.
 
-Diagnosis after v1m3-A..F all hit the same pos_bc ≤ 0.02 ceiling:
+Background
+----------
+Per-patch (32×32) Qwen ViT features were diagnosed as effectively
+rank ~12 even after applying `merger.norm`.  Qwen3.5's vision tower
+is image-text aligned and was trained to push discriminative
+information through its 2×2 `merger` (norm → spatial merge →
+linear_fc1 → act → linear_fc2 → LLM hidden dim).  At the merged
+16×16 scale the rank shoots up dramatically — that is the actual
+representation the LLM consumes, so any alignment target useful
+for downstream Video-3D-LLM should live there.
 
-  * tools/debug_alignment.py shows the alignment IS learnable on a
-    fixed batch — 100 Adam steps on patch_proj alone took pos_bc
-    from 0.018 → 0.066 (gap 0.064). So neither the loss formulation
-    nor patch_proj capacity is the actual blocker.
+The catch: we don't want to re-compute the 32×32 point-↔-image
+correspondences (expensive).  H sidesteps that by KEEPING the
+existing 32×32 correspondence values and simply dividing row/col
+by 2 in the loss path's `feature_index` calculation.  Each 16×16
+target token then aggregates the (up to) four 32×32 source patches
+that fall in its 2×2 footprint — which is exactly what Qwen does
+on its own side, so the semantics match.
 
-  * The eval result (pos_bc ≈ 0.01) is roughly the random baseline.
-    Conclusion: the model overfits each batch but the per-batch
-    optima don't agree across scenes — i.e. no scene-invariant
-    alignment subspace was found.
+Architectural deltas vs G
+-------------------------
+- `use_full_merger=True`: ENC2D_forward applies the full merger
+  (with 2×2 block-major reorder before the merger's internal
+  `view(-1, 4*D)`) and returns 16×16 tokens at Qwen LLM hidden dim
+  (2560 for Qwen3.5-4B).
+- `enc2d_head_in_channels=2560`: qwen_proj's input dim now matches
+  the LLM hidden dim instead of the raw ViT dim.
+- `enc2d_layer_idx=-1`: merger expects the FINAL block's output;
+  intermediate-layer feed would be semantically wrong.
+- `MultiViewGenerator(max_size=16384, enc2d_max_size=16384)`:
+  smaller point caps so an 8×H100 / batch=64 run fits in memory.
 
-  * Qwen ViT patches have pairwise cos ≈ 0.95, so the discriminative
-    signal lives in a very narrow subspace of the 1024-d Qwen
-    embedding. Asking patch_proj to project f3 directly INTO that
-    narrow subspace is brittle: each batch surfaces a slightly
-    different subset, the head chases moving targets, and average
-    quality stays at chance.
-
-  * A (SSL off) beat F by ~2× on every metric, confirming that SSL
-    weakly fights alignment but is not the dominant blocker.
-
-What G changes:
-
-  1. Two-tower projection (`common_dim=512`):
-     - patch_proj: Linear(1332→2048) → GELU → LN → Linear(2048→512) → LN
-     - qwen_proj : Linear(1024→512, bias=False) → LN     (NEW, trainable)
-     - InfoNCE / cosine loss now lives in a learned shared 512-d
-       space. The model is free to find an alignable subspace
-       rather than being pinned to Qwen's native one — the standard
-       CLIP / SimCLR / Sonata pattern.
-
-  2. SSL fully off (mask = roll_mask = unmask = 0):
-     - A vs F showed clear gain from removing SSL pressure on the
-       backbone.  Pair the cleanest setup (A) with the bidirectional
-       projection that should fix the real bottleneck.
-
-  3. `enc2d_loss_weight = 1.0` (no more 0.75 balance).
-
-Architecturally otherwise identical to F: same backbone, EMA, OneCycleLR,
-loss weights, transforms.  Only the alignment head structure and SSL
-weights differ.
+Everything else (loss type, K-subsample, MLP patch_proj, SSL off,
+two-tower projection, OneCycleLR) is identical to G.
 """
 
 _base_ = ["../_base_/default_runtime.py"]
@@ -63,8 +55,8 @@ del os
 crop_h = 512
 crop_w = 512
 patch_size = 16
-batch_size = 8
-num_worker = 8
+batch_size = 64
+num_worker = 16
 mix_prob = 0.0
 clip_grad = 1.0
 
@@ -149,7 +141,7 @@ model = dict(
     head_hidden_channels=4096,
     head_embed_channels=256,
     head_num_prototypes=4096,
-    enc2d_head_in_channels=1024,
+    enc2d_head_in_channels=2560,
     num_global_view=2,
     num_local_view=4,
     mask_size_start=10,
@@ -185,12 +177,16 @@ model = dict(
     # qwen_proj: Linear(1024→512, bias=False) → LN learns the
     # discriminative subspace of Qwen patches. CLIP/SimCLR pattern.
     common_dim=512,
-    # Which Qwen ViT block to read patch features from. Debug probe
-    # on Qwen3.5 last block (-1) measured effective rank ≈ 1.0 (full
-    # token-uniformity collapse), so -1 is unusable. Start at -2 and
-    # confirm via `python tools/debug_alignment.py --probe-all-layers`
-    # which intermediate layer has the highest rank.
-    enc2d_layer_idx=-2,
+    # Merger expects the FINAL block's output — using an intermediate
+    # layer would semantically misalign with what merger.linear_fc{1,2}
+    # were trained on. So back to -1 for H.
+    enc2d_layer_idx=-1,
+    # Switch ENC2D_forward from per-patch (merger.norm only, rank ~12)
+    # to the full merger output (16×16, LLM hidden dim, rank 100+
+    # expected). The model's feature_index calc downsamples the
+    # existing 32×32 correspondence with `// 2` so no correspondence
+    # re-extraction is needed.
+    use_full_merger=True,
     ema_teacher_backbone=True,
     student_pretrained_path=UTONIA_STUDENT_CKPT,
     teacher_pretrained_path=UTONIA_TEACHER_CKPT,
@@ -331,8 +327,8 @@ indoor_transform = [
             dict(type="ChromaticTranslation", p=0.95, ratio=0.05),
             dict(type="NormalizeColor"),
         ],
-        max_size=65536,
-        enc2d_max_size=65536,
+        max_size=16384,
+        enc2d_max_size=16384,
         enc2d_scale=(0.8, 1),
     ),
     dict(type="ToTensor"),
@@ -364,6 +360,10 @@ data_length = None
 data = dict(
     train=dict(
         type="ConcatDataset",
+        # Indoor multi-dataset distillation set. ScanNet was the original
+        # single-dataset target; ScanNet++ / ArkitScenes / Structured3D broaden
+        # the indoor distribution the encoder is aligned over. Append further
+        # indoor datasets (s3dis, hm3d_fix, re10k_align, ...) the same way.
         datasets=[
             dict(
                 type="SkipOnErrorImagePointDataset",
@@ -372,6 +372,39 @@ data = dict(
                 patch_size=patch_size,
                 split=["train", "val"],
                 data_root=f"{DATASET_ROOT}/data/scannet",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["train", "val", "test"],
+                data_root=f"{DATASET_ROOT}/data/scannetpp",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["Training", "Validation"],
+                data_root=f"{DATASET_ROOT}/data/arkitscenes",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["train", "val", "test"],
+                data_root=f"{DATASET_ROOT}/data/structured3d",
                 transform=indoor_transform,
                 test_mode=False,
                 loop=1,
