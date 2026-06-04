@@ -1,85 +1,60 @@
 """
-Version I — H + light SSL (mask / roll-mask / unmask) re-enabled.
+Utonia <-> Qwen3.5-VL distillation -- ALIGNMENT-ONLY (no SSL).
 
-Why this exists
----------------
-v1m3-H turned ALL SSL losses off (alignment-only).  That decision
-came from A-F ablations showing joint SSL+alignment hurt the
-alignment metrics ~2x.  But pure-alignment training has a downside
-the H eval did not directly measure: the backbone is shaped solely
-by the "match Qwen's vision token" objective, with no other
-pressure to preserve a generally-useful 3D representation.
+Goal
+----
+Align the Utonia (PTv3) point encoder to the Qwen3.5-VL vision tower so the
+distilled 3D features live in the same manifold the VLM consumes downstream
+(VSI / re-VSI spatial reasoning), instead of the original DINOv2 manifold.
 
-H got away with it for 5 short epochs because it warm-starts from
-utonia.pth (SSL-pretrained).  For LONGER training, or from-scratch,
-alignment-only would erode the geometric features Pointcept's
-original SSL recipe instilled.
+Alignment target = Qwen's MERGED (16x16, LLM-dim) features
+----------------------------------------------------------
+Per-patch (32x32) Qwen ViT features were diagnosed as effectively rank ~12 even
+after `merger.norm`. Qwen3.5's vision tower is image-text aligned and was trained
+to push discriminative information through its 2x2 `merger`
+(norm -> spatial-merge -> linear_fc1 -> act -> linear_fc2 -> LLM hidden dim). At
+the merged 16x16 scale the rank jumps to 100+, and that is the representation the
+LLM actually consumes -- so the alignment target lives there:
+  - `use_full_merger=True`: ENC2D_forward runs the full merger (with the 2x2
+    block-major reorder) and returns 16x16 tokens at the Qwen LLM hidden dim
+    (2560 for Qwen3.5-4B).
+  - `enc2d_head_in_channels=2560`, `enc2d_layer_idx=-1` (the merger needs the
+    final block's output).
+  - To avoid recomputing the 32x32 point<->image correspondences, the 32x32
+    values are kept and row/col are halved in the loss-path `feature_index`;
+    each 16x16 target token then aggregates the four 32x32 patches in its 2x2
+    footprint -- exactly what Qwen does internally, so the semantics match.
 
-I re-enables SSL with weights skewed heavily toward alignment so:
-  - alignment remains the dominant signal (3/4 of total)
-  - SSL acts as a regularizer preventing collapse to "trivially
-    Qwen-friendly but feature-poor" backbone
-  - mask/unmask heads are now instantiated (the v1m3b model build
-    skips them when loss_weight=0).  utonia.pth ships only the
-    backbone, so the SSL heads start from random and need warmup
-    to converge their cluster prototypes.
+Loss
+----
+Cross-scene (batch-wide) InfoNCE (`enc2d_loss_type="infonce_batch"`,
+`infonce_temperature=0.07`) between the projected 3D point feature and its
+matched Qwen merged token, in a shared `common_dim=512` two-tower space
+(MLP `patch_proj` on the 3D side, `qwen_proj` on the 2D side), with K-subsampling
+of the unique patches per batch. SSL (mask / roll-mask / unmask) is OFF here --
+the backbone is shaped purely by the alignment objective.
 
-Recommended diagnostic: train I and H side-by-side on identical
-data + steps, run the same linear probe + alignment eval.
-  - I.mIoU > H.mIoU at similar CKA  → SSL retention helps downstream
-  - I.mIoU ≈ H.mIoU but I.CKA lower → SSL fights alignment, H was right
+Training
+--------
+Warm-started from `utonia.pth` (backbone only; align heads random); layer-grouped
+LR (backbone base_lr*0.05 with 0.9 layer-wise decay, new modules full base_lr);
+OneCycleLR; 5 epochs; batch 64 (8xH100); indoor multi-dataset (ScanNet,
+ScanNet++, ArkitScenes, Structured3D, S3DIS, HM3D).
 
-Architectural deltas vs H
--------------------------
-- mask_loss_weight       0   -> 1/16
-- roll_mask_loss_weight  0   -> 1/16
-- unmask_loss_weight     0   -> 1/8
-- enc2d_loss_weight      1.0 -> 3/4
-- adds param_dict entries for student.mask_head / student.unmask_head
-  so they get the OneCycleLR scheduling
+Run
+---
+    export QWEN3_5_4B_PATH=/path/to/Qwen3.5-4B
+    export UTONIA_PRETRAINED_CKPT=/path/to/utonia.pth
+    export DATASET_ROOT=/path/to/3Ddataset      # reaches ${DATASET_ROOT}/data/<name>
+    bash training/install_into_pointcept.sh      # from repo root (idempotent)
+    cd third_party/Pointcept
+    python tools/train.py \
+        --config-file configs/utonia/distill-utonia-v1m3-indoor-noSSL-qwen3_5-4b.py \
+        --num-gpus 8 \
+        --options save_path=exp/utonia_q35_indoor_nossl
 
-Everything else (PT-v3m3 backbone, MLP patch_proj, two-tower 512-d
-common, use_full_merger=True 16x16, infonce_batch loss, OneCycleLR,
-warm-start from utonia.pth) is identical to H.
-
-ORIGINAL H DOCSTRING FOLLOWS:
------------------------------
-Version H — Align at Qwen's MERGED (16×16, LLM-dim) scale.
-
-Background
-----------
-Per-patch (32×32) Qwen ViT features were diagnosed as effectively
-rank ~12 even after applying `merger.norm`.  Qwen3.5's vision tower
-is image-text aligned and was trained to push discriminative
-information through its 2×2 `merger` (norm → spatial merge →
-linear_fc1 → act → linear_fc2 → LLM hidden dim).  At the merged
-16×16 scale the rank shoots up dramatically — that is the actual
-representation the LLM consumes, so any alignment target useful
-for downstream Video-3D-LLM should live there.
-
-The catch: we don't want to re-compute the 32×32 point-↔-image
-correspondences (expensive).  H sidesteps that by KEEPING the
-existing 32×32 correspondence values and simply dividing row/col
-by 2 in the loss path's `feature_index` calculation.  Each 16×16
-target token then aggregates the (up to) four 32×32 source patches
-that fall in its 2×2 footprint — which is exactly what Qwen does
-on its own side, so the semantics match.
-
-Architectural deltas vs G
--------------------------
-- `use_full_merger=True`: ENC2D_forward applies the full merger
-  (with 2×2 block-major reorder before the merger's internal
-  `view(-1, 4*D)`) and returns 16×16 tokens at Qwen LLM hidden dim
-  (2560 for Qwen3.5-4B).
-- `enc2d_head_in_channels=2560`: qwen_proj's input dim now matches
-  the LLM hidden dim instead of the raw ViT dim.
-- `enc2d_layer_idx=-1`: merger expects the FINAL block's output;
-  intermediate-layer feed would be semantically wrong.
-- `MultiViewGenerator(max_size=16384, enc2d_max_size=16384)`:
-  smaller point caps so an 8×H100 / batch=64 run fits in memory.
-
-Everything else (loss type, K-subsample, MLP patch_proj, SSL off,
-two-tower projection, OneCycleLR) is identical to G.
+See ../QWEN3_5_ALIGNMENT_SUMMARY.md for the full background, ablations, and
+findings.
 """
 
 _base_ = ["../_base_/default_runtime.py"]
@@ -200,17 +175,13 @@ model = dict(
     teacher_temp_base=0.07,
     teacher_temp_warmup_ratio=0.05,
     student_temp=0.1,
-    # I: alignment-dominant 3/4 + light SSL 1/4 regularizer.  Same
-    # ratio Pointcept originally tuned in v1m1 (1/8 + 1/8 + 2/8 +
-    # 4/8 = 0.5 alignment) is too SSL-heavy for Qwen's anisotropy
-    # — A vs F showed that hurt alignment 2x.  These weights keep
-    # SSL contributions small enough not to dominate the alignment
-    # gradient but large enough to keep the backbone geometrically
-    # grounded over long training.
-    mask_loss_weight=1/16,
-    roll_mask_loss_weight=1/16,
-    unmask_loss_weight=1/8,
-    enc2d_loss_weight=3/4,
+    # SSL fully off — A vs F showed SSL drags alignment ~2× worse.
+    # Keep mask/unmask heads instantiated (the model build does it
+    # unconditionally) but with zero loss weight they don't update.
+    mask_loss_weight=0,
+    roll_mask_loss_weight=0,
+    unmask_loss_weight=0,
+    enc2d_loss_weight=1.0,
     momentum_base=0.994,
     momentum_final=1,
     match_max_k=8,
@@ -266,11 +237,8 @@ param_dicts += [
     dict(keyword="teacher.backbone.", lr=backbone_base_lr),
     dict(keyword="patch_proj.", lr=base_lr),
     dict(keyword="qwen_proj.", lr=base_lr),
-    # SSL heads (mask / unmask) are now built — they were skipped
-    # in H when the loss weights were 0.  Add their LR entries so
-    # OneCycleLR's max_lr list matches param_dicts length.
-    dict(keyword="student.mask_head.", lr=base_lr),
-    dict(keyword="student.unmask_head.", lr=base_lr),
+    # SSL heads (mask / unmask) are not built when SSL weights = 0,
+    # so dropping their entries here matches v1m3-A's pattern.
 ]
 del dec_depths
 
@@ -457,6 +425,28 @@ data = dict(
                 patch_size=patch_size,
                 split=["train", "val", "test"],
                 data_root=f"{DATASET_ROOT}/data/structured3d",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5", "Area_6"],
+                data_root=f"{DATASET_ROOT}/data/s3dis",
+                transform=indoor_transform,
+                test_mode=False,
+                loop=1,
+            ),
+            dict(
+                type="SkipOnErrorImagePointDataset",
+                crop_h=crop_h,
+                crop_w=crop_w,
+                patch_size=patch_size,
+                split=["train", "val"],
+                data_root=f"{DATASET_ROOT}/data/hm3d_fix",
                 transform=indoor_transform,
                 test_mode=False,
                 loop=1,
